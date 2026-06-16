@@ -16,6 +16,7 @@ DEFAULT_REFERENCE_DIR = ROOT / "input_packages" / "materials_200_reference_for_e
 DEFAULT_PROMPT_DIR = ROOT / "codex_experiments" / "conductors_with_num_wann"
 DEFAULT_OUTPUT_DIR = ROOT / "harbor_datasets" / "wannier_200"
 DEFAULT_FERMI = ROOT / "200materials" / "fermi_energies.json"
+DEFAULT_PSEUDO_DIR = ROOT / "input_packages" / "pseudos_sssp_efficiency"
 
 
 DOCKERFILE = """FROM ubuntu:22.04
@@ -37,6 +38,7 @@ RUN apt-get update && apt-get install -y \\
     python3-pip \\
     python3-venv \\
     quantum-espresso \\
+    ripgrep \\
     sed \\
     wannier90 \\
     && rm -rf /var/lib/apt/lists/*
@@ -51,6 +53,20 @@ COPY README.md /app/README.md
 TEST_SH = """#!/usr/bin/env bash
 set -euo pipefail
 
+preserve_artifacts() {
+    mkdir -p /logs/artifacts
+    if [ -d /app/artifacts ]; then
+        cp -a /app/artifacts/. /logs/artifacts/ 2>/dev/null || true
+    fi
+    if [ -f /app/report.json ]; then
+        cp /app/report.json /logs/artifacts/report.json 2>/dev/null || true
+    fi
+    if [ -f /app/REPORT.md ]; then
+        cp /app/REPORT.md /logs/artifacts/REPORT.md 2>/dev/null || true
+    fi
+}
+
+trap preserve_artifacts EXIT
 mkdir -p /logs/verifier
 python3 /tests/grade.py
 """
@@ -300,6 +316,50 @@ def copytree(src: Path, dst: Path) -> None:
     shutil.copytree(src, dst, dirs_exist_ok=True)
 
 
+def required_pseudos_from_qe_input(path: Path) -> list[str]:
+    pseudos: list[str] = []
+    in_species = False
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.upper() == "ATOMIC_SPECIES":
+            in_species = True
+            continue
+        if not in_species:
+            continue
+        keyword = line.split()[0].upper()
+        if keyword in {"ATOMIC_POSITIONS", "K_POINTS", "CELL_PARAMETERS"}:
+            break
+        parts = line.split()
+        if len(parts) >= 3:
+            pseudos.append(parts[2])
+    return pseudos
+
+
+def copy_required_pseudos(agent_material: Path, material_dir: Path, pseudo_dir: Path | None) -> dict[str, list[str]]:
+    required = sorted(set(required_pseudos_from_qe_input(agent_material / "nscf" / "input" / "nscf.in")))
+    copied: list[str] = []
+    missing: list[str] = []
+    if not required:
+        return {"required": [], "copied": [], "missing": []}
+
+    target_dir = material_dir / "pseudo"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    for name in required:
+        source = pseudo_dir / name if pseudo_dir is not None else None
+        if source is not None and source.exists():
+            shutil.copy2(source, target_dir / name)
+            copied.append(name)
+        else:
+            missing.append(name)
+
+    write_text(target_dir / "required_pseudos.txt", "\n".join(required) + "\n")
+    if missing:
+        write_text(target_dir / "missing_pseudos.txt", "\n".join(missing) + "\n")
+    return {"required": required, "copied": copied, "missing": missing}
+
+
 def write_text(path: Path, text: str, mode: int | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
@@ -338,12 +398,32 @@ The agent-visible material package is available at `/app/material`.
 Write final workflow files under `/app/workflow`, report files under `/app`,
 and final Wannier artifacts under `/app/artifacts/attempt_<N>/`.
 
+If `/app/material/pseudo/` contains UPF files, use that directory when rerunning
+SCF/NSCF instead of downloading pseudopotentials.
+
 The hidden verifier reads `/tests/reference` after the agent finishes.
 """
 
 
-def instruction_text(prompt_path: Path) -> str:
-    return prompt_path.read_text(encoding="utf-8").rstrip() + """
+def base_instruction_text(prompt_path: Path, existing_instruction_path: Path) -> str:
+    if prompt_path.exists():
+        return prompt_path.read_text(encoding="utf-8").rstrip()
+    if existing_instruction_path.exists():
+        text = existing_instruction_path.read_text(encoding="utf-8")
+        return text.split("\n## Harbor grading note", 1)[0].rstrip()
+    raise FileNotFoundError(
+        f"Missing prompt {prompt_path} and no existing instruction {existing_instruction_path}"
+    )
+
+
+def instruction_text(base_instruction: str) -> str:
+    return base_instruction.rstrip() + """
+
+If `material/pseudo/` contains UPF files, those are the pseudopotentials that
+match the supplied QE inputs. Prefer rerunning SCF/NSCF with
+`pseudo_dir = './pseudo/'` from a workflow run directory that symlinks or copies
+`material/pseudo/`, especially when the supplied QE 6.3 XML cannot be consumed
+directly by the installed `pw2wannier90.x`.
 
 ## Harbor grading note
 
@@ -476,21 +556,28 @@ def create_task(
     reference_dir: Path,
     prompt_dir: Path,
     fermi_energies: dict[str, float],
+    pseudo_dir: Path | None,
     overwrite: bool,
 ) -> None:
     task_dir = output_dir / material
-    clean_or_create(task_dir, overwrite)
-
     agent_material = agent_dir / material
     reference_material = reference_dir / material
     prompt_path = prompt_dir / material / "prompt.md"
+    base_instruction = base_instruction_text(prompt_path, task_dir / "instruction.md")
+    clean_or_create(task_dir, overwrite)
+
     reference_meta = read_json(reference_material / "reference_metadata.json")
 
-    write_text(task_dir / "instruction.md", instruction_text(prompt_path))
+    write_text(task_dir / "instruction.md", instruction_text(base_instruction))
     write_text(task_dir / "task.toml", task_toml(material))
     write_text(task_dir / "environment" / "Dockerfile", DOCKERFILE)
     write_text(task_dir / "environment" / "README.md", task_readme(material))
     copytree(agent_material, task_dir / "environment" / "material")
+    pseudo_status = copy_required_pseudos(agent_material, task_dir / "environment" / "material", pseudo_dir)
+    write_text(
+        task_dir / "environment" / "material" / "pseudo" / "pseudo_manifest.json",
+        json.dumps(pseudo_status, indent=2) + "\n",
+    )
 
     write_text(task_dir / "tests" / "test.sh", TEST_SH, mode=0o755)
     write_text(task_dir / "tests" / "grade.py", GRADE_PY, mode=0o755)
@@ -531,12 +618,24 @@ def main() -> None:
     parser.add_argument("--prompt-dir", type=Path, default=DEFAULT_PROMPT_DIR)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--fermi-energies", type=Path, default=DEFAULT_FERMI)
+    parser.add_argument(
+        "--pseudo-dir",
+        type=Path,
+        default=DEFAULT_PSEUDO_DIR,
+        help="Directory containing UPF files to bundle under material/pseudo.",
+    )
+    parser.add_argument(
+        "--no-pseudos",
+        action="store_true",
+        help="Do not bundle pseudopotentials into the agent-visible material package.",
+    )
     parser.add_argument("--materials", nargs="+")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
     fermi_energies = read_json(args.fermi_energies)
     materials = material_ids(args.agent_dir, args.materials)
+    pseudo_dir = None if args.no_pseudos else args.pseudo_dir
     args.output_dir.mkdir(parents=True, exist_ok=True)
     for material in materials:
         create_task(
@@ -546,6 +645,7 @@ def main() -> None:
             args.reference_dir,
             args.prompt_dir,
             fermi_energies,
+            pseudo_dir,
             args.overwrite,
         )
     write_dataset_readme(args.output_dir, materials)

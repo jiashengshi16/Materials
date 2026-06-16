@@ -13,21 +13,25 @@ ROOT = Path(__file__).resolve().parents[1]
 JOBS_DIR = ROOT / "jobs" / "2026-06-15__17-20-19"
 OUTPUT_JSON = JOBS_DIR / "diagnostics_status_summary.json"
 
-
 def classify_diagnostics(data: dict[str, Any]) -> tuple[bool | None, str, str | None]:
-    success = data.get("status")
+    status = data.get("status")
+    reward = data.get("reward")
 
-    if success == "success":
+    if status == "success":
+        if not isinstance(reward, int | float):
+            return None, "undeterminable", "diagnostics.json success has no numeric reward"
+        if float(reward) == 0.0:
+            return False, "failed", "diagnostics.json status is success but reward is 0.0"
         return True, "success", None
-    if success == "failed":
+
+    if status == "failed":
         reason = data.get("error")
         return False, "failed", str(reason) if reason else None
 
-    if success is None:
-        return None, "undeterminable", "diagnostics.json has no success field"
+    if status is None:
+        return None, "undeterminable", "diagnostics.json has no status field"
 
-    return None, "undeterminable", f"unrecognized success: {success!r}"
-
+    return None, "undeterminable", f"unrecognized status: {status!r}"
 
 def summarize_job(job_dir: Path) -> dict[str, Any]:
     diagnostics_path = job_dir / "verifier" / "diagnostics.json"
