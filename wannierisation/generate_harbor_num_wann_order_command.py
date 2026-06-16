@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Print a Harbor command that runs all tasks ordered by instruction num_wann."""
+"""Print Harbor commands that run tasks in increasing instruction num_wann."""
 
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
+import os
 import re
 import shlex
 from pathlib import Path
@@ -12,6 +14,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATASET = ROOT / "harbor_datasets" / "wannier_200"
 NUM_WANN_RE = re.compile(r"\bnum_wann\s*=\s*(\d+)\b")
+DEFAULT_ARTIFACTS = ["/app/artifacts", "/app/report.json", "/app/REPORT.md"]
+DEFAULT_N_CONCURRENT = 4
 
 
 def relpath_for_command(path: Path) -> str:
@@ -92,7 +96,8 @@ def materialize_ordered_dataset(source_dataset: Path, target_dataset: Path, task
     (target_dataset / "README.md").write_text("\n".join(lines), encoding="utf-8")
 
 
-def build_command(args: argparse.Namespace, dataset: Path) -> list[str]:
+def build_command(args: argparse.Namespace, dataset: Path, *, n_concurrent: int | None = None) -> list[str]:
+    concurrency = args.n_concurrent if n_concurrent is None else n_concurrent
     command = [
         "harbor",
         "run",
@@ -102,12 +107,85 @@ def build_command(args: argparse.Namespace, dataset: Path) -> list[str]:
         args.agent,
         "-m",
         args.model,
+        "--n-concurrent",
+        str(concurrency),
     ]
 
     if args.extra_arg:
         command.extend(args.extra_arg)
 
+    artifacts = [] if args.no_default_artifacts else list(DEFAULT_ARTIFACTS)
+    artifacts.extend(args.artifact)
+    for artifact in artifacts:
+        command.extend(["--artifact", artifact])
+
     return command
+
+
+def print_ordered_commands(args: argparse.Namespace, tasks: list[tuple[int, str, Path]]) -> None:
+    batch_size = args.batch_size
+    if batch_size < 1:
+        raise SystemExit("--batch-size must be at least 1")
+
+    mode = f"run sorted batches of {batch_size} task(s) at a time"
+    print(f"# Mode: {mode}")
+    print(f"# Running {len(tasks)} tasks")
+    print(f"# Smallest num_wann: {tasks[0][1]} ({tasks[0][0]})")
+    print(f"# Largest num_wann: {tasks[-1][1]} ({tasks[-1][0]})")
+    print(f"# Dataset: {relpath_for_command(args.dataset)}")
+    run_group = datetime.now().strftime("%Y-%m-%d__%H-%M-%S")
+    run_group = f"num_wann_ordered__{run_group}__pid{os.getpid()}"
+    print("run_harbor_num_wann_ordered() {")
+    print("  overall_status=0")
+    for batch_start in range(0, len(tasks), batch_size):
+        batch = tasks[batch_start : batch_start + batch_size]
+        print("  pids=()")
+        first_num_wann = batch[0][0]
+        last_num_wann = batch[-1][0]
+        print(
+            "  "
+            + shlex.join(
+                [
+                    "printf",
+                    "Starting sorted batch %s-%s (num_wann %s-%s)\\n",
+                    str(batch_start + 1),
+                    str(batch_start + len(batch)),
+                    str(first_num_wann),
+                    str(last_num_wann),
+                ]
+            )
+        )
+        for offset, (num_wann, material, source) in enumerate(batch, start=batch_start + 1):
+            command = build_command(args, source, n_concurrent=1)
+            job_name = f"{run_group}__{offset:04d}__num_wann_{num_wann:03d}__{material}"
+            command.extend(["--job-name", job_name])
+            print(
+                "  "
+                + shlex.join(
+                    [
+                        "printf",
+                        "  [%s/%s] num_wann=%s %s\\n",
+                        str(offset),
+                        str(len(tasks)),
+                        str(num_wann),
+                        material,
+                    ]
+                )
+            )
+            print(f"  {shlex.join(command)} &")
+            print("  pids+=(\"$!\")")
+        print("  batch_status=0")
+        print('  for pid in "${pids[@]}"; do')
+        print('    wait "$pid" || batch_status=$?')
+        print("  done")
+        print('  if [ "$batch_status" -ne 0 ]; then')
+        print('    overall_status="$batch_status"')
+        if args.stop_on_error:
+            print('    return "$overall_status"')
+        print("  fi")
+    print('  return "$overall_status"')
+    print("}")
+    print("run_harbor_num_wann_ordered")
 
 
 def main() -> None:
@@ -121,10 +199,36 @@ def main() -> None:
     parser.add_argument("--agent", "-a", default="gemini-cli")
     parser.add_argument("--model", "-m", default="google/gemini-3.1-pro-preview")
     parser.add_argument(
+        "--n-concurrent",
+        "-n",
+        type=int,
+        default=DEFAULT_N_CONCURRENT,
+        help=(
+            "Number of concurrent Harbor trials for the generated single-job command. "
+            "Default: 4, so Harbor keeps four trials active while reading tasks from "
+            "the num_wann-ordered dataset."
+        ),
+    )
+    parser.add_argument(
         "--extra-arg",
         action="append",
         default=[],
         help="Append one extra argument to the Harbor command. Repeat for multiple args.",
+    )
+    parser.add_argument(
+        "--artifact",
+        action="append",
+        default=[],
+        help=(
+            "Pass one additional Harbor --artifact path to every generated harbor run. "
+            "The plotting-critical paths /app/artifacts, /app/report.json, and "
+            "/app/REPORT.md are already included by default."
+        ),
+    )
+    parser.add_argument(
+        "--no-default-artifacts",
+        action="store_true",
+        help="Do not include the default plotting artifact paths in generated Harbor commands.",
     )
     parser.add_argument(
         "--materials-only",
@@ -137,15 +241,51 @@ def main() -> None:
         help="Print a command with --include-task-name filters instead of creating an ordered dataset.",
     )
     parser.add_argument(
+        "--single-job",
+        action="store_true",
+        help=(
+            "Run one Harbor job over an ordered symlink dataset. This is not the default "
+            "because Harbor may enumerate local dataset directories in filesystem order."
+        ),
+    )
+    parser.add_argument(
+        "--background-batches",
+        action="store_true",
+        help=(
+            "Deprecated alias for the default explicit sorted batch launcher."
+        ),
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=4,
+        help=(
+            "Run this many sorted tasks at a time in the explicit batch launcher. Default: 4."
+        ),
+    )
+    parser.add_argument(
+        "--stop-on-error",
+        action="store_true",
+        help="Stop after the first sorted batch that has a failed Harbor command.",
+    )
+    parser.add_argument(
         "--ordered-dataset-dir",
         type=Path,
         help="Directory to write the ordered symlink dataset. Defaults to a generated name next to --dataset.",
     )
     args = parser.parse_args()
+    if not args.model:
+        raise SystemExit("--model/-m cannot be empty")
+    if args.n_concurrent < 1:
+        raise SystemExit("--n-concurrent/-n must be at least 1")
 
     tasks = dataset_tasks(args.dataset)
     if args.materials_only:
         print(" ".join(material for _num_wann, material, _source in tasks))
+        return
+
+    if not args.single_job:
+        print_ordered_commands(args, tasks)
         return
 
     if args.no_ordered_dataset:
@@ -156,6 +296,8 @@ def main() -> None:
     else:
         run_dataset = args.ordered_dataset_dir or ordered_dataset_dir(args.dataset)
         materialize_ordered_dataset(args.dataset, run_dataset, tasks)
+
+    if not args.no_ordered_dataset:
         command = build_command(args, run_dataset)
 
     print(f"# Mode: include all tasks sorted by instruction num_wann ascending")
