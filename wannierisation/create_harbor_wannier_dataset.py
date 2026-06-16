@@ -352,6 +352,32 @@ DFT reference bands. The best/final attempt must include `<seed>_hr.dat` in
 `artifacts/attempt_<N>/`; without that file the run receives reward 0 because
 there is no Hamiltonian to evaluate.
 
+Before returning a final response, verify that the final artifact exists:
+
+```bash
+test -s artifacts/attempt_1/run_manifest.json
+test -s artifacts/attempt_1/${seed}_hr.dat
+ls -lh artifacts/attempt_1/*_hr.dat
+```
+
+Do not report `status: "success"` or `executed_successfully: true` unless
+`artifacts/attempt_1/<seed>_hr.dat` exists and is non-empty. Do not run the
+final workflow in the background with `nohup` or `&` and then return before it
+finishes. When collecting artifacts, do not rely on `cp <seed>.* ...` because
+that does not copy `<seed>_hr.dat`; copy `<seed>_hr.dat` explicitly or use
+`cp <seed>* ...`.
+
+For example, after a successful Wannier90 run:
+
+```bash
+mkdir -p artifacts/attempt_1
+cp workflow/run_dir/${seed}_hr.dat artifacts/attempt_1/
+cp workflow/run_dir/${seed}.win workflow/run_dir/${seed}.wout workflow/run_dir/${seed}.eig workflow/run_dir/${seed}.chk workflow/run_dir/${seed}.nnkp artifacts/attempt_1/ 2>/dev/null || true
+```
+
+If `<seed>_hr.dat` is missing or empty after your attempts, return
+`status: "partial"` or `status: "failed"`, not `status: "success"`.
+
 ## Required JSON contracts
 
 The best/final attempt's `artifacts/attempt_<N>/run_manifest.json` must be
