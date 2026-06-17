@@ -391,9 +391,9 @@ def plot_overlay(
         axes[0].plot(
             x_axis,
             dft_rel[:, band_idx],
-            color="0.25",
-            linewidth=0.9,
-            alpha=0.42,
+            color="0.18",
+            linewidth=1.05,
+            alpha=0.55,
             zorder=2,
             label="DFT target" if band_idx == 0 else None,
         )
@@ -401,14 +401,21 @@ def plot_overlay(
             x_axis,
             wannier_rel[:, band_idx],
             color="#e66100",
-            linewidth=2.0,
+            linewidth=1.0,
             alpha=1.0,
-            linestyle=(0, (0.8, 5.0)),
-            dash_capstyle="round",
+            linestyle=":",
+            marker=None,
             zorder=5,
             label="Wannier" if band_idx == 0 else None,
         )
-        axes[1].plot(x_axis, np.where(below[:, band_idx], delta[:, band_idx], np.nan), linewidth=0.9, alpha=0.75)
+        selected = below[:, band_idx]
+        axes[1].scatter(
+            x_axis[selected],
+            delta[selected, band_idx],
+            s=8,
+            alpha=0.5,
+            linewidths=0,
+        )
     axes[0].axhline(0.0, color="0.2", linewidth=0.9, alpha=0.9)
     axes[1].axhline(0.0, color="0.25", linewidth=0.8)
     for axis in axes:
