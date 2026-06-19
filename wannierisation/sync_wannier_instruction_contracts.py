@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sync the Harbor grading note and JSON contracts across instructions.
+"""Sync shared benchmark contract text across Wannier instructions.
 
 Dry-run by default. Use --apply to modify files.
 """
@@ -10,7 +10,122 @@ import argparse
 from pathlib import Path
 
 
+DEFAULT_DATASET_DIRS = (
+    Path("harbor_datasets/wannier_200"),
+    Path("harbor_datasets/wannier_200__needs_eval_with_qe_save"),
+)
+DEFAULT_SOURCE = Path(
+    "harbor_datasets/wannier_200__needs_eval_with_qe_save/Al24W6/instruction.md"
+)
 SYNC_HEADING = "## Harbor grading note"
+EARLY_HEADING = "## Workflow provenance rules"
+DECISION_HEADING = "## Decision rationale requirement"
+RECOMMENDED_HEADING = "## Recommended QE-save workflow"
+STARTING_POINT_MARKER = "scientific starting point."
+BENCHMARK_MARKER = "\n\nFor this benchmark,"
+LEGACY_PSEUDO_NOTE = """If `material/pseudo/` contains UPF files, those are the pseudopotentials that
+match the supplied QE inputs. Prefer rerunning SCF/NSCF with
+`pseudo_dir = './pseudo/'` from a workflow run directory that symlinks or copies
+`material/pseudo/`, especially when the supplied QE 6.3 XML cannot be consumed
+directly by the installed `pw2wannier90.x`."""
+
+EARLY_CONTRACT = """## Workflow provenance rules
+
+This is a Wannierisation-strategy benchmark. Do not assume any pre-existing
+Wannier90 recipe is supplied. In particular, do not use `/search` or any other
+external lookup for reference `.win`, `.amn`, `.mmn`, `.eig`, `.nnkp`, `.wout`,
+`.chk`, or `_hr.dat` files outside the copied `material/` package. If such
+files are present inside `material/`, treat them as accidental leakage, do not
+use them, and record this in `REPORT.md`.
+
+If `material/` or a copied `materials/` package contains a QE NSCF save tree,
+use that save tree as the DFT-side input for Wannierisation. Do not rerun SCF
+or NSCF unless the provided save tree is missing or unusable. If you rerun any
+DFT-side step, record the reason explicitly in `run_manifest.json`,
+`report.json`, and `REPORT.md`."""
+
+DECISION_RATIONALE_CONTRACT = """## Decision rationale requirement
+
+For every Wannierisation decision, explain clearly **why** the choice
+was made. This includes, at minimum: projections, `num_wann`, `num_bands`,
+target-band handling, disentanglement windows, frozen windows, band exclusions
+or non-exclusions, whether to rerun any DFT-side step, how to respond to failed
+commands, whether to make another attempt, and how to set final artifact status.
+
+Maintain `workflow/DECISIONS.md` throughout the run. Each entry must include:
+- the decision made;
+- the evidence used, such as electron count, orbital character, QE logs/XML,
+  band index range, energy range, command output, or missing files;
+- why that evidence supports the decision;
+- the expected effect on the Wannierisation.
+
+Do not merely list parameter values. Explain the rationale for choosing them.
+If a choice is uncertain or heuristic, state the uncertainty and why it is still
+a reasonable choice.
+
+At the end, copy the decision rationales into `REPORT.md` and summarize the key
+rationales in `report.json.runtime_notes` and
+`artifacts/attempt_<N>/run_manifest.json.notes`."""
+
+PSEUDO_NOTE = LEGACY_PSEUDO_NOTE
+
+RECOMMENDED_QE_SAVE_WORKFLOW = """## Recommended QE-save workflow
+
+When `material/qe_save/out/aiida.save` exists, use it directly as the DFT-side
+input to `pw2wannier90.x`; do not inspect or print the wavefunction files.
+Do not spend the run doing open-ended analysis before creating files. Start by
+creating `workflow/run_dir`, writing a first `<seed>.win`, and running the
+QE-save workflow below. Keep any pre-work to a few compact metadata/log
+queries.
+
+The usual workflow is:
+
+```bash
+seed="<task seedname>"
+mkdir -p workflow/run_dir
+cp -a material/qe_save/out workflow/run_dir/out
+cp material/pseudo/*.UPF workflow/run_dir/ 2>/dev/null || true
+cd workflow/run_dir
+
+# Write ${seed}.win with the task's required num_wann/num_bands, projections,
+# kpoint_path/bands_plot settings if desired, and disentanglement windows.
+wannier90.x -pp "${seed}"
+
+cat > "${seed}.pw2wan" <<EOF
+&inputpp
+  outdir = './out'
+  prefix = 'aiida'
+  seedname = '${seed}'
+  write_mmn = .true.
+  write_amn = .true.
+  write_eig = .true.
+/
+EOF
+pw2wannier90.x -in "${seed}.pw2wan"
+wannier90.x "${seed}"
+```
+
+Only rerun SCF/NSCF if this save-tree workflow fails for a recorded technical
+reason. Use compact scripts to summarize QE logs/XML when choosing projections
+or windows; keep the full save tree as file input rather than chat output.
+
+Keep terminal output compact. Do not print full QE inputs, XML files, logs, or
+K-point lists into the chat transcript with commands like `cat` on
+`material/nscf/input/nscf.in` or `material/qe_save/logs/nscf.out`. Extract only
+the needed lines with `grep`, `head`, `tail`, `sed -n`, or small scripts, and
+redirect generated full K-point lists or workflow files directly to files.
+Also avoid full listings of `material/qe_save/out/aiida.save` and avoid
+`grep -A`/`grep -B` on UPF wavefunction or `PP_PSWFC` blocks, because those
+include large binary/checkpoint listings or long radial numeric tables."""
+
+SHARED_EARLY_BLOCK = "\n\n".join(
+    [
+        EARLY_CONTRACT,
+        DECISION_RATIONALE_CONTRACT,
+        PSEUDO_NOTE,
+        RECOMMENDED_QE_SAVE_WORKFLOW,
+    ]
+)
 
 
 def extract_synced_tail(source: Path) -> str:
@@ -25,14 +140,87 @@ def instruction_files(dataset_dir: Path) -> list[Path]:
     return sorted(dataset_dir.glob("*/instruction.md"))
 
 
-def sync_tail(path: Path, synced_tail: str) -> bool:
-    text = path.read_text(encoding="utf-8")
-    start = text.find(SYNC_HEADING)
+def unique_instruction_files(dataset_dirs: list[Path]) -> list[Path]:
+    """Return instruction files across dataset views, de-duping symlink targets."""
+    paths_by_real_path: dict[Path, Path] = {}
+    for dataset_dir in dataset_dirs:
+        for path in instruction_files(dataset_dir):
+            paths_by_real_path.setdefault(path.resolve(), path)
+    return sorted(paths_by_real_path.values())
+
+
+def remove_block_from_heading(text: str, heading: str, end_markers: tuple[str, ...]) -> str:
+    """Remove a markdown block beginning at heading and ending at first marker."""
+    start = text.find(heading)
     if start == -1:
-        suffix = "\n" if text.endswith("\n") else "\n\n"
-        new_text = text + suffix + synced_tail
+        return text
+
+    marker_positions = [pos for marker in end_markers if (pos := text.find(marker, start)) != -1]
+    if not marker_positions:
+        return text[:start].rstrip() + "\n"
+
+    end = min(marker_positions)
+    return (text[:start].rstrip() + text[end:]).rstrip() + "\n"
+
+
+def remove_known_shared_blocks(text: str) -> str:
+    """Strip old shared blocks so the canonical versions can be reinserted.
+
+    This handles both layouts seen in the dataset:
+    - the generator layout, where pseudo/recommended text appears before Harbor;
+    - the synced layout, where provenance/recommended text appears before the
+      material-specific "For this benchmark" block.
+    """
+    text = remove_block_from_heading(
+        text,
+        EARLY_HEADING,
+        (DECISION_HEADING, RECOMMENDED_HEADING, BENCHMARK_MARKER, SYNC_HEADING),
+    )
+    text = remove_block_from_heading(
+        text,
+        DECISION_HEADING,
+        (RECOMMENDED_HEADING, BENCHMARK_MARKER, SYNC_HEADING),
+    )
+    while LEGACY_PSEUDO_NOTE in text:
+        text = text.replace(LEGACY_PSEUDO_NOTE, "").replace("\n\n\n", "\n\n")
+    text = remove_block_from_heading(
+        text,
+        RECOMMENDED_HEADING,
+        (BENCHMARK_MARKER, SYNC_HEADING),
+    )
+    return text.replace("\n\n\n", "\n\n")
+
+
+def sync_shared_contract_text(text: str) -> str:
+    text = remove_known_shared_blocks(text)
+
+    insert_at = text.find(STARTING_POINT_MARKER)
+    if insert_at == -1:
+        raise ValueError(f"missing {STARTING_POINT_MARKER!r}")
+
+    insert_at += len(STARTING_POINT_MARKER)
+    return (
+        text[:insert_at].rstrip()
+        + "\n\n"
+        + SHARED_EARLY_BLOCK
+        + "\n\n"
+        + text[insert_at:].lstrip()
+    )
+
+
+# Backward-compatible name for older callers/tests.
+sync_early_contract_text = sync_shared_contract_text
+
+
+def sync_instruction(path: Path, synced_tail: str) -> bool:
+    text = path.read_text(encoding="utf-8")
+    new_text = sync_shared_contract_text(text)
+    start = new_text.find(SYNC_HEADING)
+    if start == -1:
+        suffix = "\n" if new_text.endswith("\n") else "\n\n"
+        new_text = new_text + suffix + synced_tail
     else:
-        new_text = text[:start].rstrip() + "\n\n" + synced_tail
+        new_text = new_text[:start].rstrip() + "\n\n" + synced_tail
 
     if new_text == text:
         return False
@@ -44,21 +232,32 @@ def sync_tail(path: Path, synced_tail: str) -> bool:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Sync the W instruction.md Harbor grading note and Required JSON "
-            "contracts block to wannier_200 material instructions."
+            "Sync shared provenance, decision-rationale, QE-save workflow, "
+            "Harbor grading note, and Required JSON contract blocks to "
+            "wannier_200 material instructions and linked dataset views."
         )
     )
     parser.add_argument(
         "--dataset-dir",
-        default="harbor_datasets/wannier_200",
+        action="append",
+        default=None,
         type=Path,
-        help="Dataset directory containing per-material instruction.md files.",
+        help=(
+            "Dataset directory containing per-material instruction.md files. "
+            "Can be passed more than once. Defaults to syncing both "
+            "harbor_datasets/wannier_200 and "
+            "harbor_datasets/wannier_200__needs_eval_with_qe_save."
+        ),
     )
     parser.add_argument(
         "--source",
-        default=Path("harbor_datasets/wannier_200/W/instruction.md"),
+        default=DEFAULT_SOURCE,
         type=Path,
-        help="Instruction file to copy the synced tail from.",
+        help=(
+            "Instruction file to copy the synced Harbor/JSON tail from. "
+            "Defaults to the Al24W6 instruction in the needs-eval-with-QE-save "
+            "dataset view."
+        ),
     )
     parser.add_argument(
         "--material",
@@ -78,7 +277,8 @@ def main() -> None:
     args = parse_args()
     synced_tail = extract_synced_tail(args.source)
     wanted = set(args.material)
-    paths = instruction_files(args.dataset_dir)
+    dataset_dirs = args.dataset_dir or list(DEFAULT_DATASET_DIRS)
+    paths = unique_instruction_files(dataset_dirs)
     if wanted:
         paths = [path for path in paths if path.parent.name in wanted]
 
@@ -86,9 +286,17 @@ def main() -> None:
     unchanged: list[Path] = []
     for path in paths:
         text = path.read_text(encoding="utf-8")
-        start = text.find(SYNC_HEADING)
-        current_tail = text[start:].strip() + "\n" if start != -1 else ""
-        if current_tail == synced_tail:
+        try:
+            new_text = sync_shared_contract_text(text)
+        except ValueError as exc:
+            raise SystemExit(f"{path}: {exc}") from exc
+        start = new_text.find(SYNC_HEADING)
+        if start == -1:
+            candidate = new_text.rstrip() + "\n\n" + synced_tail
+        else:
+            candidate = new_text[:start].rstrip() + "\n\n" + synced_tail
+
+        if candidate == text:
             unchanged.append(path)
         else:
             changed.append(path)
@@ -96,7 +304,7 @@ def main() -> None:
     action = "updated" if args.apply else "would update"
     for path in changed:
         if args.apply:
-            sync_tail(path, synced_tail)
+            sync_instruction(path, synced_tail)
         print(f"{action}: {path}")
 
     print(

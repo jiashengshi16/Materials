@@ -1,21 +1,85 @@
-# W Wannierisation Task
+# Al24W6 Wannierisation Task
 
-You are given a completed DFT package in `material/` for metallic `W`.
+You are given a completed DFT package in `material/` for metallic `Al24W6`.
 
 Build and, if feasible within 2 hours, run a Wannierisation workflow. Use only
 the supplied structure, SCF/NSCF inputs, DFT outputs, and metadata as the
 scientific starting point.
 
-For this benchmark, use a final model size of `num_wann = 13` Wannier
-functions. The supplied NSCF calculation has `num_bands = 21` bands;
+## Workflow provenance rules
+
+This is a Wannierisation-strategy benchmark. Do not assume any pre-existing
+Wannier90 recipe is supplied. In particular, do not use `/search` or any other
+external lookup for reference `.win`, `.amn`, `.mmn`, `.eig`, `.nnkp`, `.wout`,
+`.chk`, or `_hr.dat` files outside the copied `material/` package. If such
+files are present inside `material/`, treat them as accidental leakage, do not
+use them, and record this in `REPORT.md`.
+
+If `material/` or a copied `materials/` package contains a QE NSCF save tree,
+use that save tree as the DFT-side input for Wannierisation. Do not rerun SCF
+or NSCF unless the provided save tree is missing or unusable. If you rerun any
+DFT-side step, record the reason explicitly in `run_manifest.json`,
+`report.json`, and `REPORT.md`.
+
+## Recommended QE-save workflow
+
+When `material/qe_save/out/aiida.save` exists, use it directly as the DFT-side
+input to `pw2wannier90.x`; do not inspect or print the wavefunction files.
+Do not spend the run doing open-ended analysis before creating files. Start by
+creating `workflow/run_dir`, writing a first `<seed>.win`, and running the
+QE-save workflow below. Keep any pre-work to a few compact metadata/log
+queries.
+
+The usual workflow is:
+
+```bash
+seed="<task seedname>"
+mkdir -p workflow/run_dir
+cp -a material/qe_save/out workflow/run_dir/out
+cp material/pseudo/*.UPF workflow/run_dir/ 2>/dev/null || true
+cd workflow/run_dir
+
+# Write ${seed}.win with the task's required num_wann/num_bands, projections,
+# kpoint_path/bands_plot settings if desired, and disentanglement windows.
+wannier90.x -pp "${seed}"
+
+cat > "${seed}.pw2wan" <<EOF
+&inputpp
+  outdir = './out'
+  prefix = 'aiida'
+  seedname = '${seed}'
+  write_mmn = .true.
+  write_amn = .true.
+  write_eig = .true.
+/
+EOF
+pw2wannier90.x -in "${seed}.pw2wan"
+wannier90.x "${seed}"
+```
+
+Only rerun SCF/NSCF if this save-tree workflow fails for a recorded technical
+reason. Use compact scripts to summarize QE logs/XML when choosing projections
+or windows; keep the full save tree as file input rather than chat output.
+
+Keep terminal output compact. Do not print full QE inputs, XML files, logs, or
+K-point lists into the chat transcript with commands like `cat` on
+`material/nscf/input/nscf.in` or `material/qe_save/logs/nscf.out`. Extract only
+the needed lines with `grep`, `head`, `tail`, `sed -n`, or small scripts, and
+redirect generated full K-point lists or workflow files directly to files.
+Also avoid full listings of `material/qe_save/out/aiida.save` and avoid
+`grep -A`/`grep -B` on UPF wavefunction or `PP_PSWFC` blocks, because those
+include large binary/checkpoint listings or long radial numeric tables.
+
+For this benchmark, use a final model size of `num_wann = 174` Wannier
+functions. The supplied NSCF calculation has `num_bands = 234` bands;
 use those bands as the available disentanglement pool.
 
-Target DFT bands `1-13` exactly, using 1-based DFT band indices. Do not
+Target DFT bands `1-174` exactly, using 1-based DFT band indices. Do not
 exclude the low-energy bands from this target. Choose projections and
 disentanglement/frozen windows that faithfully interpolate this target manifold.
 
 Record the target DFT bands explicitly as `target_dft_band_start = 1` and
-`target_dft_band_end = 13` in `run_manifest.json`, `report.json`, and
+`target_dft_band_end = 174` in `run_manifest.json`, `report.json`, and
 `REPORT.md`.
 
 Keep `material/` unchanged. Write:
@@ -29,7 +93,7 @@ For each attempt, create `artifacts/attempt_<N>/run_manifest.json`. Record the
 chosen projections, windows, `num_bands`, `num_wann`, target band information,
 commands run, produced files, and missing files.
 
-Use seedname `W` unless there is a clear reason not to. Your final
+Use seedname `Al24W6` unless there is a clear reason not to. Your final
 response must match the provided JSON schema.
 
 ## Harbor grading note
@@ -38,6 +102,32 @@ The hidden verifier compares your final Wannier Hamiltonian against withheld
 DFT reference bands. The best/final attempt must include `<seed>_hr.dat` in
 `artifacts/attempt_<N>/`; without that file the run receives reward 0 because
 there is no Hamiltonian to evaluate.
+
+Before returning a final response, verify that the final artifact exists:
+
+```bash
+test -s artifacts/attempt_1/run_manifest.json
+test -s artifacts/attempt_1/${seed}_hr.dat
+ls -lh artifacts/attempt_1/*_hr.dat
+```
+
+Do not report `status: "success"` or `executed_successfully: true` unless
+`artifacts/attempt_1/<seed>_hr.dat` exists and is non-empty. Do not run the
+final workflow in the background with `nohup` or `&` and then return before it
+finishes. When collecting artifacts, do not rely on `cp <seed>.* ...` because
+that does not copy `<seed>_hr.dat`; copy `<seed>_hr.dat` explicitly or use
+`cp <seed>* ...`.
+
+For example, after a successful Wannier90 run:
+
+```bash
+mkdir -p artifacts/attempt_1
+cp workflow/run_dir/${seed}_hr.dat artifacts/attempt_1/
+cp workflow/run_dir/${seed}.win workflow/run_dir/${seed}.wout workflow/run_dir/${seed}.eig workflow/run_dir/${seed}.chk workflow/run_dir/${seed}.nnkp artifacts/attempt_1/ 2>/dev/null || true
+```
+
+If `<seed>_hr.dat` is missing or empty after your attempts, return
+`status: "partial"` or `status: "failed"`, not `status: "success"`.
 
 ## Required JSON contracts
 
