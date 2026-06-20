@@ -11,7 +11,7 @@ from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
 
-DEFAULT_GEMINI_RUN_TIMEOUT_SEC = "600"
+DEFAULT_GEMINI_RUN_TIMEOUT_SEC = "5400"
 
 
 class CachedGeminiCli(GeminiCli):
