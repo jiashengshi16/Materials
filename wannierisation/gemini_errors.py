@@ -15,6 +15,7 @@ from openpyxl.utils import get_column_letter
 
 INPUT_JSON = "/Users/jshi/Documents/GitHub/WannierisationBenchmarking/jobs/num_wann_ordered_diagnostics_summary.json"
 OUTPUT_XLSX = "/Users/jshi/Documents/GitHub/WannierisationBenchmarking/jobs/gemini_vs_reference_errors.xlsx"
+MATERIALS_ROOT = "/Users/jshi/Documents/GitHub/WannierisationBenchmarking/harbor_datasets/wannier_200"
 
 # Highlight rows where Gemini error is >= this many times the reference error.
 RATIO_HIGHLIGHT_THRESHOLD = 10.0
@@ -36,6 +37,7 @@ def get_first_number(d, keys):
 
 def extract_rows(data):
     rows = []
+    materials_root = Path(MATERIALS_ROOT).expanduser().resolve()
 
     records = data.get("results", [])
     if not isinstance(records, list):
@@ -54,6 +56,10 @@ def extract_rows(data):
             continue
 
         material = d.get("material") or d.get("material_from_folder")
+        has_qe_save = bool(
+            material
+            and (materials_root / material / "environment" / "material" / "qe_save").is_dir()
+        )
 
         # In your JSON, Gemini error is usually rmse_eV. Keep a fallback list
         # in case future summaries write it under a more explicit key.
@@ -94,6 +100,7 @@ def extract_rows(data):
                 "gemini_error_eV": gemini_error,
                 "reference_error_eV": reference_error,
                 "gemini_to_reference_ratio": ratio,
+                "has_qe_save": has_qe_save,
                 "highlight_10x_or_more": bool(is_number(ratio) and ratio >= RATIO_HIGHLIGHT_THRESHOLD),
                 "reference_error_source": d.get("reference_error_source"),
                 "job_folder": d.get("job_folder"),
@@ -117,6 +124,7 @@ def write_xlsx(rows, output_xlsx):
         "gemini_error_eV",
         "reference_error_eV",
         "gemini_to_reference_ratio",
+        "has_qe_save",
         "highlight_10x_or_more",
         "reference_error_source",
         "job_folder",
@@ -184,6 +192,7 @@ def write_xlsx(rows, output_xlsx):
         "gemini_error_eV": 18,
         "reference_error_eV": 20,
         "gemini_to_reference_ratio": 24,
+        "has_qe_save": 14,
         "highlight_10x_or_more": 22,
         "reference_error_source": 28,
         "job_folder": 58,
