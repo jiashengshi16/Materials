@@ -60,6 +60,15 @@ def numeric_reward(value: Any) -> float | None:
         return float(value)
     return None
 
+def recency_sort_key(record: RunRecord) -> tuple[str, str]:
+    """Sort by timestamp embedded in the job folder name, then folder name.
+
+    The timestamp string in these job names is ISO-like, so lexical sorting should
+    put newer runs later.
+    """
+    match = JOB_NAME_RE.match(record.folder.name)
+    timestamp = match.group("timestamp") if match else ""
+    return (timestamp, record.folder.name)
 
 def diagnostics_paths_for_job_folder(folder: Path) -> list[Path]:
     """Return verifier diagnostics files belonging to a top-level job folder.
@@ -222,7 +231,15 @@ def main() -> None:
             print()
 
         if not successes:
-            print("Decision: multiple fails only; keep all folders.")
+            keep = max(runs, key=lambda record: recency_sort_key(record))
+            delete_for_material = [run.folder for run in runs if run.folder != keep.folder]
+            folders_to_delete.extend(delete_for_material)
+
+            print("Decision: multiple fails only; keep the most recent failed run.")
+            print(f"KEEP: {keep.folder}")
+            print("DELETE:")
+            for folder in delete_for_material:
+                print(f"  {folder}")
             print()
             continue
 
