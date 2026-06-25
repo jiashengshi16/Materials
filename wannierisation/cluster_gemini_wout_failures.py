@@ -41,6 +41,7 @@ DEFAULT_SUMMARY = ROOT / "jobs" / "num_wann_ordered_diagnostics_summary.json"
 DEFAULT_JOBS = ROOT / "jobs"
 DEFAULT_DATASET = ROOT / "harbor_datasets" / "wannier_200"
 DEFAULT_OUTPUT = ROOT / "jobs" / "gemini_wout_clustering"
+DEFAULT_PROJECTION_CATEGORIES = ROOT / "jobs" / "gemini_projection_categories_from_win.json"
 
 FLOAT = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][-+]?\d+)?"
 WF_RE = re.compile(
@@ -93,6 +94,16 @@ ERROR_CMAP = LinearSegmentedColormap.from_list(
 )
 
 MISSING_COLOR = "#FFFFFF"
+PROJECTION_COLORS = {
+    "explicit_projection_runs": "#D9D9D9",
+    "random_projection_runs": "#4A4A4A",
+    "none_or_implicit_projection_runs": "#000000",
+}
+PROJECTION_LABELS = {
+    "explicit_projection_runs": "Explicit projections",
+    "random_projection_runs": "Random projections",
+    "none_or_implicit_projection_runs": "None/implicit projections",
+}
 
 
 def number(value: Any) -> float | None:
@@ -252,6 +263,45 @@ def error_category(ratio: float | None) -> str:
     return ">=10x"
 
 
+def load_projection_categories(path: Path) -> dict[str, str]:
+    """Load material -> projection category from classify_gemini_projection_modes.py JSON."""
+    if not path.is_file():
+        return {}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    result: dict[str, str] = {}
+
+    for cohort in data.get("cohorts", {}).values():
+        if not isinstance(cohort, dict):
+            continue
+
+        details = cohort.get("details", [])
+        if isinstance(details, list):
+            for item in details:
+                if not isinstance(item, dict):
+                    continue
+                material = item.get("material")
+                category = item.get("projection_category")
+                if isinstance(material, str) and isinstance(category, str):
+                    result[material] = category
+
+        materials = cohort.get("materials", {})
+        if isinstance(materials, dict):
+            for category, names in materials.items():
+                if not isinstance(category, str) or not isinstance(names, list):
+                    continue
+                for material in names:
+                    if isinstance(material, str):
+                        result.setdefault(material, category)
+
+    return result
+
+
+def projection_color(category: str | None) -> str:
+    if not category:
+        return MISSING_COLOR
+    return PROJECTION_COLORS.get(category, MISSING_COLOR)
+
+
 def record_row(record: dict[str, Any], jobs_root: Path, dataset: Path) -> dict[str, Any]:
     material = str(record.get("material") or record.get("material_from_folder"))
     trial = find_trial(record, jobs_root)
@@ -368,6 +418,7 @@ def make_plot(df: pd.DataFrame, z: np.ndarray, scaled: pd.DataFrame, output: Pat
     row_colors = pd.DataFrame({
         "Cluster": df["cluster"].map(cluster_color),
         "Error ratio": error_gradient_colors(df["error_ratio"]),
+        "Projection": df["projection_category"].map(projection_color),
     }, index=df.index)
     sns.set_theme(style="white", font_scale=0.72)
     height = max(14.0, min(42.0, 0.19 * len(df)))
@@ -397,6 +448,12 @@ def make_plot(df: pd.DataFrame, z: np.ndarray, scaled: pd.DataFrame, output: Pat
         Patch(facecolor=to_hex(ERROR_CMAP(0.0)), label="Lower interpolation error"),
         Patch(facecolor=to_hex(ERROR_CMAP(1.0)), label="Higher interpolation error"),
         Patch(facecolor=MISSING_COLOR, label="Missing error"),
+    ]
+    legend += [
+        Patch(facecolor=PROJECTION_COLORS["explicit_projection_runs"], label="Explicit projections"),
+        Patch(facecolor=PROJECTION_COLORS["random_projection_runs"], label="Random projections"),
+        Patch(facecolor=PROJECTION_COLORS["none_or_implicit_projection_runs"], label="None/implicit projections"),
+        Patch(facecolor=MISSING_COLOR, label="Missing projection category"),
     ]
     grid.ax_col_dendrogram.legend(
         handles=legend, title="Row annotations", loc="center", ncol=min(5, len(legend)), frameon=False
@@ -436,6 +493,12 @@ def main() -> None:
     parser.add_argument("--jobs-root", type=Path, default=DEFAULT_JOBS)
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument(
+        "--projection-categories",
+        type=Path,
+        default=DEFAULT_PROJECTION_CATEGORIES,
+        help="JSON from scripts/classify_gemini_projection_modes.py used for projection-mode row colours",
+    )
     parser.add_argument("--clusters", type=int, default=5, help="number of coloured dendrogram groups")
     args = parser.parse_args()
     if args.clusters < 2:
@@ -443,6 +506,9 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     df, failures = build_rows(args.summary, args.jobs_root, args.dataset)
+    projection_categories = load_projection_categories(args.projection_categories)
+    df["projection_category"] = df["material"].map(projection_categories)
+    df["projection_color_hex"] = df["projection_category"].map(projection_color)
     # A row with no final spread has no localization signature to cluster.
     # Preserve it in the failure ledger instead of median-imputing every
     # diagnostic and making it look artificially ordinary.
@@ -464,6 +530,7 @@ def main() -> None:
 
     clustered["cluster_color_hex"] = clustered["cluster"].map(cluster_colors)
     clustered["error_color_hex"] = error_gradient_colors(clustered["error_ratio"])
+    clustered["projection_color_hex"] = clustered["projection_category"].map(projection_color)
     clustered.sort_values("dendrogram_order_top_to_bottom").to_csv(
         args.output_dir / "gemini_wout_cluster_assignments.csv", index=False
     )
