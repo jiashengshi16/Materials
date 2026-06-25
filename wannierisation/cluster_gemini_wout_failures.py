@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
-"""Cluster Gemini calculations by localization/disentanglement symptoms in .wout.
+"""Cluster Gemini calculations by process diagnostics in submitted outputs.
 
-The clustering deliberately does not use interpolation error.  Error ratio is
-shown as a row-colour annotation, so enrichment of high-error calculations in
-a cluster is an independent observation rather than a built-in result.
+The process heatmap deliberately does not use interpolation error.  Error ratio
+is shown as a row-colour annotation there, so enrichment of high-error
+calculations in a cluster is an independent observation rather than a built-in
+result.  A second heatmap includes interpolation error as a clustered feature.
 
 Outputs:
-  gemini_wout_cluster_heatmap.png/pdf  labelled heatmap and dendrogram
+  gemini_wout_cluster_heatmap_process.png/pdf     process-only heatmap
+  gemini_wout_cluster_heatmap_all_columns.png/pdf heatmap including error ratio
   gemini_wout_cluster_assignments.csv  one traceable row per calculation
   gemini_wout_cluster_summary.csv      cluster-level error/feature summary
   gemini_wout_features.csv             all raw and transformed diagnostics
 """
 
 from __future__ import annotations
-from matplotlib.colors import LinearSegmentedColormap, Normalize, to_hex
 import argparse
 import json
 import math
@@ -28,13 +29,14 @@ os.environ.setdefault("MPLCONFIGDIR", str(ROOT / ".matplotlib-cache"))
 os.environ.setdefault("XDG_CACHE_HOME", str(ROOT / ".cache"))
 
 import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap, Normalize, to_hex
 from matplotlib.patches import Patch
 import numpy as np
 import pandas as pd
 import seaborn as sns
 from scipy.cluster.hierarchy import fcluster, leaves_list, linkage
-from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import RobustScaler
+from scipy.spatial.distance import squareform
+from sklearn.metrics.pairwise import nan_euclidean_distances
 
 
 DEFAULT_SUMMARY = ROOT / "jobs" / "num_wann_ordered_diagnostics_summary.json"
@@ -61,20 +63,28 @@ WOUT_TOTAL_ITER_RE = re.compile(
 )
 
 
-# Human-readable names appear as columns in the heatmap.  The underlying raw
-# values remain available in gemini_wout_features.csv.
-FEATURES = {
-    "log_final_spread_per_wf": "log final spread/WF",
-    "log_final_spread_per_wf_vs_ref": "log spread/WF vs ref",
-    "log_max_wf_spread": "log worst-WF spread",
-    "log_max_wf_spread_vs_ref": "log worst WF vs ref",
-    "log_max_to_median": "log worst/median WF",
-    "omega_I_fraction": "Omega I fraction",
-    "omega_OD_fraction": "Omega OD fraction",
-    "fractional_spread_reduction": "spread reduction",
-    "localization_iteration_fraction": "localization iter fraction",
-    "localization_reached_limit": "localization reached limit",
-    "disentanglement_converged": "disentanglement converged",
+# Human-readable names appear as columns in the heatmap. The underlying raw
+# values remain available in gemini_wout_features.csv. Missing values are kept
+# blank in the heatmap and ignored pairwise when computing row distances.
+PROCESS_FEATURES = {
+    "log_final_spread_per_wf": "final spread/WF badness",
+    "log_final_spread_per_wf_vs_ref": "spread/WF vs ref badness",
+    "log_max_wf_spread": "worst-WF spread badness",
+    "log_max_wf_spread_vs_ref": "worst WF vs ref badness",
+    "log_max_to_median": "worst/median WF badness",
+    "omega_I_fraction": "Omega I fraction badness",
+    "omega_OD_fraction": "Omega OD fraction badness",
+    "fractional_spread_reduction": "spread reduction deficit",
+}
+ALL_FEATURES = {
+    **PROCESS_FEATURES,
+    "log_error_ratio": "interpolation error badness",
+}
+FEATURE_DIRECTIONS = {
+    # Values in the heatmap are oriented so red always means worse and blue
+    # always means better.  Negating the reduction feature preserves pairwise
+    # distances but fixes the visual sign convention.
+    "fractional_spread_reduction": -1,
 }
 
 CLUSTER_CMAP = LinearSegmentedColormap.from_list(
@@ -94,6 +104,7 @@ ERROR_CMAP = LinearSegmentedColormap.from_list(
 )
 
 MISSING_COLOR = "#FFFFFF"
+MISSING_CLUSTER_COLOR = "#BDBDBD"
 PROJECTION_COLORS = {
     "explicit_projection_runs": "#D9D9D9",
     "random_projection_runs": "#4A4A4A",
@@ -104,8 +115,6 @@ PROJECTION_LABELS = {
     "random_projection_runs": "Random projections",
     "none_or_implicit_projection_runs": "None/implicit projections",
 }
-
-
 def number(value: Any) -> float | None:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         value = float(value)
@@ -319,7 +328,6 @@ def record_row(record: dict[str, Any], jobs_root: Path, dataset: Path) -> dict[s
     iters = number(gemini["localization_iterations"])
     if num_iter_limit is None:
         num_iter_limit = gemini["localization_iteration_limit"]
-    iter_fraction = iters / num_iter_limit if iters is not None and num_iter_limit else None
     ratio = number(record.get("gemini_to_reference_rmse_ratio"))
     if ratio is None:
         gemini_error = number(record.get("rmse_eV"))
@@ -341,8 +349,6 @@ def record_row(record: dict[str, Any], jobs_root: Path, dataset: Path) -> dict[s
         "disentanglement_converged": gemini["disentanglement_converged"],
         "localization_iterations": iters,
         "localization_iteration_limit": num_iter_limit,
-        "localization_iteration_fraction": iter_fraction,
-        "localization_reached_limit": float(iters >= num_iter_limit) if iters is not None and num_iter_limit else None,
         **{f"gemini_{key}": value for key, value in gs.items()},
         **{f"reference_{key}": value for key, value in rs.items()},
         "omega_I_A2": omega_i,
@@ -359,6 +365,7 @@ def record_row(record: dict[str, Any], jobs_root: Path, dataset: Path) -> dict[s
         "log_max_wf_spread_vs_ref": safe_log_ratio(gs["max_wf_spread"], rs["max_wf_spread"]),
         "log_max_to_median": safe_log(gs["max_to_median"]),
         "fractional_spread_reduction": gs["fractional_spread_reduction"],
+        "log_error_ratio": math.log10(ratio) if ratio is not None and ratio > 0 else None,
     })
     return row
 
@@ -381,69 +388,106 @@ def build_rows(summary: Path, jobs_root: Path, dataset: Path) -> tuple[pd.DataFr
     return pd.DataFrame(rows), failures
 
 
-def cluster(df: pd.DataFrame, n_clusters: int) -> tuple[pd.DataFrame, np.ndarray, pd.DataFrame]:
-    feature_df = df[list(FEATURES)].apply(pd.to_numeric, errors="coerce")
+def cluster(
+    df: pd.DataFrame,
+    features: dict[str, str],
+    n_clusters: int,
+    cluster_column: str,
+    order_column: str,
+) -> tuple[pd.DataFrame, np.ndarray, pd.DataFrame]:
+    feature_df = df[list(features)].apply(pd.to_numeric, errors="coerce")
     usable = feature_df.columns[feature_df.notna().sum() >= 2]
     dropped = [name for name in feature_df.columns if name not in usable]
     if dropped:
         print("Dropped entirely/mostly missing clustering features:", ", ".join(dropped))
     feature_df = feature_df[usable]
+    clustered_rows = feature_df.notna().any(axis=1)
+    if (~clustered_rows).any():
+        names = ", ".join(df.loc[~clustered_rows, "material"].astype(str))
+        print(f"Left out rows with no usable {cluster_column} features: {names}")
+    feature_df = feature_df.loc[clustered_rows]
     if len(feature_df) < 2:
         raise RuntimeError("need at least two parsed calculations to cluster")
-    imputed = SimpleImputer(strategy="median").fit_transform(feature_df)
-    scaled = RobustScaler().fit_transform(imputed)
-    # Prevent a constant binary column from contributing NaN/meaningless values.
-    keep = np.ptp(scaled, axis=0) > 0
-    scaled = scaled[:, keep]
-    names = [FEATURES[name] for name, use in zip(feature_df.columns, keep) if use]
-    if scaled.shape[1] == 0:
+    oriented = feature_df.copy()
+    for feature, direction in FEATURE_DIRECTIONS.items():
+        if feature in oriented:
+            oriented[feature] = oriented[feature] * direction
+    medians = oriented.median(skipna=True)
+    q25 = oriented.quantile(0.25)
+    q75 = oriented.quantile(0.75)
+    scale = (q75 - q25).replace(0, 1).fillna(1)
+    display_scaled_df = (oriented - medians) / scale
+    # Constant columns can be displayed but cannot contribute to distances.
+    keep = display_scaled_df.max(axis=0) > display_scaled_df.min(axis=0)
+    distance_df = display_scaled_df.loc[:, keep]
+    if distance_df.shape[1] == 0:
         raise RuntimeError("all clustering features are constant")
-    z = linkage(scaled, method="ward", metric="euclidean", optimal_ordering=True)
+    distances = nan_euclidean_distances(distance_df.to_numpy())
+    finite_distances = distances[np.isfinite(distances)]
+    fill_distance = float(finite_distances.max()) if finite_distances.size else 0.0
+    distances = np.nan_to_num(distances, nan=fill_distance, posinf=fill_distance, neginf=0.0)
+    np.fill_diagonal(distances, 0.0)
+    z = linkage(squareform(distances, checks=False), method="average", optimal_ordering=True)
     result = df.copy()
-    result["cluster"] = fcluster(z, t=min(n_clusters, len(result)), criterion="maxclust")
-    result["dendrogram_order_top_to_bottom"] = np.nan
+    result[cluster_column] = np.nan
+    result.loc[feature_df.index, cluster_column] = fcluster(z, t=min(n_clusters, len(feature_df)), criterion="maxclust")
+    result[order_column] = np.nan
     order = leaves_list(z)
     for position, row_index in enumerate(order, start=1):
-        result.loc[result.index[row_index], "dendrogram_order_top_to_bottom"] = position
-    scaled_df = pd.DataFrame(scaled, index=result.index, columns=names)
-    return result, z, scaled_df
+        result.loc[feature_df.index[row_index], order_column] = position
+    display_scaled_df = display_scaled_df.rename(columns={name: features[name] for name in display_scaled_df.columns})
+    return result, z, display_scaled_df
 
 
-def make_plot(df: pd.DataFrame, z: np.ndarray, scaled: pd.DataFrame, output: Path) -> None:
+def make_plot(
+    df: pd.DataFrame,
+    z: np.ndarray,
+    scaled: pd.DataFrame,
+    output: Path,
+    cluster_column: str,
+    title: str,
+    xlabel: str,
+) -> None:
+    plot_df = df.loc[scaled.index]
+    cluster_labels = sorted(plot_df[cluster_column].dropna().unique())
     cluster_color = gradient_colors(
-        sorted(df["cluster"].unique()),
+        cluster_labels,
         CLUSTER_CMAP,
     )
 
     row_colors = pd.DataFrame({
-        "Cluster": df["cluster"].map(cluster_color),
-        "Error ratio": error_gradient_colors(df["error_ratio"]),
-        "Projection": df["projection_category"].map(projection_color),
-    }, index=df.index)
+        "Cluster": plot_df[cluster_column].map(cluster_color).fillna(MISSING_CLUSTER_COLOR),
+        "Error ratio": error_gradient_colors(plot_df["error_ratio"]),
+        "Projection": plot_df["projection_category"].map(projection_color),
+    }, index=plot_df.index)
     sns.set_theme(style="white", font_scale=0.72)
     height = max(14.0, min(42.0, 0.19 * len(df)))
+    cmap = plt.get_cmap("vlag").copy()
+    cmap.set_bad(MISSING_COLOR)
     grid = sns.clustermap(
         scaled,
         row_linkage=z,
         col_cluster=False,
         row_colors=row_colors,
-        cmap="vlag",
+        cmap=cmap,
         center=0,
         vmin=-3,
         vmax=3,
+        mask=scaled.isna(),
         linewidths=0,
         figsize=(16, height),
         dendrogram_ratio=(0.13, 0.02),
         colors_ratio=0.025,
         cbar_pos=(0.02, 0.82, 0.018, 0.12),
         cbar_kws={"label": "Robust-scaled diagnostic\n(clipped at +/-3)"},
-        yticklabels=df["material"].tolist(),
+        yticklabels=plot_df["material"].tolist(),
     )
-    grid.ax_heatmap.set_xlabel(".wout diagnostic (not interpolation error)")
+    grid.ax_heatmap.set_xlabel(xlabel)
     grid.ax_heatmap.set_ylabel("Material")
     grid.ax_heatmap.tick_params(axis="y", labelsize=6)
     grid.ax_heatmap.set_xticklabels(grid.ax_heatmap.get_xticklabels(), rotation=35, ha="right")
-    legend = [Patch(facecolor=color, label=f"Cluster {cid}") for cid, color in cluster_color.items()]
+    legend = [Patch(facecolor=color, label=f"Cluster {int(cid)}") for cid, color in cluster_color.items()]
+    legend += [Patch(facecolor=MISSING_CLUSTER_COLOR, label="No process cluster")]
     legend += [
         Patch(facecolor=to_hex(ERROR_CMAP(0.0)), label="Lower interpolation error"),
         Patch(facecolor=to_hex(ERROR_CMAP(1.0)), label="Higher interpolation error"),
@@ -458,29 +502,33 @@ def make_plot(df: pd.DataFrame, z: np.ndarray, scaled: pd.DataFrame, output: Pat
     grid.ax_col_dendrogram.legend(
         handles=legend, title="Row annotations", loc="center", ncol=min(5, len(legend)), frameon=False
     )
-    grid.fig.suptitle(
-        "Gemini Wannier90 failure signatures\nClustering uses localization/disentanglement diagnostics; error ratio is annotation only",
-        y=0.997,
-    )
+    grid.fig.suptitle(title, y=0.997)
     grid.savefig(output.with_suffix(".png"), dpi=220, bbox_inches="tight")
     grid.savefig(output.with_suffix(".pdf"), bbox_inches="tight")
     plt.close(grid.fig)
 
 
-def write_summary(df: pd.DataFrame, path: Path) -> None:
+def write_summary(
+    df: pd.DataFrame,
+    features: dict[str, str],
+    cluster_column: str,
+    order_column: str,
+    path: Path,
+) -> None:
     rows = []
-    for cluster_id, group in df.groupby("cluster", sort=True):
-        ordered = group.sort_values("dendrogram_order_top_to_bottom")
+    clustered_df = df[df[cluster_column].notna()]
+    for cluster_id, group in clustered_df.groupby(cluster_column, sort=True):
+        ordered = group.sort_values(order_column)
         valid_error = group["error_ratio"].dropna()
         row: dict[str, Any] = {
-            "cluster": cluster_id,
+            "cluster": int(cluster_id),
             "n_materials": len(group),
             "n_with_error_ratio": len(valid_error),
             "fraction_error_ge_2x": float((valid_error >= 2).mean()) if len(valid_error) else None,
             "median_error_ratio": float(valid_error.median()) if len(valid_error) else None,
             "materials_in_plot_order": "; ".join(ordered["material"]),
         }
-        for feature in FEATURES:
+        for feature in features:
             if feature in group:
                 row[f"median_{feature}"] = group[feature].median(skipna=True)
         rows.append(row)
@@ -499,7 +547,7 @@ def main() -> None:
         default=DEFAULT_PROJECTION_CATEGORIES,
         help="JSON from scripts/classify_gemini_projection_modes.py used for projection-mode row colours",
     )
-    parser.add_argument("--clusters", type=int, default=5, help="number of coloured dendrogram groups")
+    parser.add_argument("--clusters", type=int, default=10, help="number of coloured dendrogram groups")
     args = parser.parse_args()
     if args.clusters < 2:
         raise SystemExit("--clusters must be at least 2")
@@ -509,38 +557,87 @@ def main() -> None:
     projection_categories = load_projection_categories(args.projection_categories)
     df["projection_category"] = df["material"].map(projection_categories)
     df["projection_color_hex"] = df["projection_category"].map(projection_color)
-    # A row with no final spread has no localization signature to cluster.
-    # Preserve it in the failure ledger instead of median-imputing every
-    # diagnostic and making it look artificially ordinary.
-    unusable = df["log_final_spread_per_wf"].isna()
-    for _, row in df.loc[unusable].iterrows():
-        failures.append({
-            "material": str(row["material"]),
-            "job_folder": str(row["job_folder"]),
-            "error": "No parseable Final State/WF spreads in .wout",
-        })
-    df = df.loc[~unusable].reset_index(drop=True)
-    if failures:
-        pd.DataFrame(failures).to_csv(args.output_dir / "gemini_wout_parse_failures.csv", index=False)
-    clustered, z, scaled = cluster(df, args.clusters)
-    cluster_colors = gradient_colors(
-        sorted(clustered["cluster"].unique()),
+    df = df.reset_index(drop=True)
+    pd.DataFrame(failures, columns=["material", "job_folder", "error"]).to_csv(
+        args.output_dir / "gemini_wout_parse_failures.csv", index=False
+    )
+    clustered, z_process, scaled_process = cluster(
+        df,
+        PROCESS_FEATURES,
+        args.clusters,
+        "process_cluster",
+        "process_dendrogram_order_top_to_bottom",
+    )
+    clustered, z_all, scaled_all = cluster(
+        clustered,
+        ALL_FEATURES,
+        args.clusters,
+        "all_columns_cluster",
+        "all_columns_dendrogram_order_top_to_bottom",
+    )
+    process_cluster_colors = gradient_colors(
+        sorted(clustered["process_cluster"].dropna().unique()),
+        CLUSTER_CMAP,
+    )
+    all_cluster_colors = gradient_colors(
+        sorted(clustered["all_columns_cluster"].dropna().unique()),
         CLUSTER_CMAP,
     )
 
-    clustered["cluster_color_hex"] = clustered["cluster"].map(cluster_colors)
+    clustered["cluster"] = clustered["process_cluster"]
+    clustered["dendrogram_order_top_to_bottom"] = clustered["process_dendrogram_order_top_to_bottom"]
+    clustered["cluster_color_hex"] = clustered["process_cluster"].map(process_cluster_colors).fillna(MISSING_CLUSTER_COLOR)
+    clustered["process_cluster_color_hex"] = clustered["process_cluster"].map(process_cluster_colors).fillna(MISSING_CLUSTER_COLOR)
+    clustered["all_columns_cluster_color_hex"] = clustered["all_columns_cluster"].map(all_cluster_colors).fillna(MISSING_CLUSTER_COLOR)
     clustered["error_color_hex"] = error_gradient_colors(clustered["error_ratio"])
     clustered["projection_color_hex"] = clustered["projection_category"].map(projection_color)
-    clustered.sort_values("dendrogram_order_top_to_bottom").to_csv(
+    clustered.sort_values("process_dendrogram_order_top_to_bottom").to_csv(
         args.output_dir / "gemini_wout_cluster_assignments.csv", index=False
     )
     clustered.to_csv(args.output_dir / "gemini_wout_features.csv", index=False)
-    write_summary(clustered, args.output_dir / "gemini_wout_cluster_summary.csv")
-    make_plot(clustered, z, scaled, args.output_dir / "gemini_wout_cluster_heatmap")
+    write_summary(
+        clustered,
+        PROCESS_FEATURES,
+        "process_cluster",
+        "process_dendrogram_order_top_to_bottom",
+        args.output_dir / "gemini_wout_cluster_summary.csv",
+    )
+    write_summary(
+        clustered,
+        ALL_FEATURES,
+        "all_columns_cluster",
+        "all_columns_dendrogram_order_top_to_bottom",
+        args.output_dir / "gemini_wout_cluster_summary_all_columns.csv",
+    )
+    make_plot(
+        clustered,
+        z_process,
+        scaled_process,
+        args.output_dir / "gemini_wout_cluster_heatmap_process",
+        "process_cluster",
+        (
+            "Gemini Wannier90 process signatures\n"
+            "Rows clustered without interpolation error; missing cells are blank"
+        ),
+        "Process diagnostic (interpolation error excluded from clustering)",
+    )
+    make_plot(
+        clustered,
+        z_all,
+        scaled_all,
+        args.output_dir / "gemini_wout_cluster_heatmap_all_columns",
+        "all_columns_cluster",
+        (
+            "Gemini Wannier90 process and outcome signatures\n"
+            "Rows clustered with interpolation error included; missing cells are blank"
+        ),
+        "Diagnostic including interpolation error",
+    )
 
     print(f"Parsed calculations: {len(clustered)}")
     print(f"Parse failures: {len(failures)}")
     print(f"Output directory: {args.output_dir.resolve()}")
+    print("Wrote process and all-column heatmaps.")
     print("Trace any row via gemini_wout_cluster_assignments.csv (material, order, colours, and .wout path).")
 
 
