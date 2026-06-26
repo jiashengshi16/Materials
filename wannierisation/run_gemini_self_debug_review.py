@@ -17,27 +17,63 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
+HARBOR_DATASET_ROOT = Path(
+    "/Users/jshi/Documents/GitHub/WannierisationBenchmarking/"
+    "harbor_datasets/wannier_200"
+)
 
 # Hardcoded experiment controls.
 MATERIALS = [
     "NNb",
     "S2Ta",
-    'AsB'
     'He',
-    'FLi'
+    'FLi',
+    'Br2V',
     "Ni4Zr4",
     'Si2Ta4',
     'Se4Tl4',
-
+    'Na6O6',
+    'C4O12Sr4',
+    'Al4O8Zn2',
+    'C2Cd2O6',
+    'Al2Os',
+    'Mo4S6'
 ]
 MODEL = "gemini-3.1-pro-preview"
 GEMINI_BIN = "gemini"
 OUTPUT_ROOT = ROOT / "jobs" / "gemini_self_debug_reviews"
+ORIGINAL_TASK_INSTRUCTIONS = ROOT / "instruction.md"
+
 
 JOBS_ROOT = ROOT / "jobs"
 DIAGNOSTICS_SUMMARY = JOBS_ROOT / "num_wann_ordered_diagnostics_summary.json"
 ERROR_WORKBOOK = JOBS_ROOT / "gemini_vs_reference_errors.xlsx"
 FAILURE_MODES_DIR = JOBS_ROOT / "gemini_failure_modes"
+
+def find_original_task_instructions(material: str) -> Path:
+    material_dir = HARBOR_DATASET_ROOT / material
+
+    candidates = [
+        material_dir / "instruction.md"
+    ]
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+
+    matches = sorted(material_dir.glob("*instruction*.md"))
+    if len(matches) == 1:
+        return matches[0]
+
+    matches = sorted(material_dir.glob("*instructions*.md"))
+    if len(matches) == 1:
+        return matches[0]
+
+    raise SystemExit(
+        f"Could not find original task instructions for {material} in {material_dir}. "
+        "Expected one of: instruction.md, instructions.md, prompt.md, task.md, "
+        "or a unique *instruction*.md file."
+    )
 
 
 def read_json(path: Path) -> Any:
@@ -124,10 +160,24 @@ def find_attempt_file(attempt: Path, material: str, suffix: str) -> Path:
 def prompt_text(material: str) -> str:
     return f"""# Gemini Self-Debug Review: {material}
 
-You are reviewing your previous Wannierisation trajectory for `{material}`.
+You are reviewing a Wannierisation trajectory for `{material}`.
 This is forensic analysis only. Do not rerun QE, do not produce a new
 Wannierisation, and do not browse the internet. Use only files in this case
 directory.
+
+Your job is to reconstruct, as closely as the logs allow, the old decision chain 
+using the original task instructions and old run logs. Treat 
+`case_files/original_task_instructions.md` as the task prompt that was available 
+to the old model during the original run.
+
+Evaluate the trajectory fairly. If the old run made scientifically reasonable 
+choices given the information available at the time, say so and do not force a 
+critique. Only identify avoidable mistakes when the task materials, trajectory, 
+logs, or final diagnostics provide evidence that a specific choice was poor, 
+contradicted by later run output, or led to an avoidable failure or high RMSE. 
+For any such issue, explain what a scientifically better second try would have 
+changed, using only information that would have been available from the task 
+materials and old run logs. 
 
 Read these files:
 
@@ -141,11 +191,30 @@ Read these files:
 - `case_files/agent/gemini-cli.trajectory.jsonl`
 - `case_files/agent/gemini-cli.txt`
 - `case_files/gemini_failure_modes/*`
+- `case_files/original_task_instructions.md`
+
+Reference files and reference-derived fields are allowed only as outcome
+comparators. Do not recommend "copy the reference",
+SCDM, `use_ws_distance`, 'atom_proj = .true', or any other reference-only setting unless the original
+task materials made that option available. If a reference setting is not
+available under the original instructions, say so explicitly and give a
+non-reference second-attempt change instead. Any proposed “better second try” must still obey 
+case_files/original_task_instructions.md. Do not propose changes that would 
+violate the original task prompt, including fixed num_bands, fixed target-band 
+requirements, required artifact/status rules, forbidden external lookups, or
+any other original instruction constraints.
 
 Treat random projections as a bad/default-fallback choice unless the trajectory
 gives unusually strong material-specific evidence. In general, random
 projections should be discouraged. Do not say random projections were fine just
-because Wannier90 completed.
+because Wannier90 completed. If random projections were used after the trajectory
+had already derived a plausible physical projection, identify that abandoned
+fork and explain why the fallback was avoidable.
+
+Do not handwave from aggregate statistics. The files under
+`case_files/gemini_failure_modes/` are background only. The core diagnosis must
+come from this material's `.win`, `.wout`, run manifest, trajectory, and
+diagnostics/error records.
 
 Write exactly these two files:
 
@@ -155,7 +224,9 @@ Write exactly these two files:
 The Markdown report must be step-by-step and specific. For each substantive
 decision in the old trajectory, judge whether it was good, bad, mixed, or
 uncertain, and explain why using concrete evidence from `.win`, `.wout`,
-manifest notes, trajectory reasoning, and final error metrics. Cover at least:
+manifest notes, trajectory reasoning, and final error metrics. Cite the file
+paths you used, and include line numbers when you have them from grep, rg, nl,
+or similar inspection. Cover at least:
 
 1. projection choice;
 2. random projection use, if any;
@@ -165,13 +236,45 @@ manifest notes, trajectory reasoning, and final error metrics. Cover at least:
 6. response to Wannier90 warnings or iteration caps;
 7. localization quality from WF spreads and spread components;
 8. whether the old run accepted a result it should have rejected;
+
+If the run shows evidence of avoidable issues, also cover:
+
 9. the most likely specific failure chain;
 10. what should be done differently next time.
+
+For every decision review, answer all of these forensic questions:
+
+- What exactly did the old run decide or claim?
+- What evidence did the old run use at the time?
+- What later evidence in `.wout`, diagnostics, errors, or trajectory contradicts
+  or weakens that decision?
+- Was the mistake avoidable without seeing the hidden reference recipe?
+- What concrete second-attempt change should have been tried instead, staying
+  WITHIN the original task instructions?
+- What remains uncertain because the logs do not contain enough information?
+
+Be especially suspicious of:
+
+- accepting a result after checking only that `<seed>_hr.dat` exists;
+- judging localization by average/total spread while ignoring max WF spread,
+  spread outliers, final gradient, or iteration limits;
+- declaring projections "excellent" or windows "robust" merely because they are
+  chemically plausible;
+- padding `num_wann` with duplicate same-site, same-angular-momentum
+  projections without evidence that the channels are linearly independent;
+- abandoning a physically motivated projection after a syntax, stale-file, or
+  workflow error and falling back to `random`;
+- recommendations that only say "increase iterations" when the logs show a
+  projection, window, validation, or workflow-decision problem.
 
 Be explicit about uncertainty. Do not claim causal proof when the files only
 support diagnostic correlation. But make concrete judgments where evidence is
 strong: random projections, unconverged disentanglement, huge WF spreads,
 fragile windows, or mismatch between claimed rationale and observed output.
+Use "plausible but unproven" rather than "good" when a choice is chemically
+reasonable but the run output shows poor localization or band interpolation.
+The goal is to find avoidable scientific decision errors, not to assign credit
+for parameters that merely look conventional.
 
 The JSON report must have this shape:
 
@@ -179,27 +282,27 @@ The JSON report must have this shape:
 {{
   "material": "{material}",
   "verdict": "good | mixed | bad | uncertain",
-  "random_projections_used": false,
+  "random_projections_used": true | false,
   "random_projection_verdict": "not_used | bad | uncertain",
   "decision_reviews": [
     {{
       "decision": "short name",
       "verdict": "good | mixed | bad | uncertain",
       "evidence": ["specific file-backed evidence"],
+      "old_claim_or_decision": "what the old run said or did",
+      "observed_failure_signal": "what later output showed",
       "why": "specific explanation",
-      "better_choice": "what should have been done instead"
+      "better_choice": "concrete second-attempt change if the decision was an avoidable issue, otherwise null",
     }}
   ],
-  "failure_chain": ["ordered specific causes"],
-  "recommended_next_run_changes": ["specific changes"],
-  "confidence": "low | medium | high"
+"failure_chain": ["ordered specific causes, or empty if no avoidable failure chain is supported"],
+"recommended_next_run_changes": ["specific changes, or empty if the trajectory was reasonable and no supported changes are warranted"],
 }}
 ```
 
 Your final response should be a concise JSON object pointing to
 `self_debug_report.md` and `self_debug_report.json`.
 """
-
 
 def build_case(
     material: str,
@@ -229,6 +332,12 @@ def build_case(
     write_text(case_files / "diagnostics_record.json", json.dumps(record, indent=2) + "\n")
     write_text(case_files / "error_record.json", json.dumps(errors.get(material, {}), indent=2) + "\n")
     write_text(case_files / "failure_modes_record.json", json.dumps(modes.get(material, {}), indent=2) + "\n")
+
+    original_task_instructions = find_original_task_instructions(material)
+    copy_file(
+        original_task_instructions,
+        case_files / "original_task_instructions.md",
+    )
 
     for path in sorted(FAILURE_MODES_DIR.glob("*")):
         if path.is_file():
