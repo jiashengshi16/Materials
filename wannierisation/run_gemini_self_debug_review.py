@@ -22,6 +22,13 @@ ROOT = Path(__file__).resolve().parents[1]
 MATERIALS = [
     "NNb",
     "S2Ta",
+    'AsB'
+    'He',
+    'FLi'
+    "Ni4Zr4",
+    'Si2Ta4',
+    'Se4Tl4',
+
 ]
 MODEL = "gemini-3.1-pro-preview"
 GEMINI_BIN = "gemini"
@@ -230,18 +237,120 @@ def build_case(
     write_text(case_dir / "prompt.md", prompt_text(material))
     return case_dir
 
+def report_is_nonempty(case_dir: Path) -> bool:
+    md_path = case_dir / "self_debug_report.md"
+    json_path = case_dir / "self_debug_report.json"
+
+    if not md_path.is_file() or not json_path.is_file():
+        return False
+
+    if not md_path.read_text(encoding="utf-8").strip():
+        return False
+
+    raw_json = json_path.read_text(encoding="utf-8").strip()
+    if not raw_json:
+        return False
+
+    try:
+        data = json.loads(raw_json)
+    except json.JSONDecodeError:
+        return False
+
+    # Minimal sanity checks that this is actually the requested diagnosis.
+    if not isinstance(data, dict):
+        return False
+    if not data.get("verdict"):
+        return False
+    if not data.get("decision_reviews"):
+        return False
+    if not data.get("failure_chain"):
+        return False
+    if not data.get("recommended_next_run_changes"):
+        return False
+
+    return True
+
 
 def run_gemini(case_dir: Path) -> None:
     prompt = (case_dir / "prompt.md").read_text(encoding="utf-8")
-    log_path = case_dir / "gemini_stdout_stderr.txt"
+    combined_log_path = case_dir / "gemini_stdout_stderr.txt"
+    status_path = case_dir / "run_status.json"
+
     command = [
         GEMINI_BIN,
         "--yolo",
         f"--model={MODEL}",
         f"--prompt={prompt}",
     ]
-    with log_path.open("w", encoding="utf-8") as log:
-        subprocess.run(command, cwd=case_dir, stdout=log, stderr=subprocess.STDOUT, check=True)
+
+    attempts: list[dict[str, Any]] = []
+    max_attempts = 10
+
+    for attempt_index in range(1, max_attempts + 1):
+        # Remove stale outputs so success must come from this attempt.
+        for output_name in ("self_debug_report.md", "self_debug_report.json"):
+            output_path = case_dir / output_name
+            if output_path.exists():
+                output_path.unlink()
+
+        attempt_log_path = case_dir / f"gemini_attempt_{attempt_index:02d}_stdout_stderr.txt"
+
+        completed = subprocess.run(
+            command,
+            cwd=case_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+
+        stdout_stderr = completed.stdout or ""
+        attempt_log_path.write_text(stdout_stderr, encoding="utf-8")
+
+        produced_nonempty_diagnosis = report_is_nonempty(case_dir)
+
+        attempt_record = {
+            "attempt": attempt_index,
+            "returncode": completed.returncode,
+            "attempt_log_path": attempt_log_path.name,
+            "self_debug_report_md_exists": (case_dir / "self_debug_report.md").is_file(),
+            "self_debug_report_json_exists": (case_dir / "self_debug_report.json").is_file(),
+            "produced_nonempty_diagnosis": produced_nonempty_diagnosis,
+        }
+        attempts.append(attempt_record)
+
+        status = {
+            "command": command,
+            "max_attempts": max_attempts,
+            "success": produced_nonempty_diagnosis,
+            "attempts": attempts,
+        }
+        status_path.write_text(json.dumps(status, indent=2) + "\n", encoding="utf-8")
+
+        if produced_nonempty_diagnosis:
+            combined_log_path.write_text(stdout_stderr, encoding="utf-8")
+            return
+
+        print(
+            f"Gemini attempt {attempt_index}/{max_attempts} did not produce "
+            f"a non-empty diagnosis for {case_dir.name}; retrying..."
+        )
+
+    combined_log_path.write_text(
+        "\n\n".join(
+            [
+                f"===== ATTEMPT {record['attempt']} "
+                f"returncode={record['returncode']} =====\n"
+                f"{(case_dir / record['attempt_log_path']).read_text(encoding='utf-8')}"
+                for record in attempts
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    raise SystemExit(
+        f"Gemini review failed after {max_attempts} attempts or did not write "
+        f"a non-empty diagnosis: {case_dir}"
+    )
 
 
 def main() -> None:
