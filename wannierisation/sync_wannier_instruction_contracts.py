@@ -10,6 +10,7 @@ import argparse
 from pathlib import Path
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATASET_DIRS = (
     Path("harbor_datasets/wannier_200"),
     Path("harbor_datasets/wannier_200__needs_eval_with_qe_save"),
@@ -62,6 +63,12 @@ Maintain `workflow/DECISIONS.md` throughout the run. Each entry must include:
 Do not merely list parameter values. Explain the rationale for choosing them.
 If a choice is uncertain or heuristic, state the uncertainty and why it is still
 a reasonable choice.
+
+PROJECTION CHOICES MUST NOT BE RANDOM. USE YOUR OWN EXPLICIT PROJECTIONS. Do not use `random`, randomized trial projections, or arbitrary placeholder projections
+as a fallback. If the ideal projection set is uncertain infer the best
+available projections from evidence such as composition, valence electron count, expected orbital character,
+pseudopotential metadata, QE logs/XML, band energies, and the target band
+manifold.
 
 At the end, copy the decision rationales into `REPORT.md` and summarize the key
 rationales in `report.json.runtime_notes` and
@@ -147,6 +154,13 @@ def unique_instruction_files(dataset_dirs: list[Path]) -> list[Path]:
         for path in instruction_files(dataset_dir):
             paths_by_real_path.setdefault(path.resolve(), path)
     return sorted(paths_by_real_path.values())
+
+
+def resolve_repo_relative(path: Path) -> Path:
+    """Resolve relative paths from cwd first, then from the repository root."""
+    if path.is_absolute() or path.exists():
+        return path
+    return REPO_ROOT / path
 
 
 def remove_block_from_heading(text: str, heading: str, end_markers: tuple[str, ...]) -> str:
@@ -275,9 +289,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    synced_tail = extract_synced_tail(args.source)
+    source = resolve_repo_relative(args.source)
+    synced_tail = extract_synced_tail(source)
     wanted = set(args.material)
-    dataset_dirs = args.dataset_dir or list(DEFAULT_DATASET_DIRS)
+    dataset_dirs = [
+        resolve_repo_relative(dataset_dir)
+        for dataset_dir in (args.dataset_dir or list(DEFAULT_DATASET_DIRS))
+    ]
     paths = unique_instruction_files(dataset_dirs)
     if wanted:
         paths = [path for path in paths if path.parent.name in wanted]

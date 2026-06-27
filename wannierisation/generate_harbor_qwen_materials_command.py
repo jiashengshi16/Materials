@@ -15,7 +15,10 @@ import generate_harbor_num_wann_order_command as harbor_generator
 # Edit only this list. Names must exactly match directories in wannier_200.
 MATERIALS = [
     'AsB',
-    #'BrLi', 
+    #'BrLi',
+    'He',
+    'FLi',
+    #'Ne'
     # 'BrNa' 
 
 ]
@@ -25,7 +28,7 @@ MATERIALS = [
 DEFAULT_QWEN_BASE_URL = (
     "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
 )
-MODEL = "qwen3-coder-30b-a3b-instruct"
+MODEL = "qwen3-coder-480b-a35b-instruct"
 MAX_MATERIALS = 10
 
 
@@ -79,7 +82,9 @@ def main() -> None:
             "Unknown material directory/directories: " + ", ".join(missing)
         )
 
-    # Match the Namespace consumed by the existing, unchanged command builder.
+    # Match the Namespace consumed by the shared command builder. Its default
+    # artifact list intentionally skips /app/artifacts to avoid a duplicate
+    # artifacts/artifacts export.
     args = argparse.Namespace(
         dataset=cli.dataset,
         agent="qwen-coder",  # Harbor's name for its native Qwen Code adapter.
@@ -87,6 +92,8 @@ def main() -> None:
         n_concurrent=1,
         batch_size=cli.batch_size,
         stop_on_error=cli.stop_on_error,
+        docker_prune_after_batch=False,
+        docker_prune_after_material=False,
         delete_after_run=True,
         extra_arg=[
             "--agent-kwarg",

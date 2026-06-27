@@ -15,9 +15,18 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATASET = ROOT / "harbor_datasets" / "wannier_200"
 NUM_WANN_RE = re.compile(r"\bnum_wann\s*=\s*(\d+)\b")
-DEFAULT_ARTIFACTS = ["/app/artifacts", "/app/report.json", "/app/REPORT.md"]
+# The task test wrapper already copies /app/artifacts/. into /logs/artifacts,
+# which Harbor stores as the trial's top-level artifacts directory. Exporting
+# /app/artifacts again creates a duplicate artifacts/artifacts tree.
+DEFAULT_ARTIFACTS = ["/app/report.json", "/app/REPORT.md"]
+QE_SAVE_EXPORT_ARTIFACTS = [
+    "/app/workflow/run_dir/out",
+    "/app/workflow/run_dir/scf.out",
+    "/app/workflow/run_dir/nscf.out",
+]
 DEFAULT_N_CONCURRENT = 4
 QE_SAVE_RELATIVE_PATH = Path("environment") / "material" / "qe_save"
+QE_SAVE_INSTALLER = ROOT / "scripts" / "install_harbor_qe_save.py"
 HOST_NETWORK_COMPOSE = ROOT / "docker" / "harbor-host-network.compose.yml"
 GEMINI_IPV4_NODE_OPTIONS = "NODE_OPTIONS=--dns-result-order=ipv4first"
 GEMINI_RUN_TIMEOUT_ENV = "HARBOR_GEMINI_RUN_TIMEOUT_SEC=7000"
@@ -270,6 +279,8 @@ def build_command(args: argparse.Namespace, dataset: Path, *, n_concurrent: int 
         command.extend(all_extra_args)
 
     artifacts = [] if args.no_default_artifacts else list(DEFAULT_ARTIFACTS)
+    if args.save_generated_qe_save:
+        artifacts.extend(QE_SAVE_EXPORT_ARTIFACTS)
     artifacts.extend(args.artifact)
     for artifact in artifacts:
         command.extend(["--artifact", artifact])
@@ -331,7 +342,22 @@ def print_ordered_commands(args: argparse.Namespace, tasks: list[tuple[int, str,
                     ]
                 )
             )
-            print(f"  {shlex.join(command)} &")
+            if args.save_generated_qe_save:
+                installer = [
+                    str(QE_SAVE_INSTALLER),
+                    "--job-dir",
+                    str(args.jobs_root / job_name),
+                    "--task-dir",
+                    str(source),
+                ]
+                print("  (")
+                print("    task_status=0")
+                print(f"    {shlex.join(command)} || task_status=$?")
+                print(f"    {shlex.join(installer)} || task_status=$?")
+                print('    exit "$task_status"')
+                print("  ) &")
+            else:
+                print(f"  {shlex.join(command)} &")
             print("  pids+=(\"$!\")")
         print("  batch_status=0")
         print('  for pid in "${pids[@]}"; do')
@@ -380,9 +406,25 @@ def main() -> None:
         default=[],
         help=(
             "Pass one additional Harbor --artifact path to every generated harbor run. "
-            "The plotting-critical paths /app/artifacts, /app/report.json, and "
-            "/app/REPORT.md are already included by default."
+            "The plotting-summary paths /app/report.json and /app/REPORT.md are "
+            "already included by default. The attempt artifacts are preserved by "
+            "the task wrapper without exporting /app/artifacts again."
         ),
+    )
+    parser.add_argument(
+        "--save-generated-qe-save",
+        action="store_true",
+        help=(
+            "Export a valid workflow/run_dir/out tree from each Harbor trial and "
+            "install it into the source task's environment/material/qe_save after the run. "
+            "Existing qe_save directories are never overwritten."
+        ),
+    )
+    parser.add_argument(
+        "--jobs-root",
+        type=Path,
+        default=ROOT / "jobs",
+        help="Harbor jobs directory used to locate exported QE-save artifacts.",
     )
     parser.add_argument(
         "--no-default-artifacts",
@@ -508,6 +550,8 @@ def main() -> None:
         raise SystemExit("--model/-m cannot be empty")
     if args.n_concurrent < 1:
         raise SystemExit("--n-concurrent/-n must be at least 1")
+    if args.save_generated_qe_save and args.single_job:
+        raise SystemExit("--save-generated-qe-save requires the default explicit batch launcher")
 
     include_materials = None
     exclude_materials = None
