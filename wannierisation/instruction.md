@@ -1,6 +1,6 @@
-# Al24W6 Wannierisation Task
+# Ag2Y Wannierisation Task
 
-You are given a completed DFT package in `material/` for metallic `Al24W6`.
+You are given a completed DFT package in `material/` for metallic `Ag2Y`.
 
 Build and, if feasible within 2 hours, run a Wannierisation workflow. Use only
 the supplied structure, SCF/NSCF inputs, DFT outputs, and metadata as the
@@ -20,6 +20,41 @@ use that save tree as the DFT-side input for Wannierisation. Do not rerun SCF
 or NSCF unless the provided save tree is missing or unusable. If you rerun any
 DFT-side step, record the reason explicitly in `run_manifest.json`,
 `report.json`, and `REPORT.md`.
+
+## Decision rationale requirement
+
+For every Wannierisation decision, explain clearly **why** the choice
+was made. This includes, at minimum: projections, `num_wann`, `num_bands`,
+target-band handling, disentanglement windows, frozen windows, band exclusions
+or non-exclusions, whether to rerun any DFT-side step, how to respond to failed
+commands, whether to make another attempt, and how to set final artifact status.
+
+Maintain `workflow/DECISIONS.md` throughout the run. Each entry must include:
+- the decision made;
+- the evidence used, such as electron count, orbital character, QE logs/XML,
+  band index range, energy range, command output, or missing files;
+- why that evidence supports the decision;
+- the expected effect on the Wannierisation.
+
+Do not merely list parameter values. Explain the rationale for choosing them.
+If a choice is uncertain or heuristic, state the uncertainty and why it is still
+a reasonable choice.
+
+PROJECTION CHOICES MUST NOT BE RANDOM. USE YOUR OWN EXPLICIT PROJECTIONS. Do not use `random`, randomized trial projections, or arbitrary placeholder projections
+as a fallback. If the ideal projection set is uncertain infer the best
+available projections from evidence such as composition, valence electron count, expected orbital character,
+pseudopotential metadata, QE logs/XML, band energies, and the target band
+manifold.
+
+At the end, copy the decision rationales into `REPORT.md` and summarize the key
+rationales in `report.json.runtime_notes` and
+`artifacts/attempt_<N>/run_manifest.json.notes`.
+
+If `material/pseudo/` contains UPF files, those are the pseudopotentials that
+match the supplied QE inputs. Prefer rerunning SCF/NSCF with
+`pseudo_dir = './pseudo/'` from a workflow run directory that symlinks or copies
+`material/pseudo/`, especially when the supplied QE 6.3 XML cannot be consumed
+directly by the installed `pw2wannier90.x`.
 
 ## Recommended QE-save workflow
 
@@ -70,16 +105,16 @@ Also avoid full listings of `material/qe_save/out/aiida.save` and avoid
 `grep -A`/`grep -B` on UPF wavefunction or `PP_PSWFC` blocks, because those
 include large binary/checkpoint listings or long radial numeric tables.
 
-For this benchmark, use a final model size of `num_wann = 174` Wannier
-functions. The supplied NSCF calculation has `num_bands = 234` bands;
+For this benchmark, use a final model size of `num_wann = 33` Wannier
+functions. The supplied NSCF calculation has `num_bands = 73` bands;
 use those bands as the available disentanglement pool.
 
-Target DFT bands `1-174` exactly, using 1-based DFT band indices. Do not
+Target DFT bands `1-33` exactly, using 1-based DFT band indices. Do not
 exclude the low-energy bands from this target. Choose projections and
 disentanglement/frozen windows that faithfully interpolate this target manifold.
 
 Record the target DFT bands explicitly as `target_dft_band_start = 1` and
-`target_dft_band_end = 174` in `run_manifest.json`, `report.json`, and
+`target_dft_band_end = 33` in `run_manifest.json`, `report.json`, and
 `REPORT.md`.
 
 Keep `material/` unchanged. Write:
@@ -93,7 +128,7 @@ For each attempt, create `artifacts/attempt_<N>/run_manifest.json`. Record the
 chosen projections, windows, `num_bands`, `num_wann`, target band information,
 commands run, produced files, and missing files.
 
-Use seedname `Al24W6` unless there is a clear reason not to. Your final
+Use seedname `Ag2Y` unless there is a clear reason not to. Your final
 response must match the provided JSON schema.
 
 ## Harbor grading note

@@ -183,14 +183,12 @@ Read these files:
 
 - `case_files/diagnostics_record.json`
 - `case_files/error_record.json`
-- `case_files/failure_modes_record.json`
 - `case_files/artifacts/attempt_1/{material}.win`
 - `case_files/artifacts/attempt_1/{material}.wout`
 - `case_files/artifacts/attempt_1/run_manifest.json`
 - `case_files/agent/trajectory.json`
 - `case_files/agent/gemini-cli.trajectory.jsonl`
 - `case_files/agent/gemini-cli.txt`
-- `case_files/gemini_failure_modes/*`
 - `case_files/original_task_instructions.md`
 
 Reference files and reference-derived fields are allowed only as outcome
@@ -211,8 +209,7 @@ because Wannier90 completed. If random projections were used after the trajector
 had already derived a plausible physical projection, identify that abandoned
 fork and explain why the fallback was avoidable.
 
-Do not handwave from aggregate statistics. The files under
-`case_files/gemini_failure_modes/` are background only. The core diagnosis must
+Do not handwave from aggregate statistics. The core diagnosis must
 come from this material's `.win`, `.wout`, run manifest, trajectory, and
 diagnostics/error records.
 
@@ -338,10 +335,6 @@ def build_case(
         original_task_instructions,
         case_files / "original_task_instructions.md",
     )
-
-    for path in sorted(FAILURE_MODES_DIR.glob("*")):
-        if path.is_file():
-            copy_file(path, case_files / "gemini_failure_modes" / path.name)
 
     write_text(case_dir / "prompt.md", prompt_text(material))
     return case_dir
