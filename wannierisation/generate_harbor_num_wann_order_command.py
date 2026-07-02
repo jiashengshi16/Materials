@@ -35,7 +35,7 @@ CACHED_GEMINI_AGENT_IMPORT = "harbor_agents.cached_gemini_cli:CachedGeminiCli"
 DEFAULT_GEMINI_AGENT_TIMEOUT_MULTIPLIER = "1.1"
 DEFAULT_MAX_RETRIES = "2"
 DEFAULT_RETRY_INCLUDES = ["AgentSetupTimeoutError", "NonZeroAgentExitCodeError"]
-DOCKER_SYSTEM_PRUNE_COMMAND = ["docker", "system", "prune", "--force"]
+DOCKER_SYSTEM_PRUNE_COMMAND = ["docker", "system", "prune", "--force", '--all']
 DEFAULT_SUCCESS_ROOTS = [ROOT / "jobs", ROOT / "reruns"]
 DEFAULT_EXCLUDED_RESULT_DIR_NAMES = {"randprojections"}
 
@@ -195,7 +195,7 @@ def retry_includes(extra_args: list[str]) -> set[str]:
 
 
 def gemini_default_extra_args(args: argparse.Namespace) -> list[str]:
-    if args.agent != "gemini-cli" or args.no_gemini_cached_defaults:
+    if args.agent != "gemini-cli":
         return []
 
     extra: list[str] = []
@@ -319,11 +319,7 @@ def build_command(args: argparse.Namespace, dataset: Path, *, n_concurrent: int 
         and not has_agent_env(all_extra_args, "HARBOR_GEMINI_RUN_TIMEOUT_SEC")
     ):
         command.extend(["--agent-env", GEMINI_RUN_TIMEOUT_ENV])
-    if (
-        args.agent == "gemini-cli"
-        and not args.no_gemini_host_network
-        and not has_extra_docker_compose(all_extra_args)
-    ):
+    if args.agent == "gemini-cli" and not has_extra_docker_compose(all_extra_args):
         command.extend(["--extra-docker-compose", relpath_for_command(HOST_NETWORK_COMPOSE)])
 
     if all_extra_args:
@@ -762,13 +758,6 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--background-batches",
-        action="store_true",
-        help=(
-            "Deprecated alias for the default explicit sorted batch launcher."
-        ),
-    )
-    parser.add_argument(
         "--batch-size",
         type=int,
         default=4,
@@ -782,7 +771,8 @@ def main() -> None:
         help=(
             "After each sorted batch finishes, run 'docker system prune --force'. "
             "This is global Docker cleanup: running containers are preserved, but "
-            "unused stopped containers/images/cache from other runs may be removed."
+            "stopped containers, unused networks, dangling images, and build cache "
+            "from other runs may be removed."
         ),
     )
     parser.add_argument(
@@ -905,43 +895,11 @@ def main() -> None:
         help="Do not add Harbor --delete to generated commands.",
     )
     parser.add_argument(
-        "--gemini-ipv4-first",
-        dest="gemini_ipv4_first",
-        action="store_true",
-        default=True,
-        help=(
-            "For gemini-cli, pass NODE_OPTIONS=--dns-result-order=ipv4first "
-            "to avoid broken Docker IPv6 routes. Default: enabled."
-        ),
-    )
-    parser.add_argument(
-        "--no-gemini-cached-defaults",
-        action="store_true",
-        help=(
-            "Do not auto-inject the cached Gemini agent, shorter Gemini agent "
-            "timeout, retry count, or transient Gemini setup/exit retry includes."
-        ),
-    )
-    parser.add_argument(
-        "--no-gemini-ipv4-first",
-        dest="gemini_ipv4_first",
-        action="store_false",
-        help="Do not add NODE_OPTIONS=--dns-result-order=ipv4first for gemini-cli.",
-    )
-    parser.add_argument(
         "--no-gemini-run-timeout",
         action="store_true",
         help=(
             "Do not add HARBOR_GEMINI_RUN_TIMEOUT_SEC=600 for the cached Gemini "
             "agent wrapper."
-        ),
-    )
-    parser.add_argument(
-        "--no-gemini-host-network",
-        action="store_true",
-        help=(
-            "Do not add the Docker Compose host-network overlay for gemini-cli. "
-            "By default this avoids broken Docker bridge outbound HTTPS on this host."
         ),
     )
     parser.add_argument(

@@ -64,11 +64,8 @@ Do not merely list parameter values. Explain the rationale for choosing them.
 If a choice is uncertain or heuristic, state the uncertainty and why it is still
 a reasonable choice.
 
-PROJECTION CHOICES MUST NOT BE RANDOM. USE YOUR OWN EXPLICIT PROJECTIONS. Do not use `random`, randomized trial projections, or arbitrary placeholder projections
-as a fallback. If the ideal projection set is uncertain infer the best
-available projections from evidence such as composition, valence electron count, expected orbital character,
-pseudopotential metadata, QE logs/XML, band energies, and the target band
-manifold.
+PROJECTION CHOICES MUST NOT BE RANDOM. Do not use `random`, randomized trial projections, or arbitrary placeholder projections
+as a fallback.
 
 At the end, copy the decision rationales into `REPORT.md` and summarize the key
 rationales in `report.json.runtime_notes` and
