@@ -8,6 +8,7 @@ No argparse. Edit MATERIALS and GEMINI_BIN below, then run:
 
 from __future__ import annotations
 
+import csv
 import json
 import re
 import shutil
@@ -22,6 +23,9 @@ ROOT = Path(__file__).resolve().parents[1]
 HARBOR_DATASET_ROOT = ROOT / "harbor_datasets" / "wannier_200"
 
 # Hardcoded experiment controls.
+USE_CANDIDATE_RUN_ERROR_TABLE = True
+CANDIDATE_RUN_ERROR_TABLE = ROOT / "candidate_run_error_table.csv"
+CANDIDATE_RUN_COLUMNS = ("run_1", "run_2", "run_3", "run_4", "run_5")
 MATERIALS = [
     'Al18Co4',
     'Al4Mn2O8',
@@ -188,6 +192,22 @@ def read_json_object(path: Path) -> dict[str, Any]:
     return data
 
 
+def validate_manifest_material(manifest: dict[str, Any], material: str, manifest_path: Path) -> None:
+    manifest_material = manifest.get("material_id") or manifest.get("material")
+    if isinstance(manifest_material, str) and manifest_material == material:
+        return
+
+    seedname = manifest.get("seedname")
+    if isinstance(seedname, str) and seedname == material:
+        return
+
+    if isinstance(manifest_material, str):
+        raise SystemExit(
+            f"Manifest material mismatch for {material}: {manifest_path} "
+            f"contains {manifest_material!r}"
+        )
+
+
 def find_trial_cases(material: str) -> list[TrialCase]:
     cases: list[TrialCase] = []
 
@@ -211,12 +231,7 @@ def find_trial_cases(material: str) -> list[TrialCase]:
                     raise SystemExit(f"Missing run_manifest.json for {material}: {manifest_path}")
 
                 manifest = read_json_object(manifest_path)
-                manifest_material = manifest.get("material_id") or manifest.get("material")
-                if isinstance(manifest_material, str) and manifest_material != material:
-                    raise SystemExit(
-                        f"Manifest material mismatch for {material}: {manifest_path} "
-                        f"contains {manifest_material!r}"
-                    )
+                validate_manifest_material(manifest, material, manifest_path)
 
                 cases.append(
                     TrialCase(
@@ -235,6 +250,115 @@ def find_trial_cases(material: str) -> list[TrialCase]:
             f"Could not find any num_wann_ordered trial folders for {material} "
             f"under {', '.join(display_path(root) for root in RUN_ROOTS)}"
         )
+
+    return cases
+
+
+def resolve_existing_path(path_text: str) -> Path:
+    path = Path(path_text)
+    if not path.is_absolute():
+        path = ROOT / path
+    return path.resolve()
+
+
+def trial_case_from_trial_dir(
+    material: str,
+    trial_dir: Path,
+    csv_row_number: int | None = None,
+    csv_run_column: str | None = None,
+) -> TrialCase:
+    attempt_dir = trial_dir / "artifacts" / "attempt_1"
+    if not attempt_dir.is_dir():
+        raise SystemExit(f"Missing artifacts/attempt_1 for {material}: {trial_dir}")
+
+    job_dir = trial_dir.parent
+    manifest_path = attempt_dir / "run_manifest.json"
+    if not manifest_path.is_file():
+        raise SystemExit(f"Missing run_manifest.json for {material}: {manifest_path}")
+
+    manifest = read_json_object(manifest_path)
+    validate_manifest_material(manifest, material, manifest_path)
+
+    try:
+        run_root = job_dir.parent.relative_to(ROOT)
+    except ValueError:
+        run_root = job_dir.parent
+
+    job_metadata = {
+        **parse_job_name(job_dir),
+        "run_root": job_dir.parent.name,
+        "run_root_path": display_path(job_dir.parent),
+        "csv_source": (
+            {
+                "row_number": csv_row_number,
+                "run_column": csv_run_column,
+                "candidate_run_error_table": display_path(CANDIDATE_RUN_ERROR_TABLE),
+            }
+            if csv_row_number is not None and csv_run_column is not None
+            else None
+        ),
+    }
+    job_metadata["run_root"] = str(run_root)
+
+    return TrialCase(
+        material=material,
+        job_dir=job_dir,
+        trial_dir=trial_dir,
+        attempt_dir=attempt_dir,
+        case_id=case_id_for(job_metadata, trial_dir),
+        job_metadata=job_metadata,
+        manifest=manifest,
+    )
+
+
+def collect_cases_from_candidate_run_error_table() -> list[TrialCase]:
+    if not CANDIDATE_RUN_ERROR_TABLE.is_file():
+        raise SystemExit(f"Missing candidate run table: {CANDIDATE_RUN_ERROR_TABLE}")
+
+    cases: list[TrialCase] = []
+    with CANDIDATE_RUN_ERROR_TABLE.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        missing_columns = [
+            column
+            for column in ("candidate_material", *CANDIDATE_RUN_COLUMNS)
+            if column not in (reader.fieldnames or [])
+        ]
+        if missing_columns:
+            raise SystemExit(
+                f"{CANDIDATE_RUN_ERROR_TABLE} is missing required column(s): "
+                f"{', '.join(missing_columns)}"
+            )
+
+        for row_number, row in enumerate(reader, start=2):
+            material = (row.get("candidate_material") or "").strip()
+            if not material:
+                raise SystemExit(
+                    f"Missing candidate_material in {CANDIDATE_RUN_ERROR_TABLE} row {row_number}"
+                )
+
+            for run_column in CANDIDATE_RUN_COLUMNS:
+                run_path_text = (row.get(run_column) or "").strip()
+                if not run_path_text:
+                    continue
+
+                trial_dir = resolve_existing_path(run_path_text)
+                if not trial_dir.is_dir():
+                    raise SystemExit(
+                        f"{run_column} in {CANDIDATE_RUN_ERROR_TABLE} row {row_number} "
+                        f"does not point to a directory: {trial_dir}"
+                    )
+
+                cases.append(
+                    trial_case_from_trial_dir(
+                        material=material,
+                        trial_dir=trial_dir,
+                        csv_row_number=row_number,
+                        csv_run_column=run_column,
+                    )
+                )
+
+    if not cases:
+        raise SystemExit(f"No non-empty run_1/run_2/run_3 entries in {CANDIDATE_RUN_ERROR_TABLE}")
 
     return cases
 
@@ -685,24 +809,36 @@ def run_case(case: TrialCase) -> Path:
 def collect_cases() -> list[TrialCase]:
     all_cases: list[TrialCase] = []
 
-    for material in MATERIALS:
-        cases = find_trial_cases(material)
-        if len(cases) > 1:
-            print(f"Found {len(cases)} trial folders for {material}; reviewing all of them.")
-        all_cases.extend(cases)
+    if USE_CANDIDATE_RUN_ERROR_TABLE:
+        all_cases = collect_cases_from_candidate_run_error_table()
+        print(
+            f"Loaded {len(all_cases)} explicit trial folder(s) from "
+            f"{display_path(CANDIDATE_RUN_ERROR_TABLE)}."
+        )
+    else:
+        for material in MATERIALS:
+            cases = find_trial_cases(material)
+            if len(cases) > 1:
+                print(f"Found {len(cases)} trial folders for {material}; reviewing all of them.")
+            all_cases.extend(cases)
 
+    unique_cases: list[TrialCase] = []
     output_dirs: dict[Path, TrialCase] = {}
     for case in all_cases:
         output_dir = output_dir_for_case(case)
         previous = output_dirs.get(output_dir)
         if previous is not None:
+            if previous.material == case.material and previous.trial_dir == case.trial_dir:
+                print(f"Skipping duplicate trial folder for {case.material}: {display_path(case.trial_dir)}")
+                continue
             raise SystemExit(
                 "Two trial cases resolve to the same output directory: "
                 f"{previous.case_id} and {case.case_id} -> {output_dir}"
             )
         output_dirs[output_dir] = case
+        unique_cases.append(case)
 
-    return all_cases
+    return unique_cases
 
 
 def main() -> None:
