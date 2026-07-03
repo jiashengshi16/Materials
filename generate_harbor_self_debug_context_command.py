@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 from collections import Counter
 from datetime import datetime
 import json
@@ -17,7 +18,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATASET = ROOT / "harbor_datasets" / "wannier_200"
-SELF_DEBUG_REVIEWS_ROOT = ROOT / "jobs" / "gemini_self_debug_reviews_self"
+SELF_DEBUG_REVIEWS_ROOT = ROOT / "jobs" / "gemini_self_debug_reviews_chemical_similarity"
+DEFAULT_CANDIDATE_RUN_ERROR_TABLE = ROOT / "candidate_run_error_table.csv"
+DEFAULT_CANDIDATE_SELF_DEBUG_REVIEWS_ROOT = ROOT / "jobs" / "gemini_self_debug_reviews_chemical_similarity"
 DEFAULT_AUGMENTED_DATASET_PARENT = ROOT / "harbor_datasets"
 NUM_WANN_RE = re.compile(r"\bnum_wann\s*=\s*(\d+)\b")
 # The task test wrapper already copies /app/artifacts/. into /logs/artifacts,
@@ -291,8 +294,9 @@ def materialize_ordered_dataset(source_dataset: Path, target_dataset: Path, task
     (target_dataset / "README.md").write_text("\n".join(lines), encoding="utf-8")
 
 
-def self_debug_reports_for_material(material: str) -> list[tuple[str, Path, Path]]:
-    material_root = SELF_DEBUG_REVIEWS_ROOT / material
+def self_debug_reports_for_material(material: str, root: Path | None = None) -> list[tuple[str, Path, Path]]:
+    root = SELF_DEBUG_REVIEWS_ROOT if root is None else root
+    material_root = root / material
     if not material_root.is_dir():
         return []
 
@@ -316,11 +320,39 @@ def materials_with_self_debug_reports() -> set[str]:
     return materials
 
 
+def candidate_materials_from_table(path: Path) -> dict[str, list[str]]:
+    if not path.is_file():
+        raise SystemExit(f"candidate run-error table does not exist: {path}")
+
+    candidates_by_material: dict[str, list[str]] = {}
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        required_columns = {"material", "candidate_material"}
+        if reader.fieldnames is None or not required_columns.issubset(reader.fieldnames):
+            raise SystemExit(
+                f"{path} must contain CSV columns: {', '.join(sorted(required_columns))}"
+            )
+        for row in reader:
+            material = (row.get("material") or "").strip()
+            candidate_material = (row.get("candidate_material") or "").strip()
+            if not material or not candidate_material:
+                continue
+            candidates = candidates_by_material.setdefault(material, [])
+            if candidate_material not in candidates:
+                candidates.append(candidate_material)
+    return candidates_by_material
+
+
 def safe_context_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_") or "case"
 
 
-def context_instruction_appendix(material: str, reports: list[tuple[str, Path, Path]]) -> str:
+def context_instruction_appendix(
+    material: str,
+    reports: list[tuple[str, Path, Path]],
+    candidate_reports: dict[str, list[tuple[str, Path, Path]]] | None = None,
+) -> str:
+    candidate_reports = candidate_reports or {}
     lines = [
         "",
         "",
@@ -344,20 +376,51 @@ def context_instruction_appendix(material: str, reports: list[tuple[str, Path, P
                 "",
             ]
         )
-        return "\n".join(lines)
-
-    lines.append("Copied self-debug context files:")
-    for case_name, _md_path, _json_path in reports:
-        context_dir = Path("self_debug_reviews") / safe_context_name(case_name)
-        lines.append(f"- `{context_dir / 'self_debug_report.md'}`")
-        lines.append(f"- `{context_dir / 'self_debug_report.json'}`")
-    lines.append("")
+    else:
+        lines.append("Copied self-debug context files:")
+        for case_name, _md_path, _json_path in reports:
+            context_dir = Path("self_debug_reviews") / safe_context_name(case_name)
+            lines.append(f"- `{context_dir / 'self_debug_report.md'}`")
+            lines.append(f"- `{context_dir / 'self_debug_report.json'}`")
+        lines.append("")
+    if candidate_reports:
+        lines.extend(
+            [
+                "# Chemically Similar Candidate Self-Debug Reports",
+                "",
+                (
+                    "The files below are self-debug reports from chemically similar "
+                    "candidate materials listed for this material in the candidate "
+                    "run-error table. READ ALL OF THE self-debug reports CAREFULLY BEFORE PROCEEDING. "
+                    "Use them only as analogical context about "
+                    "projection, window, convergence, and validation failure modes. "
+                    "Do not copy settings blindly: this task's instruction remains "
+                    "authoritative, including its material, num_wann, num_bands, "
+                    "target-band, artifact, and status constraints."
+                ),
+                "",
+            ]
+        )
+        for candidate_material, reports_for_candidate in candidate_reports.items():
+            lines.append(f"Candidate material `{candidate_material}`:")
+            for case_name, _md_path, _json_path in reports_for_candidate:
+                context_dir = (
+                    Path("candidate_self_debug_reviews")
+                    / safe_context_name(candidate_material)
+                    / safe_context_name(case_name)
+                )
+                lines.append(f"- `{context_dir / 'self_debug_report.md'}`")
+                lines.append(f"- `{context_dir / 'self_debug_report.json'}`")
+            lines.append("")
     return "\n".join(lines)
 
 
 def materialize_self_debug_context_dataset(
     source_dataset: Path,
     tasks: list[tuple[int, str, Path]],
+    *,
+    candidate_materials_by_material: dict[str, list[str]] | None = None,
+    candidate_self_debug_reviews_root: Path | None = None,
 ) -> tuple[Path, list[tuple[int, str, Path]]]:
     timestamp = datetime.now().strftime("%Y-%m-%d__%H-%M-%S")
     target_dataset = (
@@ -388,13 +451,26 @@ def materialize_self_debug_context_dataset(
                     child,
                     target_environment,
                     copy_function=link_or_copy,
-                    ignore=shutil.ignore_patterns("self_debug_reviews"),
+                    ignore=shutil.ignore_patterns(
+                        "self_debug_reviews",
+                        "candidate_self_debug_reviews",
+                    ),
                 )
                 continue
             link = target_task / child.name
             link.symlink_to(child.resolve(), target_is_directory=child.is_dir())
 
         reports = self_debug_reports_for_material(material)
+        candidate_reports: dict[str, list[tuple[str, Path, Path]]] = {}
+        if candidate_materials_by_material and candidate_self_debug_reviews_root is not None:
+            for candidate_material in candidate_materials_by_material.get(material, []):
+                reports_for_candidate = self_debug_reports_for_material(
+                    candidate_material,
+                    candidate_self_debug_reviews_root,
+                )
+                if reports_for_candidate:
+                    candidate_reports[candidate_material] = reports_for_candidate
+
         context_root = target_task / "self_debug_reviews"
         environment_context_root = target_task / "environment" / "self_debug_reviews"
         for case_name, md_path, json_path in reports:
@@ -406,6 +482,25 @@ def materialize_self_debug_context_dataset(
             environment_case_target.mkdir(parents=True, exist_ok=True)
             shutil.copy2(md_path, environment_case_target / "self_debug_report.md")
             shutil.copy2(json_path, environment_case_target / "self_debug_report.json")
+
+        candidate_context_root = target_task / "candidate_self_debug_reviews"
+        environment_candidate_context_root = (
+            target_task / "environment" / "candidate_self_debug_reviews"
+        )
+        for candidate_material, reports_for_candidate in candidate_reports.items():
+            safe_material = safe_context_name(candidate_material)
+            for case_name, md_path, json_path in reports_for_candidate:
+                safe_case = safe_context_name(case_name)
+                case_target = candidate_context_root / safe_material / safe_case
+                case_target.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(md_path, case_target / "self_debug_report.md")
+                shutil.copy2(json_path, case_target / "self_debug_report.json")
+                environment_case_target = (
+                    environment_candidate_context_root / safe_material / safe_case
+                )
+                environment_case_target.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(md_path, environment_case_target / "self_debug_report.md")
+                shutil.copy2(json_path, environment_case_target / "self_debug_report.json")
 
         source_dockerfile = source_task / "environment" / "Dockerfile"
         target_dockerfile = target_task / "environment" / "Dockerfile"
@@ -420,10 +515,36 @@ def materialize_self_debug_context_dataset(
                 )
             else:
                 dockerfile_text += "\nCOPY self_debug_reviews /app/self_debug_reviews\n"
+        if (
+            candidate_reports
+            and "COPY candidate_self_debug_reviews /app/candidate_self_debug_reviews"
+            not in dockerfile_text
+        ):
+            marker = "COPY self_debug_reviews /app/self_debug_reviews\n"
+            if marker in dockerfile_text:
+                dockerfile_text = dockerfile_text.replace(
+                    marker,
+                    marker + "COPY candidate_self_debug_reviews /app/candidate_self_debug_reviews\n",
+                    1,
+                )
+            else:
+                marker = "COPY material /app/material\n"
+                if marker in dockerfile_text:
+                    dockerfile_text = dockerfile_text.replace(
+                        marker,
+                        marker
+                        + "COPY candidate_self_debug_reviews /app/candidate_self_debug_reviews\n",
+                        1,
+                    )
+                else:
+                    dockerfile_text += (
+                        "\nCOPY candidate_self_debug_reviews "
+                        "/app/candidate_self_debug_reviews\n"
+                    )
         target_dockerfile.write_text(dockerfile_text, encoding="utf-8")
 
         instruction_text = (source_task / "instruction.md").read_text(encoding="utf-8")
-        instruction_text += context_instruction_appendix(material, reports)
+        instruction_text += context_instruction_appendix(material, reports, candidate_reports)
         (target_task / "instruction.md").write_text(instruction_text, encoding="utf-8")
 
         augmented_tasks.append((num_wann, material, target_task))
@@ -433,6 +554,12 @@ def materialize_self_debug_context_dataset(
         "",
         f"Source dataset: `{source_dataset}`",
         f"Self-debug reviews root: `{SELF_DEBUG_REVIEWS_ROOT}`",
+        (
+            "Candidate self-debug reviews root: "
+            f"`{candidate_self_debug_reviews_root}`"
+            if candidate_self_debug_reviews_root is not None
+            else "Candidate self-debug reviews root: not enabled"
+        ),
         f"Task count: {len(augmented_tasks)}",
         "",
         "Each task directory links to the original task inputs and includes copied",
@@ -859,7 +986,7 @@ def main() -> None:
         default=DEFAULT_N_CONCURRENT,
         help=(
             "Number of concurrent Harbor trials for the generated single-job command. "
-            "Default: 4, so Harbor keeps four trials active while reading tasks from "
+            "Default: 8, so Harbor keeps eight trials active while reading tasks from "
             "the num_wann-ordered dataset."
         ),
     )
@@ -966,7 +1093,33 @@ def main() -> None:
         default=SELF_DEBUG_REVIEWS_ROOT,
         help=(
             "Directory containing per-material self-debug report folders to copy into "
-            "the generated tasks. Defaults to jobs/gemini_self_debug_reviews."
+            f"the generated tasks. Defaults to {relpath_for_command(SELF_DEBUG_REVIEWS_ROOT)}."
+        ),
+    )
+    parser.add_argument(
+        "--include-candidate-self-debug-reports",
+        action="store_true",
+        help=(
+            "Also copy self-debug reports for candidate_material entries from "
+            "--candidate-run-error-table into each generated task."
+        ),
+    )
+    parser.add_argument(
+        "--candidate-run-error-table",
+        type=Path,
+        default=DEFAULT_CANDIDATE_RUN_ERROR_TABLE,
+        help=(
+            "CSV table containing material and candidate_material columns. Used only "
+            "with --include-candidate-self-debug-reports."
+        ),
+    )
+    parser.add_argument(
+        "--candidate-self-debug-reviews-root",
+        type=Path,
+        default=DEFAULT_CANDIDATE_SELF_DEBUG_REVIEWS_ROOT,
+        help=(
+            "Directory containing per-candidate-material self-debug report folders. "
+            "Used only with --include-candidate-self-debug-reports."
         ),
     )
     parser.add_argument(
@@ -993,8 +1146,8 @@ def main() -> None:
         dest="success_roots",
         help=(
             "Directory to scan for existing successful diagnostics. Repeat for multiple "
-            "roots. Defaults to jobs/gemini_self_debug_reviews in this self-debug "
-            "context launcher."
+            f"roots. Defaults to {relpath_for_command(SELF_DEBUG_REVIEWS_ROOT)} in this "
+            "self-debug context launcher."
         ),
     )
     parser.add_argument(
@@ -1104,7 +1257,7 @@ def main() -> None:
         "--no-gemini-run-timeout",
         action="store_true",
         help=(
-            "Do not add HARBOR_GEMINI_RUN_TIMEOUT_SEC=600 for the cached Gemini "
+            "Do not add HARBOR_GEMINI_RUN_TIMEOUT_SEC=4000 for the cached Gemini "
             "agent wrapper."
         ),
     )
@@ -1154,6 +1307,10 @@ def main() -> None:
         args.jobs_root = SELF_DEBUG_REVIEWS_ROOT
     if args.validate_new_success is None:
         args.validate_new_success = args.target_success_runs is not None
+    args.candidate_run_error_table = args.candidate_run_error_table.expanduser().resolve()
+    args.candidate_self_debug_reviews_root = (
+        args.candidate_self_debug_reviews_root.expanduser().resolve()
+    )
 
     include_materials = None
     exclude_materials = None
@@ -1202,8 +1359,23 @@ def main() -> None:
         print(" ".join(material for _num_wann, material, _source in tasks))
         return
 
+    candidate_materials_by_material = None
+    if args.include_candidate_self_debug_reports:
+        candidate_materials_by_material = candidate_materials_from_table(
+            args.candidate_run_error_table
+        )
+
     if tasks and not args.materials_only:
-        augmented_dataset, tasks = materialize_self_debug_context_dataset(args.dataset, tasks)
+        augmented_dataset, tasks = materialize_self_debug_context_dataset(
+            args.dataset,
+            tasks,
+            candidate_materials_by_material=candidate_materials_by_material,
+            candidate_self_debug_reviews_root=(
+                args.candidate_self_debug_reviews_root
+                if args.include_candidate_self_debug_reports
+                else None
+            ),
+        )
         args.dataset = augmented_dataset
 
     if args.target_success_runs is not None:
