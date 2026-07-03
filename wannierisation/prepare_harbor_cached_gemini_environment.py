@@ -37,6 +37,19 @@ COPY README.md /app/README.md
 """
 
 
+SELF_DEBUG_CONTEXT_COPY = "COPY self_debug_reviews /app/self_debug_reviews\n"
+
+
+def expected_dockerfile(dockerfile: Path) -> str:
+    if not (dockerfile.parent / "self_debug_reviews").is_dir():
+        return EXPECTED_DOCKERFILE
+    return EXPECTED_DOCKERFILE.replace(
+        "COPY material /app/material\n",
+        "COPY material /app/material\n" + SELF_DEBUG_CONTEXT_COPY,
+        1,
+    )
+
+
 def run(command: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
     print("+", " ".join(command))
     return subprocess.run(command, check=check, text=True)
@@ -58,8 +71,9 @@ def patch_dockerfiles(dataset: Path) -> int:
     changed = 0
     for dockerfile in dockerfiles:
         old = dockerfile.read_text(encoding="utf-8")
-        if old != EXPECTED_DOCKERFILE:
-            dockerfile.write_text(EXPECTED_DOCKERFILE, encoding="utf-8")
+        expected = expected_dockerfile(dockerfile)
+        if old != expected:
+            dockerfile.write_text(expected, encoding="utf-8")
             changed += 1
     return changed
 
