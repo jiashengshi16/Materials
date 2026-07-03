@@ -59,6 +59,7 @@ OUTPUT_CSV = REVIEWS_ROOT / "projection_mode_comparison.csv"
 OUTPUT_JSON = REVIEWS_ROOT / "projection_mode_comparison_summary.json"
 OUTPUT_ERROR_CSV = REVIEWS_ROOT / "projection_error_ratio_comparison.csv"
 OUTPUT_ERROR_JSON = REVIEWS_ROOT / "projection_error_ratio_comparison.json"
+OUTPUT_ALL_RATIOS_CSV = REVIEWS_ROOT / "all_error_ratios_by_material.csv"
 OUTPUT_HEATMAP = REVIEWS_ROOT / "projection_mode_delta_heatmap"
 
 ERROR_CMAP = LinearSegmentedColormap.from_list(
@@ -232,6 +233,83 @@ def job_folder_from_run_id(run_id: object) -> Path | None:
         return None
     candidate = ROOT / parts[0] / parts[1]
     return candidate if candidate.is_dir() else None
+
+
+def write_all_error_ratios_csv(new_by_material: dict[str, list[Path]]) -> int:
+    original_df = pd.read_csv(ORIGINAL_BEST_CSV)
+    original_df["num_wann"] = pd.to_numeric(original_df["num_wann"], errors="coerce")
+    original_df["gemini_to_reference_ratio"] = pd.to_numeric(
+        original_df["gemini_to_reference_ratio"],
+        errors="coerce",
+    )
+    original_df["reference_error_eV"] = pd.to_numeric(
+        original_df["reference_error_eV"],
+        errors="coerce",
+    )
+    original_df = original_df.dropna(subset=["material", "num_wann"])
+
+    rows: list[dict[str, object]] = []
+    max_original_runs = 0
+    max_new_runs = 0
+
+    for material, new_folders in sorted(new_by_material.items()):
+        folders_by_num_wann: dict[int, list[Path]] = defaultdict(list)
+        for folder in new_folders:
+            num_wann = num_wann_from_job_folder(folder)
+            if num_wann is not None:
+                folders_by_num_wann[num_wann].append(folder)
+
+        for num_wann, candidate_folders in sorted(folders_by_num_wann.items()):
+            original_matches = original_df[
+                (original_df["material"] == material)
+                & (original_df["num_wann"] == num_wann)
+            ].copy()
+            if original_matches.empty:
+                continue
+
+            reference_values = original_matches["reference_error_eV"].dropna()
+            if reference_values.empty:
+                continue
+            reference_rmse = float(reference_values.iloc[0])
+
+            original_ratios = [
+                float(value)
+                for value in original_matches["gemini_to_reference_ratio"].dropna().tolist()
+                if math.isfinite(float(value))
+            ]
+            original_ratios.sort()
+
+            new_ratios: list[float] = []
+            for folder in candidate_folders:
+                _new_rmse, new_ratio = error_ratio(folder, reference_rmse)
+                if new_ratio is not None:
+                    new_ratios.append(new_ratio)
+            new_ratios.sort()
+
+            max_original_runs = max(max_original_runs, len(original_ratios))
+            max_new_runs = max(max_new_runs, len(new_ratios))
+            row: dict[str, object] = {
+                "material": material,
+                "num_wann": num_wann,
+            }
+            for index, ratio in enumerate(original_ratios, start=1):
+                row[f"original_run_{index}_error_ratio"] = ratio
+            for index, ratio in enumerate(new_ratios, start=1):
+                row[f"new_run_{index}_error_ratio"] = ratio
+            rows.append(row)
+
+    fieldnames = (
+        ["material", "num_wann"]
+        + [f"original_run_{index}_error_ratio" for index in range(1, max_original_runs + 1)]
+        + [f"new_run_{index}_error_ratio" for index in range(1, max_new_runs + 1)]
+    )
+    OUTPUT_ALL_RATIOS_CSV.parent.mkdir(parents=True, exist_ok=True)
+    with OUTPUT_ALL_RATIOS_CSV.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    return len(rows)
 
 
 def category_counts(rows: list[dict[str, str]], key: str) -> dict[str, int]:
@@ -513,6 +591,7 @@ def main() -> None:
     original_best_by_key = load_original_best_rows()
     original_projection_lookup = load_projection_category_lookup()
     new_by_material = job_folders_by_material(REVIEWS_ROOT)
+    all_ratio_row_count = write_all_error_ratios_csv(new_by_material)
 
     rows: list[dict[str, object]] = []
     skipped: list[dict[str, str]] = []
@@ -640,9 +719,22 @@ def main() -> None:
         OUTPUT_CSV.write_text("", encoding="utf-8")
         OUTPUT_ERROR_CSV.write_text("", encoding="utf-8")
         OUTPUT_ERROR_JSON.write_text("[]\n", encoding="utf-8")
-        OUTPUT_JSON.write_text(json.dumps({"compared_materials": 0, "skipped_materials": skipped}, indent=2) + "\n", encoding="utf-8")
+        OUTPUT_JSON.write_text(
+            json.dumps(
+                {
+                    "compared_materials": 0,
+                    "skipped_materials": skipped,
+                    "all_error_ratios_csv": str(OUTPUT_ALL_RATIOS_CSV.relative_to(ROOT)),
+                    "all_error_ratios_rows": all_ratio_row_count,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         print("Compared materials: 0")
         print(f"Skipped materials: {len(skipped)}")
+        print(f"Wrote {OUTPUT_ALL_RATIOS_CSV.relative_to(ROOT)}")
         return
 
     transitions = {
@@ -707,6 +799,7 @@ def main() -> None:
             "csv": str(OUTPUT_CSV.relative_to(ROOT)),
             "error_ratio_csv": str(OUTPUT_ERROR_CSV.relative_to(ROOT)),
             "error_ratio_json": str(OUTPUT_ERROR_JSON.relative_to(ROOT)),
+            "all_error_ratios_csv": str(OUTPUT_ALL_RATIOS_CSV.relative_to(ROOT)),
             "heatmap_png": str(OUTPUT_HEATMAP.with_suffix(".png").relative_to(ROOT)),
             "heatmap_pdf": str(OUTPUT_HEATMAP.with_suffix(".pdf").relative_to(ROOT)),
         },
@@ -722,6 +815,7 @@ def main() -> None:
             "no block or missing .win => none_or_implicit_projection_runs"
         ),
         "compared_materials": len(rows),
+        "all_error_ratios_rows": all_ratio_row_count,
         "skipped_materials": skipped,
         "original_counts_for_same_materials": category_counts(
             rows,
@@ -760,6 +854,7 @@ def main() -> None:
     print(f"Wrote {OUTPUT_CSV.relative_to(ROOT)}")
     print(f"Wrote {OUTPUT_ERROR_CSV.relative_to(ROOT)}")
     print(f"Wrote {OUTPUT_ERROR_JSON.relative_to(ROOT)}")
+    print(f"Wrote {OUTPUT_ALL_RATIOS_CSV.relative_to(ROOT)}")
     print(f"Wrote {OUTPUT_JSON.relative_to(ROOT)}")
     print(f"Wrote {OUTPUT_HEATMAP.with_suffix('.png').relative_to(ROOT)}")
     print(f"Wrote {OUTPUT_HEATMAP.with_suffix('.pdf').relative_to(ROOT)}")

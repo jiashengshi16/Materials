@@ -48,7 +48,7 @@ MATERIALS = [
 ]
 MODEL = "gemini-3.1-pro-preview"
 GEMINI_BIN = "gemini"
-MAX_CONCURRENT_GEMINI = 8
+MAX_CONCURRENT_GEMINI = 12
 OUTPUT_ROOT = ROOT / "jobs" / "gemini_self_debug_reviews"
 JOBS_ROOT = ROOT / "jobs"
 RUN_ROOTS = [
@@ -389,7 +389,7 @@ Do not read or rely on these aggregate/reference-analysis files (they are outdat
 The per-run verifier diagnostics are allowed only as scalar final outcome
 metrics for this specific run. They do not provide the hidden reference recipe
 or the Gemini/reference RMSE ratio. Do not recommend "copy the reference",
-SCDM, `use_ws_distance`, `atom_proj = .true.`, or any other reference-only
+SCDM, `use_ws_distance`, or any other reference-only
 setting unless the original task materials made that option available. If a
 reference setting is not available under the original instructions, say so
 explicitly and give a non-reference second-attempt change instead. Any proposed
