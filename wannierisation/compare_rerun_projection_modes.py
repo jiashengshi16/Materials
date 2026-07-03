@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare projection modes for rerun materials against their original jobs.
+"""Compare projection modes for self-debug review runs against prior best runs.
 
 Hardcoded paths only, by request.  Projection categories use the same rule as
 the existing Gemini projection analysis:
@@ -16,6 +16,8 @@ import json
 import math
 import os
 import re
+import sys
+import types
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -28,7 +30,11 @@ from matplotlib.colors import LinearSegmentedColormap, Normalize, TwoSlopeNorm, 
 from matplotlib.patches import Patch
 import numpy as np
 import pandas as pd
-import seaborn as sns
+
+try:
+    import seaborn  # noqa: F401
+except ModuleNotFoundError:
+    sys.modules["seaborn"] = types.SimpleNamespace()
 
 from cluster_gemini_wout_failures import (
     PROCESS_FEATURES,
@@ -44,13 +50,16 @@ from cluster_gemini_wout_failures import (
 
 JOBS_ROOT = ROOT / "jobs"
 RERUNS_ROOT = ROOT / "reruns"
+REVIEWS_ROOT = JOBS_ROOT / "gemini_self_debug_reviews"
 SUMMARY_PATH = JOBS_ROOT / "num_wann_ordered_diagnostics_summary.json"
+ORIGINAL_BEST_CSV = JOBS_ROOT / "successful_run_errorsFROMACMINI.csv"
+PROJECTION_CATEGORY_JSON = JOBS_ROOT / "gemini_projection_categories_from_win.json"
 DATASET_ROOT = ROOT / "harbor_datasets" / "wannier_200"
-OUTPUT_CSV = RERUNS_ROOT / "projection_mode_comparison.csv"
-OUTPUT_JSON = RERUNS_ROOT / "projection_mode_comparison_summary.json"
-OUTPUT_ERROR_CSV = RERUNS_ROOT / "projection_error_ratio_comparison.csv"
-OUTPUT_ERROR_JSON = RERUNS_ROOT / "projection_error_ratio_comparison.json"
-OUTPUT_HEATMAP = RERUNS_ROOT / "projection_mode_delta_heatmap"
+OUTPUT_CSV = REVIEWS_ROOT / "projection_mode_comparison.csv"
+OUTPUT_JSON = REVIEWS_ROOT / "projection_mode_comparison_summary.json"
+OUTPUT_ERROR_CSV = REVIEWS_ROOT / "projection_error_ratio_comparison.csv"
+OUTPUT_ERROR_JSON = REVIEWS_ROOT / "projection_error_ratio_comparison.json"
+OUTPUT_HEATMAP = REVIEWS_ROOT / "projection_mode_delta_heatmap"
 
 ERROR_CMAP = LinearSegmentedColormap.from_list(
     "error_pink_to_purple",
@@ -60,8 +69,8 @@ DELTA_CMAP = LinearSegmentedColormap.from_list(
     "delta_blue_white_red",
     ["#2D70B8", "#FFFFFF", "#B83A3A"],
 )
-ERROR_RATIO_COLUMNS = ("jobs error ratio", "rerun error ratio")
-PROJECTION_COLUMNS = ("jobs projection", "rerun projection")
+ERROR_RATIO_COLUMNS = ("original run BEST", "new run BEST")
+PROJECTION_COLUMNS = ("original projection", "new projection")
 
 CATEGORY_KEYS = (
     "random_projection_runs",
@@ -77,6 +86,11 @@ PROJECTION_BLOCK_RE = re.compile(
 
 def material_from_job_folder(path: Path) -> str:
     return path.name.rsplit("__", 1)[-1]
+
+
+def num_wann_from_job_folder(path: Path) -> int | None:
+    match = re.search(r"__num_wann_(\d+)__", path.name)
+    return int(match.group(1)) if match else None
 
 
 def projection_block(text: str) -> str | None:
@@ -139,11 +153,13 @@ def find_submitted_file(job_folder: Path, material: str, suffix: str) -> Path | 
         return None
 
     candidates = [
+        *sorted((trial / "artifacts" / "logs" / "artifacts").glob(f"attempt_*/*{material}{suffix}")),
         *sorted((trial / "artifacts" / "artifacts").glob(f"attempt_*/*{material}{suffix}")),
         *sorted((trial / "artifacts").glob(f"attempt_*/*{material}{suffix}")),
     ]
     if not candidates:
         candidates = [
+            *sorted((trial / "artifacts" / "logs" / "artifacts").glob(f"attempt_*/*{suffix}")),
             *sorted((trial / "artifacts" / "artifacts").glob(f"attempt_*/*{suffix}")),
             *sorted((trial / "artifacts").glob(f"attempt_*/*{suffix}")),
         ]
@@ -167,6 +183,55 @@ def job_folders_by_material(root: Path) -> dict[str, list[Path]]:
         if path.is_dir() and path.name.startswith("num_wann_ordered__"):
             by_material[material_from_job_folder(path)].append(path)
     return dict(by_material)
+
+
+def load_original_best_rows() -> dict[tuple[str, int], dict[str, object]]:
+    df = pd.read_csv(ORIGINAL_BEST_CSV)
+    df["num_wann"] = pd.to_numeric(df["num_wann"], errors="coerce")
+    df["gemini_to_reference_ratio"] = pd.to_numeric(df["gemini_to_reference_ratio"], errors="coerce")
+    df = df.dropna(subset=["material", "num_wann", "gemini_to_reference_ratio"])
+    result: dict[tuple[str, int], dict[str, object]] = {}
+    for (_material, _num_wann), group in df.groupby(["material", "num_wann"], sort=True):
+        best = group.sort_values(["gemini_to_reference_ratio", "gemini_error_eV"], na_position="last").iloc[0]
+        material = str(best["material"])
+        num_wann = int(best["num_wann"])
+        result[(material, num_wann)] = best.to_dict()
+    return result
+
+
+def load_projection_category_lookup() -> dict[str, str]:
+    if not PROJECTION_CATEGORY_JSON.is_file():
+        return {}
+
+    data = json.loads(PROJECTION_CATEGORY_JSON.read_text(encoding="utf-8"))
+    lookup: dict[str, tuple[float, str]] = {}
+    for cohort in data.get("cohorts", {}).values():
+        if not isinstance(cohort, dict):
+            continue
+        for detail in cohort.get("details", []):
+            if not isinstance(detail, dict):
+                continue
+            material = detail.get("material")
+            category = detail.get("projection_category")
+            ratio = finite(detail.get("gemini_to_reference_ratio"))
+            if not isinstance(material, str) or not isinstance(category, str):
+                continue
+            if ratio is None:
+                ratio = float("inf")
+            previous = lookup.get(material)
+            if previous is None or ratio < previous[0]:
+                lookup[material] = (ratio, category)
+    return {material: category for material, (_ratio, category) in lookup.items()}
+
+
+def job_folder_from_run_id(run_id: object) -> Path | None:
+    if not isinstance(run_id, str) or not run_id:
+        return None
+    parts = Path(run_id).parts
+    if len(parts) < 2:
+        return None
+    candidate = ROOT / parts[0] / parts[1]
+    return candidate if candidate.is_dir() else None
 
 
 def category_counts(rows: list[dict[str, str]], key: str) -> dict[str, int]:
@@ -309,24 +374,24 @@ def make_delta_heatmap(rows: list[dict[str, object]]) -> None:
     df = pd.DataFrame(rows)
     feature_columns = [f"delta_{feature}" for feature in PROCESS_FEATURES]
     labels = {f"delta_{key}": label for key, label in PROCESS_FEATURES.items()}
-    df["delta_log_error_ratio"] = np.log10(pd.to_numeric(df["rerun_error_ratio"], errors="coerce")) - np.log10(
-        pd.to_numeric(df["jobs_error_ratio"], errors="coerce")
+    df["delta_log_error_ratio"] = np.log10(pd.to_numeric(df["new_error_ratio"], errors="coerce")) - np.log10(
+        pd.to_numeric(df["original_error_ratio"], errors="coerce")
     )
     feature_columns.append("delta_log_error_ratio")
     labels["delta_log_error_ratio"] = "interpolation error badness"
 
     df = df.sort_values(["delta_log_error_ratio", "material"], na_position="last").reset_index(drop=True)
     heatmap_df = df[feature_columns].apply(pd.to_numeric, errors="coerce").rename(columns=labels)
-    ratio_df = df[["jobs_error_ratio", "rerun_error_ratio"]].rename(
+    ratio_df = df[["original_error_ratio", "new_error_ratio"]].rename(
         columns={
-            "jobs_error_ratio": ERROR_RATIO_COLUMNS[0],
-            "rerun_error_ratio": ERROR_RATIO_COLUMNS[1],
+            "original_error_ratio": ERROR_RATIO_COLUMNS[0],
+            "new_error_ratio": ERROR_RATIO_COLUMNS[1],
         }
     )
-    projection_df = df[["jobs_projection_category", "rerun_projection_category"]].rename(
+    projection_df = df[["original_projection_category", "new_projection_category"]].rename(
         columns={
-            "jobs_projection_category": PROJECTION_COLUMNS[0],
-            "rerun_projection_category": PROJECTION_COLUMNS[1],
+            "original_projection_category": PROJECTION_COLUMNS[0],
+            "new_projection_category": PROJECTION_COLUMNS[1],
         }
     )
 
@@ -336,7 +401,13 @@ def make_delta_heatmap(rows: list[dict[str, object]]) -> None:
     vmax = max(vmax, 1e-9)
     norm = TwoSlopeNorm(vmin=-vmax, vcenter=0.0, vmax=vmax)
 
-    sns.set_theme(style="white", font_scale=0.82)
+    plt.rcParams.update(
+        {
+            "axes.facecolor": "white",
+            "figure.facecolor": "white",
+            "font.size": 8.2,
+        }
+    )
     height = max(8.5, 0.25 * len(df) + 2.0)
     fig = plt.figure(figsize=(17.0, height))
     gs = fig.add_gridspec(
@@ -384,17 +455,25 @@ def make_delta_heatmap(rows: list[dict[str, object]]) -> None:
                 fontweight="bold",
             )
 
-    sns.heatmap(
-        heatmap_df,
-        ax=heatmap_ax,
-        cmap=DELTA_CMAP,
+    heatmap_values = heatmap_df.to_numpy(dtype=float)
+    masked_heatmap_values = np.ma.masked_invalid(heatmap_values)
+    heatmap_cmap = DELTA_CMAP.copy()
+    heatmap_cmap.set_bad(MISSING_COLOR)
+    image = heatmap_ax.imshow(
+        masked_heatmap_values,
+        aspect="auto",
+        interpolation="nearest",
+        cmap=heatmap_cmap,
         norm=norm,
-        mask=heatmap_df.isna(),
-        cbar=True,
-        cbar_ax=cbar_ax,
-        cbar_kws={"label": "Delta badness, rerun - jobs\nblue improves, red worsens"},
-        linewidths=0,
-        yticklabels=df["material"].tolist(),
+        extent=(0, len(heatmap_df.columns), nrows, 0),
+    )
+    cbar = fig.colorbar(image, cax=cbar_ax)
+    cbar.set_label("Delta badness, new - original\nblue improves, red worsens")
+    heatmap_ax.set_xticks(np.arange(len(heatmap_df.columns)) + 0.5)
+    heatmap_ax.set_xticklabels(
+        heatmap_df.columns.tolist(),
+        rotation=35,
+        ha="right",
     )
 
     for ax, columns in ((ratio_ax, ERROR_RATIO_COLUMNS), (projection_ax, PROJECTION_COLUMNS)):
@@ -407,9 +486,10 @@ def make_delta_heatmap(rows: list[dict[str, object]]) -> None:
 
     ratio_ax.set_yticklabels(df["material"].tolist(), fontsize=7)
     projection_ax.tick_params(labelleft=False)
+    heatmap_ax.set_yticks(np.arange(len(df)) + 0.5)
     heatmap_ax.tick_params(axis="y", labelleft=False, labelright=True, right=False, length=0)
     heatmap_ax.set_yticklabels(df["material"].tolist(), rotation=0, fontsize=7)
-    heatmap_ax.set_xlabel("Process diagnostic delta, reruns vs jobs")
+    heatmap_ax.set_xlabel("Process diagnostic delta, new best vs original best")
     heatmap_ax.set_ylabel("Material")
     heatmap_ax.set_xticklabels(heatmap_ax.get_xticklabels(), rotation=35, ha="right")
     ratio_ax.set_ylabel("Material")
@@ -423,134 +503,185 @@ def make_delta_heatmap(rows: list[dict[str, object]]) -> None:
         Patch(facecolor=ERROR_CMAP(0.95), label="Higher error ratio"),
     ]
     fig.legend(handles=legend, loc="upper center", ncol=6, frameon=False, bbox_to_anchor=(0.52, 0.985))
-    fig.suptitle("Rerun deltas for materials also present in jobs", y=0.995)
+    fig.suptitle("New self-debug best deltas against original best runs", y=0.995)
     fig.savefig(OUTPUT_HEATMAP.with_suffix(".png"), dpi=220, bbox_inches="tight")
     fig.savefig(OUTPUT_HEATMAP.with_suffix(".pdf"), bbox_inches="tight")
     plt.close(fig)
 
 
 def main() -> None:
-    jobs_by_material = job_folders_by_material(JOBS_ROOT)
-    reruns_by_material = job_folders_by_material(RERUNS_ROOT)
-    reference_rmse_by_material = load_reference_rmse_by_material()
+    original_best_by_key = load_original_best_rows()
+    original_projection_lookup = load_projection_category_lookup()
+    new_by_material = job_folders_by_material(REVIEWS_ROOT)
 
     rows: list[dict[str, object]] = []
     skipped: list[dict[str, str]] = []
 
-    for material, rerun_folders in sorted(reruns_by_material.items()):
-        jobs_folders = jobs_by_material.get(material, [])
-        reference_rmse = reference_rmse_by_material.get(material)
-        if len(jobs_folders) != 1 or len(rerun_folders) != 1 or reference_rmse is None:
-            skipped.append(
-                {
-                    "material": material,
-                    "jobs_matches": str(len(jobs_folders)),
-                    "rerun_matches": str(len(rerun_folders)),
-                    "has_reference_rmse": str(reference_rmse is not None),
-                }
-            )
-            continue
+    for material, new_folders in sorted(new_by_material.items()):
+        folders_by_num_wann: dict[int, list[Path]] = defaultdict(list)
+        for folder in new_folders:
+            num_wann = num_wann_from_job_folder(folder)
+            if num_wann is not None:
+                folders_by_num_wann[num_wann].append(folder)
 
-        jobs_folder = jobs_folders[0]
-        rerun_folder = rerun_folders[0]
-        jobs_win = find_submitted_win(jobs_folder, material)
-        rerun_win = find_submitted_win(rerun_folder, material)
-        jobs_wout = find_submitted_wout(jobs_folder, material)
-        rerun_wout = find_submitted_wout(rerun_folder, material)
-        jobs_category = classify_win(jobs_win)
-        rerun_category = classify_win(rerun_win)
-        jobs_rmse, jobs_ratio = error_ratio(jobs_folder, reference_rmse)
-        rerun_rmse, rerun_ratio = error_ratio(rerun_folder, reference_rmse)
-        delta_ratio = (
-            rerun_ratio - jobs_ratio
-            if rerun_ratio is not None and jobs_ratio is not None
-            else None
-        )
-        ratio_fold_change = (
-            rerun_ratio / jobs_ratio
-            if rerun_ratio is not None and jobs_ratio is not None and jobs_ratio > 0
-            else None
-        )
-        delta_log10_ratio = (
-            math.log10(rerun_ratio) - math.log10(jobs_ratio)
-            if rerun_ratio is not None and jobs_ratio is not None and rerun_ratio > 0 and jobs_ratio > 0
-            else None
-        )
-        reference_wout = DATASET_ROOT / material / "tests/reference/wannier/output/wannier90/aiida.wout"
-        jobs_features = process_feature_row(jobs_wout, reference_wout)
-        rerun_features = process_feature_row(rerun_wout, reference_wout)
-        deltas = {}
-        for feature in PROCESS_FEATURES:
-            jobs_value = oriented_feature_value(feature, jobs_features.get(feature))
-            rerun_value = oriented_feature_value(feature, rerun_features.get(feature))
-            deltas[f"delta_{feature}"] = (
-                rerun_value - jobs_value
-                if rerun_value is not None and jobs_value is not None
+        for num_wann, candidate_folders in sorted(folders_by_num_wann.items()):
+            original_row = original_best_by_key.get((material, num_wann))
+            if original_row is None:
+                skipped.append(
+                    {
+                        "material": material,
+                        "num_wann": str(num_wann),
+                        "reason": "no original CSV row with matching material and num_wann",
+                    }
+                )
+                continue
+
+            reference_rmse = finite(original_row.get("reference_error_eV"))
+            if reference_rmse is None:
+                skipped.append(
+                    {
+                        "material": material,
+                        "num_wann": str(num_wann),
+                        "reason": "original CSV row has no finite reference_error_eV",
+                    }
+                )
+                continue
+
+            new_candidates: list[tuple[float, float | None, Path]] = []
+            for folder in candidate_folders:
+                new_rmse, new_ratio = error_ratio(folder, reference_rmse)
+                if new_ratio is not None:
+                    new_candidates.append((new_ratio, new_rmse, folder))
+
+            if not new_candidates:
+                skipped.append(
+                    {
+                        "material": material,
+                        "num_wann": str(num_wann),
+                        "reason": "no new candidate had finite rmse/reference ratio",
+                    }
+                )
+                continue
+
+            new_ratio, new_rmse, new_folder = sorted(new_candidates, key=lambda item: (item[0], item[2].name))[0]
+            original_rmse = finite(original_row.get("gemini_error_eV"))
+            original_ratio = finite(original_row.get("gemini_to_reference_ratio"))
+            if original_ratio is None:
+                skipped.append(
+                    {
+                        "material": material,
+                        "num_wann": str(num_wann),
+                        "reason": "original CSV row has no finite gemini_to_reference_ratio",
+                    }
+                )
+                continue
+
+            original_job_folder = job_folder_from_run_id(original_row.get("run_id"))
+            original_win = find_submitted_win(original_job_folder, material) if original_job_folder else None
+            original_wout = find_submitted_wout(original_job_folder, material) if original_job_folder else None
+            new_win = find_submitted_win(new_folder, material)
+            new_wout = find_submitted_wout(new_folder, material)
+            original_category = (
+                classify_win(original_win)
+                if original_win is not None
+                else original_projection_lookup.get(material, "none_or_implicit_projection_runs")
+            )
+            new_category = classify_win(new_win)
+            delta_ratio = new_ratio - original_ratio
+            ratio_fold_change = new_ratio / original_ratio if original_ratio > 0 else None
+            delta_log10_ratio = (
+                math.log10(new_ratio) - math.log10(original_ratio)
+                if new_ratio > 0 and original_ratio > 0
                 else None
             )
+            reference_wout = DATASET_ROOT / material / "tests/reference/wannier/output/wannier90/aiida.wout"
+            original_features = process_feature_row(original_wout, reference_wout)
+            new_features = process_feature_row(new_wout, reference_wout)
+            deltas = {}
+            for feature in PROCESS_FEATURES:
+                original_value = oriented_feature_value(feature, original_features.get(feature))
+                new_value = oriented_feature_value(feature, new_features.get(feature))
+                deltas[f"delta_{feature}"] = (
+                    new_value - original_value
+                    if new_value is not None and original_value is not None
+                    else None
+                )
 
-        row: dict[str, object] = {
-            "material": material,
-            "reference_rmse_eV": reference_rmse,
-            "jobs_rmse_eV": jobs_rmse,
-            "rerun_rmse_eV": rerun_rmse,
-            "jobs_error_ratio": jobs_ratio,
-            "rerun_error_ratio": rerun_ratio,
-            "delta_error_ratio_rerun_minus_jobs": delta_ratio,
-            "ratio_fold_change_rerun_over_jobs": ratio_fold_change,
-            "delta_log10_error_ratio_rerun_minus_jobs": delta_log10_ratio,
-            "jobs_projection_category": jobs_category,
-            "rerun_projection_category": rerun_category,
-            "changed_projection_category": str(jobs_category != rerun_category),
-            "jobs_was_random": str(jobs_category == "random_projection_runs"),
-            "rerun_still_random": str(rerun_category == "random_projection_runs"),
-            "jobs_job_folder": jobs_folder.name,
-            "rerun_job_folder": rerun_folder.name,
-            "jobs_win_path": relative(jobs_win),
-            "rerun_win_path": relative(rerun_win),
-            "jobs_wout_path": relative(jobs_wout),
-            "rerun_wout_path": relative(rerun_wout),
-        }
-        row.update(deltas)
-        rows.append(row)
+            row: dict[str, object] = {
+                "material": material,
+                "num_wann": num_wann,
+                "reference_rmse_eV": reference_rmse,
+                "original_rmse_eV": original_rmse,
+                "new_rmse_eV": new_rmse,
+                "original_error_ratio": original_ratio,
+                "new_error_ratio": new_ratio,
+                "delta_error_ratio_new_minus_original": delta_ratio,
+                "ratio_fold_change_new_over_original": ratio_fold_change,
+                "delta_log10_error_ratio_new_minus_original": delta_log10_ratio,
+                "original_projection_category": original_category,
+                "new_projection_category": new_category,
+                "changed_projection_category": str(original_category != new_category),
+                "original_was_random": str(original_category == "random_projection_runs"),
+                "new_still_random": str(new_category == "random_projection_runs"),
+                "original_run_id": original_row.get("run_id"),
+                "new_job_folder": new_folder.name,
+                "new_candidate_count_for_material_num_wann": len(candidate_folders),
+                "original_job_folder": original_job_folder.name if original_job_folder else "",
+                "original_win_path": relative(original_win),
+                "new_win_path": relative(new_win),
+                "original_wout_path": relative(original_wout),
+                "new_wout_path": relative(new_wout),
+            }
+            row.update(deltas)
+            rows.append(row)
+
+    if not rows:
+        OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
+        OUTPUT_CSV.write_text("", encoding="utf-8")
+        OUTPUT_ERROR_CSV.write_text("", encoding="utf-8")
+        OUTPUT_ERROR_JSON.write_text("[]\n", encoding="utf-8")
+        OUTPUT_JSON.write_text(json.dumps({"compared_materials": 0, "skipped_materials": skipped}, indent=2) + "\n", encoding="utf-8")
+        print("Compared materials: 0")
+        print(f"Skipped materials: {len(skipped)}")
+        return
 
     transitions = {
-        original: {rerun: 0 for rerun in CATEGORY_KEYS}
+        original: {new: 0 for new in CATEGORY_KEYS}
         for original in CATEGORY_KEYS
     }
     for row in rows:
-        transitions[row["jobs_projection_category"]][row["rerun_projection_category"]] += 1
+        transitions[row["original_projection_category"]][row["new_projection_category"]] += 1
 
-    jobs_random_rows = [
+    original_random_rows = [
         row for row in rows
-        if row["jobs_projection_category"] == "random_projection_runs"
+        if row["original_projection_category"] == "random_projection_runs"
     ]
-    jobs_random_rerun_counts = category_counts(
-        jobs_random_rows,
-        "rerun_projection_category",
+    original_random_new_counts = category_counts(
+        original_random_rows,
+        "new_projection_category",
     )
 
     OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
     with OUTPUT_CSV.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(rows[0]) if rows else [])
-        if rows:
-            writer.writeheader()
-            writer.writerows(rows)
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
 
     error_fields = [
         "material",
+        "num_wann",
         "reference_rmse_eV",
-        "jobs_rmse_eV",
-        "rerun_rmse_eV",
-        "jobs_error_ratio",
-        "rerun_error_ratio",
-        "delta_error_ratio_rerun_minus_jobs",
-        "ratio_fold_change_rerun_over_jobs",
-        "delta_log10_error_ratio_rerun_minus_jobs",
-        "jobs_projection_category",
-        "rerun_projection_category",
-        "jobs_job_folder",
-        "rerun_job_folder",
+        "original_rmse_eV",
+        "new_rmse_eV",
+        "original_error_ratio",
+        "new_error_ratio",
+        "delta_error_ratio_new_minus_original",
+        "ratio_fold_change_new_over_original",
+        "delta_log10_error_ratio_new_minus_original",
+        "original_projection_category",
+        "new_projection_category",
+        "original_run_id",
+        "new_job_folder",
     ]
     with OUTPUT_ERROR_CSV.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=error_fields)
@@ -571,14 +702,20 @@ def main() -> None:
 
     summary = {
         "paths": {
-            "jobs_root": str(JOBS_ROOT.relative_to(ROOT)),
-            "reruns_root": str(RERUNS_ROOT.relative_to(ROOT)),
+            "new_runs_root": str(REVIEWS_ROOT.relative_to(ROOT)),
+            "original_best_csv": str(ORIGINAL_BEST_CSV.relative_to(ROOT)),
             "csv": str(OUTPUT_CSV.relative_to(ROOT)),
             "error_ratio_csv": str(OUTPUT_ERROR_CSV.relative_to(ROOT)),
             "error_ratio_json": str(OUTPUT_ERROR_JSON.relative_to(ROOT)),
             "heatmap_png": str(OUTPUT_HEATMAP.with_suffix(".png").relative_to(ROOT)),
             "heatmap_pdf": str(OUTPUT_HEATMAP.with_suffix(".pdf").relative_to(ROOT)),
         },
+        "selection": (
+            "Original best is the lowest gemini_to_reference_ratio per material,num_wann "
+            "from successful_run_errorsFROMACMINI.csv. New best is the lowest "
+            "rmse_eV/reference_error_eV among gemini_self_debug_reviews runs with "
+            "the same material and num_wann."
+        ),
         "classification": (
             "begin projections with only random => random_projection_runs; "
             "any other projections block => explicit_projection_runs; "
@@ -586,40 +723,40 @@ def main() -> None:
         ),
         "compared_materials": len(rows),
         "skipped_materials": skipped,
-        "jobs_counts_for_same_materials": category_counts(
+        "original_counts_for_same_materials": category_counts(
             rows,
-            "jobs_projection_category",
+            "original_projection_category",
         ),
-        "rerun_counts_for_same_materials": category_counts(
+        "new_counts_for_same_materials": category_counts(
             rows,
-            "rerun_projection_category",
+            "new_projection_category",
         ),
-        "jobs_materials_by_projection_category": category_materials(
+        "original_materials_by_projection_category": category_materials(
             rows,
-            "jobs_projection_category",
+            "original_projection_category",
         ),
-        "rerun_materials_by_projection_category": category_materials(
+        "new_materials_by_projection_category": category_materials(
             rows,
-            "rerun_projection_category",
+            "new_projection_category",
         ),
-        "transition_counts_jobs_to_rerun": transitions,
-        "rerun_counts_for_jobs_random_materials": jobs_random_rerun_counts,
-        "jobs_random_materials": sorted(
-            row["material"] for row in jobs_random_rows
+        "transition_counts_original_to_new": transitions,
+        "new_counts_for_original_random_materials": original_random_new_counts,
+        "original_random_materials": sorted(
+            row["material"] for row in original_random_rows
         ),
     }
     OUTPUT_JSON.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
 
     print(f"Compared materials: {len(rows)}")
     print(f"Skipped materials: {len(skipped)}")
-    print("Jobs counts for same materials:")
-    print(json.dumps(summary["jobs_counts_for_same_materials"], indent=2))
-    print("Rerun counts for same materials:")
-    print(json.dumps(summary["rerun_counts_for_same_materials"], indent=2))
-    print("Transition counts, jobs -> rerun:")
+    print("Original counts for same materials:")
+    print(json.dumps(summary["original_counts_for_same_materials"], indent=2))
+    print("New counts for same materials:")
+    print(json.dumps(summary["new_counts_for_same_materials"], indent=2))
+    print("Transition counts, original -> new:")
     print(json.dumps(transitions, indent=2))
-    print("Rerun counts among materials whose jobs run used random projections:")
-    print(json.dumps(jobs_random_rerun_counts, indent=2))
+    print("New counts among materials whose original best used random projections:")
+    print(json.dumps(original_random_new_counts, indent=2))
     print(f"Wrote {OUTPUT_CSV.relative_to(ROOT)}")
     print(f"Wrote {OUTPUT_ERROR_CSV.relative_to(ROOT)}")
     print(f"Wrote {OUTPUT_ERROR_JSON.relative_to(ROOT)}")
