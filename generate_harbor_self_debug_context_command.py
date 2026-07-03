@@ -7,6 +7,7 @@ import argparse
 from collections import Counter
 from datetime import datetime
 import json
+import errno
 import os
 import re
 import shlex
@@ -16,7 +17,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATASET = ROOT / "harbor_datasets" / "wannier_200"
-SELF_DEBUG_REVIEWS_ROOT = ROOT / "jobs" / "gemini_self_debug_reviews"
+SELF_DEBUG_REVIEWS_ROOT = ROOT / "jobs" / "gemini_self_debug_reviews_self"
 DEFAULT_AUGMENTED_DATASET_PARENT = ROOT / "harbor_datasets"
 NUM_WANN_RE = re.compile(r"\bnum_wann\s*=\s*(\d+)\b")
 # The task test wrapper already copies /app/artifacts/. into /logs/artifacts,
@@ -365,6 +366,14 @@ def materialize_self_debug_context_dataset(
     )
     target_dataset.mkdir(parents=True, exist_ok=False)
 
+    def link_or_copy(src: str, dst: str) -> None:
+        try:
+            os.link(src, dst)
+        except OSError as exc:
+            if exc.errno != errno.EXDEV:
+                raise
+            shutil.copy2(src, dst)
+
     augmented_tasks: list[tuple[int, str, Path]] = []
     for num_wann, material, source_task in tasks:
         target_task = target_dataset / material
@@ -373,16 +382,45 @@ def materialize_self_debug_context_dataset(
         for child in sorted(source_task.iterdir()):
             if child.name == "instruction.md":
                 continue
+            if child.name == "environment":
+                target_environment = target_task / "environment"
+                shutil.copytree(
+                    child,
+                    target_environment,
+                    copy_function=link_or_copy,
+                    ignore=shutil.ignore_patterns("self_debug_reviews"),
+                )
+                continue
             link = target_task / child.name
             link.symlink_to(child.resolve(), target_is_directory=child.is_dir())
 
         reports = self_debug_reports_for_material(material)
         context_root = target_task / "self_debug_reviews"
+        environment_context_root = target_task / "environment" / "self_debug_reviews"
         for case_name, md_path, json_path in reports:
             case_target = context_root / safe_context_name(case_name)
             case_target.mkdir(parents=True, exist_ok=True)
             shutil.copy2(md_path, case_target / "self_debug_report.md")
             shutil.copy2(json_path, case_target / "self_debug_report.json")
+            environment_case_target = environment_context_root / safe_context_name(case_name)
+            environment_case_target.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(md_path, environment_case_target / "self_debug_report.md")
+            shutil.copy2(json_path, environment_case_target / "self_debug_report.json")
+
+        source_dockerfile = source_task / "environment" / "Dockerfile"
+        target_dockerfile = target_task / "environment" / "Dockerfile"
+        dockerfile_text = source_dockerfile.read_text(encoding="utf-8")
+        if reports and "COPY self_debug_reviews /app/self_debug_reviews" not in dockerfile_text:
+            marker = "COPY material /app/material\n"
+            if marker in dockerfile_text:
+                dockerfile_text = dockerfile_text.replace(
+                    marker,
+                    marker + "COPY self_debug_reviews /app/self_debug_reviews\n",
+                    1,
+                )
+            else:
+                dockerfile_text += "\nCOPY self_debug_reviews /app/self_debug_reviews\n"
+        target_dockerfile.write_text(dockerfile_text, encoding="utf-8")
 
         instruction_text = (source_task / "instruction.md").read_text(encoding="utf-8")
         instruction_text += context_instruction_appendix(material, reports)
@@ -802,6 +840,8 @@ def print_target_success_loop(args: argparse.Namespace, tasks: list[tuple[int, s
 
 
 def main() -> None:
+    global SELF_DEBUG_REVIEWS_ROOT, DEFAULT_SUCCESS_ROOTS
+
     parser = argparse.ArgumentParser(
         description=(
             "Read every task's instruction.md, sort by num_wann ascending, "
@@ -919,6 +959,15 @@ def main() -> None:
         "--diagnostics-summary",
         type=Path,
         help="Diagnostics summary JSON containing failed_or_unknown and results lists.",
+    )
+    parser.add_argument(
+        "--self-debug-reviews-root",
+        type=Path,
+        default=SELF_DEBUG_REVIEWS_ROOT,
+        help=(
+            "Directory containing per-material self-debug report folders to copy into "
+            "the generated tasks. Defaults to jobs/gemini_self_debug_reviews."
+        ),
     )
     parser.add_argument(
         "--rerun-non-successful-and-unrun",
@@ -1078,6 +1127,8 @@ def main() -> None:
         help="Directory to write the ordered symlink dataset. Defaults to a generated name next to --dataset.",
     )
     args = parser.parse_args()
+    SELF_DEBUG_REVIEWS_ROOT = args.self_debug_reviews_root.expanduser().resolve()
+    DEFAULT_SUCCESS_ROOTS = [SELF_DEBUG_REVIEWS_ROOT]
     if not args.model:
         raise SystemExit("--model/-m cannot be empty")
     if args.n_concurrent < 1:
