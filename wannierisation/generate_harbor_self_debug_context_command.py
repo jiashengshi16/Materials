@@ -28,6 +28,14 @@ NUM_WANN_RE = re.compile(r"\bnum_wann\s*=\s*(\d+)\b")
 # which Harbor stores as the trial's top-level artifacts directory. Exporting
 # /app/artifacts again creates a duplicate artifacts/artifacts tree.
 DEFAULT_ARTIFACTS = ["/app/report.json", "/app/REPORT.md"]
+SELF_DEBUG_TRACE_ARTIFACTS = [
+    "/app/workflow/gemini_file_trace.log",
+    "/app/workflow/SELF_DEBUG_CONTEXT_SUMMARY.json",
+]
+TRACE_WRAPPER_NAME = "trace_agent_file_access.sh"
+TRACE_VERIFIER_NAME = "verify_self_debug_context_access.py"
+TRACE_WRAPPER_APP_PATH = "/app/trace_agent_file_access.sh"
+DEFAULT_TRACE_AGENT_WRAPPER_ENV = "HARBOR_AGENT_COMMAND_WRAPPER"
 QE_SAVE_EXPORT_ARTIFACTS = [
     "/app/workflow/run_dir/out",
     "/app/workflow/run_dir/scf.out",
@@ -449,61 +457,237 @@ and before creating `workflow/run_dir`, read the complete self-debug bundle:
 
 `/app/self_debug_context/ALL_SELF_DEBUG_REPORTS.md`
 
-The bundle contains self-debug reports from one or more context scopes. Each
-section declares its scope. Interpret each report according to its scope:
+This bundle contains **{expected_self_debug_file_count} required self-debug files**.
+They are also enumerated in:
 
-- `same_material`: prior attempts for the current target material. Treat these
-  as direct evidence about this material's previous projection, window,
-  convergence, validation, and final-status failure modes.
+`/app/self_debug_context/index.json`
 
-- `candidate_material`: prior attempts for a different material selected as
-  relevant context for the target material. Treat these as analogical forensic
-  evidence. Extract transferable lessons about projection choices, window
-  choices, convergence behavior, validation failures, and final-status mistakes,
-  but do not copy candidate-material-specific values blindly.
+You must not sample these files. You must not read only the first few. You must not
+infer that the remaining files are similar. Read every section in the bundle.
+Use the reports only as forensic context about projection, window, convergence,
+validation, and final-status failure modes; this task instruction remains
+authoritative for material, num_wann, num_bands, target-band, artifact, and
+status constraints.
 
-The current task instruction remains authoritative for the target material,
-num_wann, num_bands, target-band handling, artifact requirements, and final
-status. Self-debug reports are advisory forensic context, not a replacement for
-the current task specification.
-
-You must not sample the bundle. You must not read only the first few files. You
-must not infer that the remaining files are similar. Read every section listed
-in `/app/self_debug_context/index.json`.
-
-After reading the complete bundle, and before any QE or Wannier90 command,
-create:
+After reading the bundle, and before any Wannier90/QE command, create:
 
 `workflow/SELF_DEBUG_CONTEXT_SUMMARY.json`
 
-It must be valid JSON and must include one entry per required self-debug file.
-Each entry must include:
-- app_path
-- sha256
-- scope
-- material, if the report is from another material
-- case
-- file_kind
-- key_failure_or_lesson
-- projection_or_window_implication
-- how_used_or_rejected_for_current_strategy
+It must be valid JSON with this shape:
 
-The summary must also include:
-- target_material
-- expected_file_count
-- read_file_count
-- all_files_read
-- scope_counts
-- cross_report_lessons
-- current_strategy_implications
+```json
+{{
+  "target_material": "{material}",
+  "expected_file_count": {expected_self_debug_file_count},
+  "read_file_count": {expected_self_debug_file_count},
+  "all_files_read": true,
+  "files": [
+    {{
+      "app_path": "/app/self_debug_context/raw/.../self_debug_report.md",
+      "sha256": "...",
+      "key_failure_or_lesson": "...",
+      "projection_or_window_implication": "...",
+      "used_in_current_strategy": true
+    }}
+  ],
+  "cross_report_lessons": [],
+  "current_strategy_implications": []
+}}
+```
 
-Hard gate: if the summary is missing, invalid, claims `all_files_read != true`,
-has `read_file_count != expected_file_count`, has fewer file entries than
-`expected_file_count`, or omits any file listed in `index.json`, do not proceed.
-Return `status: "failed"` and explain that the self-debug preflight was
-incomplete.
+Hard gate: if `workflow/SELF_DEBUG_CONTEXT_SUMMARY.json` is missing, invalid,
+claims `all_files_read != true`, or has `read_file_count != expected_file_count`,
+do not proceed. Return `status: "failed"` and explain that the self-debug
+preflight was incomplete.
 """
 
+
+
+def trace_wrapper_script() -> str:
+    return """#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p /app/workflow
+: > /app/workflow/gemini_file_trace.log
+if ! command -v strace >/dev/null 2>&1; then
+  echo "ERROR: strace is not installed in the task image; cannot enforce self-debug context reads" >&2
+  echo "ERROR: strace_missing" > /app/workflow/gemini_file_trace.log
+  exit 127
+fi
+exec strace -f \
+  -e trace=openat,open,read,stat,newfstatat,access \
+  -s 300 \
+  -o /app/workflow/gemini_file_trace.log \
+  "$@"
+"""
+
+
+def trace_verifier_script() -> str:
+    return """#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+REQUIRED_TRACE_PATHS = [
+    \"/app/self_debug_context/ALL_SELF_DEBUG_REPORTS.md\",
+    \"/app/self_debug_context/index.json\",
+]
+
+
+def load_json(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding=\"utf-8\"))
+    except Exception as exc:
+        raise SystemExit(f\"failed to read JSON {path}: {exc}\")
+    if not isinstance(data, dict):
+        raise SystemExit(f\"expected JSON object in {path}\")
+    return data
+
+
+def trace_has_path_access(trace_text: str, app_path: str) -> bool:
+    # strace read(2) lines do not include the pathname after a successful open, so
+    # the reliable pathname evidence is open/openat/stat/access/newfstatat.
+    escaped = re.escape(app_path)
+    return re.search(r\"\\b(openat|open|stat|newfstatat|access)\\([^\\n]*\" + escaped, trace_text) is not None
+
+
+def verify(index_path: Path, summary_path: Path, trace_path: Path) -> list[str]:
+    errors: list[str] = []
+    if not index_path.is_file():
+        return [f\"missing index.json: {index_path}\"]
+    if not summary_path.is_file():
+        return [f\"missing SELF_DEBUG_CONTEXT_SUMMARY.json: {summary_path}\"]
+    if not trace_path.is_file():
+        return [f\"missing gemini_file_trace.log: {trace_path}\"]
+
+    index = load_json(index_path)
+    summary = load_json(summary_path)
+    trace_text = trace_path.read_text(encoding=\"utf-8\", errors=\"replace\")
+
+    for required_path in REQUIRED_TRACE_PATHS:
+        if not trace_has_path_access(trace_text, required_path):
+            errors.append(f\"no OS trace evidence of opening/stat/access for {required_path}\")
+    if \"read(\" not in trace_text:
+        errors.append(\"trace contains no read(2) syscalls\")
+
+    expected_file_count = index.get(\"expected_file_count\")
+    if summary.get(\"expected_file_count\") != expected_file_count:
+        errors.append(
+            f\"summary expected_file_count={summary.get('expected_file_count')!r} \"
+            f\"does not match index expected_file_count={expected_file_count!r}\"
+        )
+    if summary.get(\"read_file_count\") != expected_file_count:
+        errors.append(
+            f\"summary read_file_count={summary.get('read_file_count')!r} \"
+            f\"does not match expected_file_count={expected_file_count!r}\"
+        )
+    if summary.get(\"all_files_read\") is not True:
+        errors.append(\"summary all_files_read is not true\")
+
+    index_records = index.get(\"records\")
+    if not isinstance(index_records, list):
+        errors.append(\"index records is missing or not a list\")
+        index_records = []
+    summary_files = summary.get(\"files\")
+    if not isinstance(summary_files, list):
+        errors.append(\"summary files is missing or not a list\")
+        summary_files = []
+
+    seen = {
+        (item.get(\"app_path\"), item.get(\"sha256\"))
+        for item in summary_files
+        if isinstance(item, dict)
+    }
+    for record in index_records:
+        if not isinstance(record, dict):
+            errors.append(\"index contains a non-object record\")
+            continue
+        app_path = record.get(\"app_path\")
+        sha256 = record.get(\"sha256\")
+        if not app_path or not sha256:
+            errors.append(f\"index record missing app_path or sha256: {record!r}\")
+            continue
+        if (app_path, sha256) not in seen:
+            errors.append(f\"summary missing indexed file app_path/sha256: {app_path} {sha256}\")
+
+    if isinstance(expected_file_count, int) and len(summary_files) < expected_file_count:
+        errors.append(
+            f\"summary files has {len(summary_files)} entries; expected at least {expected_file_count}\"
+        )
+
+    return errors
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(\"--index\", default=\"/app/self_debug_context/index.json\")
+    parser.add_argument(\"--summary\", default=\"/app/workflow/SELF_DEBUG_CONTEXT_SUMMARY.json\")
+    parser.add_argument(\"--trace\", default=\"/app/workflow/gemini_file_trace.log\")
+    args = parser.parse_args()
+    errors = verify(Path(args.index), Path(args.summary), Path(args.trace))
+    if errors:
+        print(\"SELF_DEBUG_CONTEXT_ACCESS_VERIFICATION_FAILED\", file=sys.stderr)
+        for error in errors:
+            print(f\"- {error}\", file=sys.stderr)
+        return 1
+    print(\"SELF_DEBUG_CONTEXT_ACCESS_VERIFICATION_OK\")
+    return 0
+
+
+if __name__ == \"__main__\":
+    raise SystemExit(main())
+"""
+
+
+def write_trace_tools(environment_dir: Path) -> None:
+    wrapper_path = environment_dir / TRACE_WRAPPER_NAME
+    wrapper_path.write_text(trace_wrapper_script(), encoding="utf-8")
+    wrapper_path.chmod(0o755)
+    verifier_path = environment_dir / TRACE_VERIFIER_NAME
+    verifier_path.write_text(trace_verifier_script(), encoding="utf-8")
+    verifier_path.chmod(0o755)
+
+
+def inject_trace_tools_into_dockerfile(dockerfile_text: str) -> str:
+    install_snippet = (
+        "RUN if command -v apt-get >/dev/null 2>&1; then "
+        "apt-get update && apt-get install -y --no-install-recommends strace && "
+        "rm -rf /var/lib/apt/lists/*; "
+        "elif command -v apk >/dev/null 2>&1; then apk add --no-cache strace; "
+        "elif command -v dnf >/dev/null 2>&1; then dnf install -y strace && dnf clean all; "
+        "else echo 'WARNING: no known package manager for installing strace' >&2; fi\n"
+    )
+    copy_snippet = (
+        f"COPY {TRACE_WRAPPER_NAME} /app/{TRACE_WRAPPER_NAME}\n"
+        f"COPY {TRACE_VERIFIER_NAME} /app/{TRACE_VERIFIER_NAME}\n"
+        f"RUN chmod +x /app/{TRACE_WRAPPER_NAME} /app/{TRACE_VERIFIER_NAME}\n"
+    )
+
+    if (
+        "apt-get install -y --no-install-recommends strace" not in dockerfile_text
+        and "apk add --no-cache strace" not in dockerfile_text
+        and "dnf install -y strace" not in dockerfile_text
+    ):
+        lines = dockerfile_text.splitlines(keepends=True)
+        for index, line in enumerate(lines):
+            if line.lstrip().upper().startswith("FROM "):
+                lines.insert(index + 1, install_snippet)
+                dockerfile_text = "".join(lines)
+                break
+        else:
+            # Malformed but keep previous behavior for nonstandard inputs.
+            dockerfile_text = install_snippet + dockerfile_text
+
+    if f"COPY {TRACE_WRAPPER_NAME} /app/{TRACE_WRAPPER_NAME}" not in dockerfile_text:
+        marker = "COPY material /app/material\n"
+        if marker in dockerfile_text:
+            dockerfile_text = dockerfile_text.replace(marker, copy_snippet + marker, 1)
+        else:
+            dockerfile_text += "\n" + copy_snippet
+    return dockerfile_text
 
 def materialize_self_debug_context_dataset(
     source_dataset: Path,
@@ -582,6 +766,7 @@ def materialize_self_debug_context_dataset(
             material=material,
             records=self_debug_records,
         )
+        write_trace_tools(target_task / "environment")
 
         context_root = target_task / "self_debug_reviews"
         environment_context_root = target_task / "environment" / "self_debug_reviews"
@@ -617,6 +802,7 @@ def materialize_self_debug_context_dataset(
         source_dockerfile = source_task / "environment" / "Dockerfile"
         target_dockerfile = target_task / "environment" / "Dockerfile"
         dockerfile_text = source_dockerfile.read_text(encoding="utf-8")
+        dockerfile_text = inject_trace_tools_into_dockerfile(dockerfile_text)
         dockerfile_text = dockerfile_text.replace(
             "COPY self_debug_reviews /app/self_debug_reviews\n",
             "",
@@ -748,6 +934,16 @@ def build_command(args: argparse.Namespace, dataset: Path, *, n_concurrent: int 
         command.extend(["--agent-env", GEMINI_RUN_TIMEOUT_ENV])
     if (
         args.agent == "gemini-cli"
+        and not args.no_gemini_file_trace
+        and args.trace_agent_wrapper_env_name
+        and not has_agent_env(all_extra_args, args.trace_agent_wrapper_env_name)
+    ):
+        command.extend([
+            "--agent-env",
+            f"{args.trace_agent_wrapper_env_name}={TRACE_WRAPPER_APP_PATH}",
+        ])
+    if (
+        args.agent == "gemini-cli"
         and not args.no_gemini_host_network
         and not has_extra_docker_compose(all_extra_args)
     ):
@@ -759,6 +955,10 @@ def build_command(args: argparse.Namespace, dataset: Path, *, n_concurrent: int 
     artifacts = [] if args.no_default_artifacts else list(DEFAULT_ARTIFACTS)
     if args.save_generated_qe_save:
         artifacts.extend(QE_SAVE_EXPORT_ARTIFACTS)
+    if not args.no_gemini_file_trace:
+        for artifact in SELF_DEBUG_TRACE_ARTIFACTS:
+            if artifact not in artifacts:
+                artifacts.append(artifact)
     artifacts.extend(args.artifact)
     for artifact in artifacts:
         command.extend(["--artifact", artifact])
@@ -922,6 +1122,7 @@ def print_target_success_loop(args: argparse.Namespace, tasks: list[tuple[int, s
         {
             "num_wann": num_wann,
             "material": material,
+            "task_dir": str(source),
             "command": build_command(args, source, n_concurrent=1),
         }
         for num_wann, material, source in tasks
@@ -948,6 +1149,7 @@ def print_target_success_loop(args: argparse.Namespace, tasks: list[tuple[int, s
     print("import shutil")
     print("import signal")
     print("import subprocess")
+    print("import sys")
     print("import time")
     print("from pathlib import Path")
     print("")
@@ -1009,8 +1211,36 @@ def print_target_success_loop(args: argparse.Namespace, tasks: list[tuple[int, s
     print("                counts[material] += 1")
     print("    return counts")
     print("")
-    print("def job_has_success(job_dir):")
+    print("def _latest_existing(paths):")
+    print("    paths = [path for path in paths if path.is_file()]")
+    print("    if not paths:")
+    print("        return None")
+    print("    return max(paths, key=lambda path: path.stat().st_mtime)")
+    print("")
+    print("def self_debug_gate_passes(job_dir, task_dir):")
     print("    job_path = Path(job_dir)")
+    print("    task_path = Path(task_dir)")
+    print("    index_path = task_path / 'environment' / 'self_debug_context' / 'index.json'")
+    print("    if not index_path.is_file():")
+    print("        index_path = task_path / 'self_debug_context' / 'index.json'")
+    print("    trace_path = _latest_existing(job_path.rglob('gemini_file_trace.log'))")
+    print("    summary_path = _latest_existing(job_path.rglob('SELF_DEBUG_CONTEXT_SUMMARY.json'))")
+    print("    if not index_path.is_file() or trace_path is None or summary_path is None:")
+    print("        print(f'    self-debug gate failed: missing index/trace/summary for {job_path}', flush=True)")
+    print("        return False")
+    print("    verifier_path = task_path / 'environment' / 'verify_self_debug_context_access.py'")
+    print("    if not verifier_path.is_file():")
+    print("        print(f'    self-debug gate failed: missing verifier script {verifier_path}', flush=True)")
+    print("        return False")
+    print("    result = subprocess.run([sys.executable, str(verifier_path), '--index', str(index_path), '--summary', str(summary_path), '--trace', str(trace_path)], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)")
+    print("    if result.returncode != 0:")
+    print("        print(result.stdout, flush=True)")
+    print("        return False")
+    print("    return True")
+    print("")
+    print("def job_has_success(job_dir, task_dir):")
+    print("    job_path = Path(job_dir)")
+    print("    diagnostics_success = False")
     print("    for diagnostics_path in job_path.rglob('diagnostics.json'):")
     print("        if diagnostics_path.parent.name != 'verifier':")
     print("            continue")
@@ -1021,8 +1251,11 @@ def print_target_success_loop(args: argparse.Namespace, tasks: list[tuple[int, s
     print("        except Exception:")
     print("            continue")
     print("        if isinstance(data, dict) and data.get('status') == 'success':")
-    print("            return True")
-    print("    return False")
+    print("            diagnostics_success = True")
+    print("            break")
+    print("    if not diagnostics_success:")
+    print("        return False")
+    print("    return self_debug_gate_passes(job_dir, task_dir)")
     print("")
     print("def select_wave(counts, wave_index):")
     print("    pending = [")
@@ -1083,7 +1316,7 @@ def print_target_success_loop(args: argparse.Namespace, tasks: list[tuple[int, s
     print("            command = [*task['command'], '--job-name', job_name]")
     print("            print(f'  [{len(processes) + 1}/{len(wave)}] num_wann={num_wann} {material}', flush=True)")
     print("            process = subprocess.Popen(command, preexec_fn=os.setsid)")
-    print("            processes.append({'process': process, 'material': material, 'job_name': job_name, 'job_dir': job_dir})")
+    print("            processes.append({'process': process, 'material': material, 'job_name': job_name, 'job_dir': job_dir, 'task_dir': task['task_dir']})")
     print("        deadline = time.monotonic() + WAVE_TIMEOUT_SEC")
     print("        while any(item['process'].poll() is None for item in processes) and time.monotonic() < deadline:")
     print("            time.sleep(5)")
@@ -1092,7 +1325,7 @@ def print_target_success_loop(args: argparse.Namespace, tasks: list[tuple[int, s
     print("        wave_status = 0")
     print("        for item in processes:")
     print("            status = item['process'].wait()")
-    print("            success = job_has_success(item['job_dir'])")
+    print("            success = job_has_success(item['job_dir'], item['task_dir'])")
     print("            if success:")
     print("                print(f\"  success: {item['material']} ({item['job_name']})\", flush=True)")
     print("                continue")
@@ -1394,6 +1627,24 @@ def main() -> None:
         help=(
             "Do not add HARBOR_GEMINI_RUN_TIMEOUT_SEC=4000 for the cached Gemini "
             "agent wrapper."
+        ),
+    )
+    parser.add_argument(
+        "--no-gemini-file-trace",
+        action="store_true",
+        help=(
+            "Do not inject the strace wrapper, trace artifacts, or post-run "
+            "self-debug context access gate for Gemini runs."
+        ),
+    )
+    parser.add_argument(
+        "--trace-agent-wrapper-env-name",
+        default=DEFAULT_TRACE_AGENT_WRAPPER_ENV,
+        help=(
+            "Agent-layer environment variable used to point Gemini execution at "
+            f"{TRACE_WRAPPER_APP_PATH}. Harbor's Gemini agent wrapper must honor "
+            "this variable for OS-level tracing to be collected. Default: "
+            f"{DEFAULT_TRACE_AGENT_WRAPPER_ENV}."
         ),
     )
     parser.add_argument(
