@@ -437,7 +437,7 @@ def choice_color_values(values: pd.DataFrame) -> np.ndarray:
 
 
 def choice_label(value: object, col_index: int) -> str:
-    if col_index == 0:
+    if col_index in {0, 2}:
         numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iat[0]
         return f"{float(numeric):.2f}" if pd.notna(numeric) else ""
     if value is True:
