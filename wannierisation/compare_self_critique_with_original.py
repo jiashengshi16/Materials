@@ -47,7 +47,7 @@ from compare_wannier_choices import (
 
 JOBS_ROOT = ROOT / "jobs"
 RERUNS_ROOT = ROOT / "reruns"
-REVIEWS_ROOT = JOBS_ROOT / "gemini_self_debug_reviews_self"
+REVIEWS_ROOT = JOBS_ROOT / "gemini_self_debug_self"
 SUMMARY_PATH = JOBS_ROOT / "num_wann_ordered_diagnostics_summary.json"
 ORIGINAL_BEST_CSV = JOBS_ROOT / "successful_run_errors.csv"
 DATASET_ROOT = ROOT / "harbor_datasets" / "wannier_200"
@@ -75,6 +75,14 @@ CHOICE_COLUMNS = ("projection similarity", "window strict equal", "window simila
 
 
 def material_from_job_folder(path: Path) -> str:
+    metadata_path = path / "case_files" / "case_metadata.json"
+    if metadata_path.is_file():
+        data = json.loads(metadata_path.read_text(encoding="utf-8"))
+        material = data.get("material")
+        if isinstance(material, str) and material:
+            return material
+    if path.parent != REVIEWS_ROOT and not path.parent.name.startswith("num_wann_ordered__"):
+        return path.parent.name
     return path.name.rsplit("__", 1)[-1]
 
 
@@ -103,6 +111,10 @@ def sort_submitted_candidates(candidates: list[Path]) -> list[Path]:
 
 
 def find_trial(job_folder: Path) -> Path | None:
+    if (job_folder / "artifacts").is_dir() and (
+        (job_folder / "verifier").is_dir() or any((job_folder / "artifacts").glob("attempt_*"))
+    ):
+        return job_folder
     trials = [
         path
         for path in sorted(job_folder.iterdir())
@@ -114,6 +126,15 @@ def find_trial(job_folder: Path) -> Path | None:
 
 
 def find_submitted_file(job_folder: Path, material: str, suffix: str) -> Path | None:
+    case_files = job_folder / "case_files"
+    if case_files.is_dir():
+        candidates = [
+            *sorted((case_files / "artifacts").glob(f"attempt_*/*{material}{suffix}")),
+            *sorted((case_files / "artifacts").glob(f"attempt_*/*{suffix}")),
+        ]
+        if candidates:
+            return sort_submitted_candidates(candidates)[-1]
+
     trial = find_trial(job_folder)
     if trial is None:
         return None
@@ -151,10 +172,80 @@ def job_folders_by_material(root: Path) -> dict[str, list[Path]]:
     return dict(by_material)
 
 
-def load_original_best_rows() -> dict[tuple[str, int], dict[str, object]]:
+def load_original_rows() -> list[dict[str, object]]:
     df = pd.read_csv(ORIGINAL_BEST_CSV)
     df["num_wann"] = pd.to_numeric(df["num_wann"], errors="coerce")
     df["gemini_to_reference_ratio"] = pd.to_numeric(df["gemini_to_reference_ratio"], errors="coerce")
+    df["gemini_error_eV"] = pd.to_numeric(df["gemini_error_eV"], errors="coerce")
+    df["reference_error_eV"] = pd.to_numeric(df["reference_error_eV"], errors="coerce")
+    df = df.dropna(subset=["material", "num_wann", "gemini_to_reference_ratio"])
+    reference_by_key = {
+        (str(row["material"]), int(row["num_wann"])): float(row["reference_error_eV"])
+        for _, row in df.dropna(subset=["reference_error_eV"]).iterrows()
+    }
+    reference_by_material = load_reference_rmse_by_material()
+
+    rows_by_run_id: dict[str, dict[str, object]] = {}
+    for row in df.to_dict("records"):
+        run_id = str(row.get("run_id") or "")
+        if not run_id:
+            continue
+        material = str(row["material"])
+        num_wann = int(row["num_wann"])
+        row["material"] = material
+        row["num_wann"] = num_wann
+        row["run_id"] = run_id
+        row["original_source"] = "successful_run_errors.csv"
+        rows_by_run_id[run_id] = row
+
+    for material_dir in sorted(REVIEWS_ROOT.iterdir()):
+        if not material_dir.is_dir() or material_dir.name.startswith("num_wann_ordered__"):
+            continue
+        for case_dir in sorted(material_dir.iterdir()):
+            if not case_dir.is_dir():
+                continue
+            metadata_path = case_dir / "case_files" / "case_metadata.json"
+            diagnostics_path = case_dir / "case_files" / "verifier" / "diagnostics.json"
+            if not metadata_path.is_file() or not diagnostics_path.is_file():
+                continue
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
+            material = metadata.get("material") or diagnostics.get("material") or material_dir.name
+            num_wann = metadata.get("job_metadata", {}).get("num_wann_from_folder")
+            if num_wann is None:
+                num_wann = metadata.get("manifest_summary", {}).get("num_wann")
+            rmse = finite(diagnostics.get("rmse_eV"))
+            if not isinstance(material, str) or num_wann is None or rmse is None:
+                continue
+            num_wann = int(num_wann)
+            reference_rmse = reference_by_key.get((material, num_wann), reference_by_material.get(material))
+            ratio = rmse / reference_rmse if reference_rmse and reference_rmse > 0 else None
+            if ratio is None:
+                continue
+            run_id = str(metadata.get("source_trial_path") or relative(case_dir))
+            if run_id in rows_by_run_id:
+                continue
+            rows_by_run_id[run_id] = {
+                "material": material,
+                "run_id": run_id,
+                "num_wann": num_wann,
+                "reward": diagnostics.get("reward"),
+                "gemini_error_eV": rmse,
+                "reference_error_eV": reference_rmse,
+                "gemini_to_reference_ratio": ratio,
+                "original_source": "gemini_self_debug_self review case",
+                "review_case_path": relative(case_dir),
+            }
+
+    return list(rows_by_run_id.values())
+
+
+def load_original_best_rows() -> dict[tuple[str, int], dict[str, object]]:
+    rows = load_original_rows()
+    df = pd.DataFrame(rows)
+    df["num_wann"] = pd.to_numeric(df["num_wann"], errors="coerce")
+    df["gemini_to_reference_ratio"] = pd.to_numeric(df["gemini_to_reference_ratio"], errors="coerce")
+    df["gemini_error_eV"] = pd.to_numeric(df["gemini_error_eV"], errors="coerce")
     df = df.dropna(subset=["material", "num_wann", "gemini_to_reference_ratio"])
     result: dict[tuple[str, int], dict[str, object]] = {}
     for (_material, _num_wann), group in df.groupby(["material", "num_wann"], sort=True):
@@ -168,6 +259,9 @@ def load_original_best_rows() -> dict[tuple[str, int], dict[str, object]]:
 def job_folder_from_run_id(run_id: object) -> Path | None:
     if not isinstance(run_id, str) or not run_id:
         return None
+    direct = ROOT / run_id
+    if direct.is_dir():
+        return direct
     parts = Path(run_id).parts
     if len(parts) < 2:
         return None
@@ -176,16 +270,10 @@ def job_folder_from_run_id(run_id: object) -> Path | None:
 
 
 def write_all_error_ratios_csv(new_by_material: dict[str, list[Path]]) -> int:
-    original_df = pd.read_csv(ORIGINAL_BEST_CSV)
+    original_df = pd.DataFrame(load_original_rows())
     original_df["num_wann"] = pd.to_numeric(original_df["num_wann"], errors="coerce")
-    original_df["gemini_to_reference_ratio"] = pd.to_numeric(
-        original_df["gemini_to_reference_ratio"],
-        errors="coerce",
-    )
-    original_df["reference_error_eV"] = pd.to_numeric(
-        original_df["reference_error_eV"],
-        errors="coerce",
-    )
+    original_df["gemini_to_reference_ratio"] = pd.to_numeric(original_df["gemini_to_reference_ratio"], errors="coerce")
+    original_df["reference_error_eV"] = pd.to_numeric(original_df["reference_error_eV"], errors="coerce")
     original_df = original_df.dropna(subset=["material", "num_wann"])
 
     rows: list[dict[str, object]] = []
@@ -776,8 +864,10 @@ def main() -> None:
         },
         "selection": (
             "Original best is the lowest gemini_to_reference_ratio per material,num_wann "
-            "from successful_run_errorsFROMACMINI.csv. New best is the lowest "
-            "rmse_eV/reference_error_eV among gemini_self_debug_reviews runs with "
+            "from successful_run_errors.csv plus copied review cases under "
+            "jobs/gemini_self_debug_self/<material>, deduplicated by source trial path. "
+            "New best is the lowest rmse_eV/reference_error_eV among top-level "
+            "gemini_self_debug_self/num_wann_ordered runs with "
             "the same material and num_wann."
         ),
         "win_choice_comparison": (
