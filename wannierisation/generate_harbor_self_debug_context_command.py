@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 from collections import Counter
 from datetime import datetime
 import json
@@ -297,79 +298,200 @@ def safe_context_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_") or "case"
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def self_debug_source_files(
+    reports: list[tuple[str, Path, Path]],
+    candidate_reports: dict[str, list[tuple[str, Path, Path]]] | None = None,
+    *,
+    include_same_material_reports: bool = True,
+) -> list[dict[str, object]]:
+    """Return every self-debug file the agent must read, in deterministic order."""
+    candidate_reports = candidate_reports or {}
+    records: list[dict[str, object]] = []
+
+    if include_same_material_reports:
+        for case_name, md_path, json_path in reports:
+            safe_case = safe_context_name(case_name)
+            for file_kind, src_path in (
+                ("self_debug_report_md", md_path),
+                ("self_debug_report_json", json_path),
+            ):
+                rel_path = Path("raw") / "same_material" / safe_case / src_path.name
+                records.append(
+                    {
+                        "scope": "same_material",
+                        "material": None,
+                        "case": case_name,
+                        "file_kind": file_kind,
+                        "source_path": str(src_path),
+                        "bundle_path": str(Path("self_debug_context") / rel_path),
+                        "app_path": str(Path("/app/self_debug_context") / rel_path),
+                        "sha256": sha256_file(src_path),
+                    }
+                )
+
+    for candidate_material, reports_for_candidate in sorted(candidate_reports.items()):
+        safe_material = safe_context_name(candidate_material)
+        for case_name, md_path, json_path in reports_for_candidate:
+            safe_case = safe_context_name(case_name)
+            for file_kind, src_path in (
+                ("self_debug_report_md", md_path),
+                ("self_debug_report_json", json_path),
+            ):
+                rel_path = Path("raw") / "candidate" / safe_material / safe_case / src_path.name
+                records.append(
+                    {
+                        "scope": "candidate_material",
+                        "material": candidate_material,
+                        "case": case_name,
+                        "file_kind": file_kind,
+                        "source_path": str(src_path),
+                        "bundle_path": str(Path("self_debug_context") / rel_path),
+                        "app_path": str(Path("/app/self_debug_context") / rel_path),
+                        "sha256": sha256_file(src_path),
+                    }
+                )
+
+    return records
+
+
+def write_self_debug_context_bundle(
+    target_root: Path,
+    *,
+    material: str,
+    records: list[dict[str, object]],
+) -> None:
+    """Create one mandatory read bundle, an index, and raw copied files."""
+    bundle_root = target_root / "self_debug_context"
+    bundle_root.mkdir(parents=True, exist_ok=True)
+
+    rendered: list[str] = [
+        "# REQUIRED SELF-DEBUG CONTEXT BUNDLE",
+        "",
+        f"Target material: `{material}`",
+        f"Expected self-debug file count: {len(records)}",
+        "",
+        "The agent must read every file section below before choosing projections, windows, target-band handling, or final status.",
+        "This bundle is generated from `self_debug_context/index.json`; do not treat a subset as representative.",
+        "",
+    ]
+
+    for index, record in enumerate(records, start=1):
+        source_path = Path(str(record["source_path"]))
+        bundle_path = Path(str(record["bundle_path"]))
+        copy_target = target_root / bundle_path
+        copy_target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_path, copy_target)
+
+        body = source_path.read_text(encoding="utf-8", errors="replace")
+        fence = "```json" if source_path.suffix == ".json" else "```markdown"
+        rendered.extend(
+            [
+                f"## Self-debug file {index} of {len(records)}",
+                "",
+                f"- scope: `{record['scope']}`",
+                f"- candidate_material: `{record['material']}`",
+                f"- case: `{record['case']}`",
+                f"- file_kind: `{record['file_kind']}`",
+                f"- app_path: `{record['app_path']}`",
+                f"- sha256: `{record['sha256']}`",
+                "",
+                fence,
+                body.rstrip(),
+                "```",
+                "",
+            ]
+        )
+
+    index_payload = {
+        "target_material": material,
+        "expected_file_count": len(records),
+        "expected_report_pair_count": len(records) // 2,
+        "required_summary_path": "workflow/SELF_DEBUG_CONTEXT_SUMMARY.json",
+        "required_bundle_path": "/app/self_debug_context/ALL_SELF_DEBUG_REPORTS.md",
+        "records": records,
+    }
+    (bundle_root / "index.json").write_text(
+        json.dumps(index_payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    (bundle_root / "ALL_SELF_DEBUG_REPORTS.md").write_text(
+        "\n".join(rendered),
+        encoding="utf-8",
+    )
+
+
 def context_instruction_appendix(
     material: str,
     reports: list[tuple[str, Path, Path]],
     candidate_reports: dict[str, list[tuple[str, Path, Path]]] | None = None,
     *,
     include_same_material_reports: bool = True,
+    expected_self_debug_file_count: int = 0,
 ) -> str:
     candidate_reports = candidate_reports or {}
-    if not include_same_material_reports and not candidate_reports:
+    if expected_self_debug_file_count == 0:
         return ""
 
-    lines = ["", ""]
-    if include_same_material_reports:
-        lines.extend(
-            [
-                "# Previous Gemini Self-Debug Reports",
-                "",
-                (
-                    "Before choosing the Wannierisation strategy for this new run, read the "
-                    "previous self-debug reports copied below for this same material. Treat "
-                    "them as forensic context about prior mistakes and possible fixes, not "
-                    "as hidden reference recipes. Any next-run strategy must still obey all "
-                    "constraints in this task instruction, including projection, num_wann, "
-                    "num_bands, target-band, artifact, and status rules."
-                ),
-                "",
-            ]
-        )
-        if not reports:
-            lines.extend(
-                [
-                    f"No previous self-debug reports were found for `{material}` under:",
-                    f"`{SELF_DEBUG_REVIEWS_ROOT}`",
-                    "",
-                ]
-            )
-        else:
-            lines.append("Copied self-debug context files:")
-            for case_name, _md_path, _json_path in reports:
-                context_dir = Path("self_debug_reviews") / safe_context_name(case_name)
-                lines.append(f"- `{context_dir / 'self_debug_report.md'}`")
-                lines.append(f"- `{context_dir / 'self_debug_report.json'}`")
-            lines.append("")
-    if candidate_reports:
-        lines.extend(
-            [
-                "# Chemically Similar Candidate Self-Debug Reports",
-                "",
-                (
-                    "The files below are self-debug reports from chemically similar "
-                    "candidate materials listed for this material in the candidate "
-                    "run-error table. READ ALL OF THE self-debug reports CAREFULLY BEFORE PROCEEDING. "
-                    "Use them only as analogical context about "
-                    "projection, window, convergence, and validation failure modes. "
-                    "Do not copy settings blindly: this task's instruction remains "
-                    "authoritative, including its material, num_wann, num_bands, "
-                    "target-band, artifact, and status constraints."
-                ),
-                "",
-            ]
-        )
-        for candidate_material, reports_for_candidate in candidate_reports.items():
-            lines.append(f"Candidate material `{candidate_material}`:")
-            for case_name, _md_path, _json_path in reports_for_candidate:
-                context_dir = (
-                    Path("candidate_self_debug_reviews")
-                    / safe_context_name(candidate_material)
-                    / safe_context_name(case_name)
-                )
-                lines.append(f"- `{context_dir / 'self_debug_report.md'}`")
-                lines.append(f"- `{context_dir / 'self_debug_report.json'}`")
-            lines.append("")
-    return "\n".join(lines)
+    return f"""
+
+# Mandatory Self-Debug Context Preflight
+
+Before choosing the Wannierisation strategy, before writing the first `<seed>.win`,
+and before creating `workflow/run_dir`, read the complete self-debug bundle:
+
+`/app/self_debug_context/ALL_SELF_DEBUG_REPORTS.md`
+
+This bundle contains **{expected_self_debug_file_count} required self-debug files**.
+They are also enumerated in:
+
+`/app/self_debug_context/index.json`
+
+You must not sample these files. You must not read only the first few. You must not
+infer that the remaining files are similar. Read every section in the bundle.
+Use the reports only as forensic context about projection, window, convergence,
+validation, and final-status failure modes; this task instruction remains
+authoritative for material, num_wann, num_bands, target-band, artifact, and
+status constraints.
+
+After reading the bundle, and before any Wannier90/QE command, create:
+
+`workflow/SELF_DEBUG_CONTEXT_SUMMARY.json`
+
+It must be valid JSON with this shape:
+
+```json
+{{
+  "target_material": "{material}",
+  "expected_file_count": {expected_self_debug_file_count},
+  "read_file_count": {expected_self_debug_file_count},
+  "all_files_read": true,
+  "files": [
+    {{
+      "app_path": "/app/self_debug_context/raw/.../self_debug_report.md",
+      "sha256": "...",
+      "key_failure_or_lesson": "...",
+      "projection_or_window_implication": "...",
+      "used_in_current_strategy": true
+    }}
+  ],
+  "cross_report_lessons": [],
+  "current_strategy_implications": []
+}}
+```
+
+Hard gate: if `workflow/SELF_DEBUG_CONTEXT_SUMMARY.json` is missing, invalid,
+claims `all_files_read != true`, or has `read_file_count != expected_file_count`,
+do not proceed. Return `status: "failed"` and explain that the self-debug
+preflight was incomplete.
+"""
 
 
 def materialize_self_debug_context_dataset(
@@ -412,6 +534,7 @@ def materialize_self_debug_context_dataset(
                     ignore=shutil.ignore_patterns(
                         "self_debug_reviews",
                         "candidate_self_debug_reviews",
+                        "self_debug_context",
                     ),
                 )
                 continue
@@ -432,6 +555,22 @@ def materialize_self_debug_context_dataset(
                 )
                 if reports_for_candidate:
                     candidate_reports[candidate_material] = reports_for_candidate
+
+        self_debug_records = self_debug_source_files(
+            reports,
+            candidate_reports,
+            include_same_material_reports=include_same_material_reports,
+        )
+        write_self_debug_context_bundle(
+            target_task,
+            material=material,
+            records=self_debug_records,
+        )
+        write_self_debug_context_bundle(
+            target_task / "environment",
+            material=material,
+            records=self_debug_records,
+        )
 
         context_root = target_task / "self_debug_reviews"
         environment_context_root = target_task / "environment" / "self_debug_reviews"
@@ -511,6 +650,19 @@ def materialize_self_debug_context_dataset(
                         "\nCOPY candidate_self_debug_reviews "
                         "/app/candidate_self_debug_reviews\n"
                     )
+        if (
+            self_debug_records
+            and "COPY self_debug_context /app/self_debug_context" not in dockerfile_text
+        ):
+            marker = "COPY material /app/material\n"
+            if marker in dockerfile_text:
+                dockerfile_text = dockerfile_text.replace(
+                    marker,
+                    marker + "COPY self_debug_context /app/self_debug_context\n",
+                    1,
+                )
+            else:
+                dockerfile_text += "\nCOPY self_debug_context /app/self_debug_context\n"
         target_dockerfile.write_text(dockerfile_text, encoding="utf-8")
 
         instruction_text = (source_task / "instruction.md").read_text(encoding="utf-8")
@@ -519,6 +671,7 @@ def materialize_self_debug_context_dataset(
             reports,
             candidate_reports,
             include_same_material_reports=include_same_material_reports,
+            expected_self_debug_file_count=len(self_debug_records),
         )
         (target_task / "instruction.md").write_text(instruction_text, encoding="utf-8")
 
@@ -537,12 +690,12 @@ def materialize_self_debug_context_dataset(
         ),
         f"Task count: {len(augmented_tasks)}",
         "",
-        "Each task directory links to the original task inputs and includes copied",
+        "Each task directory links to the original task inputs and includes a mandatory",
         (
-            "`self_debug_reviews/*/self_debug_report.md` and "
-            "`self_debug_reviews/*/self_debug_report.json` files for the same material."
+            "`self_debug_context/ALL_SELF_DEBUG_REPORTS.md` bundle plus raw copied "
+            "self-debug report files for the same material."
             if include_same_material_reports
-            else "candidate self-debug report files only; same-material reports are not copied."
+            else "`self_debug_context/ALL_SELF_DEBUG_REPORTS.md` bundle with candidate report files only; same-material reports are not copied."
         ),
         "",
     ]
