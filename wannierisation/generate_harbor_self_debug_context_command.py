@@ -449,48 +449,59 @@ and before creating `workflow/run_dir`, read the complete self-debug bundle:
 
 `/app/self_debug_context/ALL_SELF_DEBUG_REPORTS.md`
 
-This bundle contains **{expected_self_debug_file_count} required self-debug files**.
-They are also enumerated in:
+The bundle contains self-debug reports from one or more context scopes. Each
+section declares its scope. Interpret each report according to its scope:
 
-`/app/self_debug_context/index.json`
+- `same_material`: prior attempts for the current target material. Treat these
+  as direct evidence about this material's previous projection, window,
+  convergence, validation, and final-status failure modes.
 
-You must not sample these files. You must not read only the first few. You must not
-infer that the remaining files are similar. Read every section in the bundle.
-Use the reports only as forensic context about projection, window, convergence,
-validation, and final-status failure modes; this task instruction remains
-authoritative for material, num_wann, num_bands, target-band, artifact, and
-status constraints.
+- `candidate_material`: prior attempts for a different material selected as
+  relevant context for the target material. Treat these as analogical forensic
+  evidence. Extract transferable lessons about projection choices, window
+  choices, convergence behavior, validation failures, and final-status mistakes,
+  but do not copy candidate-material-specific values blindly.
 
-After reading the bundle, and before any Wannier90/QE command, create:
+The current task instruction remains authoritative for the target material,
+num_wann, num_bands, target-band handling, artifact requirements, and final
+status. Self-debug reports are advisory forensic context, not a replacement for
+the current task specification.
+
+You must not sample the bundle. You must not read only the first few files. You
+must not infer that the remaining files are similar. Read every section listed
+in `/app/self_debug_context/index.json`.
+
+After reading the complete bundle, and before any QE or Wannier90 command,
+create:
 
 `workflow/SELF_DEBUG_CONTEXT_SUMMARY.json`
 
-It must be valid JSON with this shape:
+It must be valid JSON and must include one entry per required self-debug file.
+Each entry must include:
+- app_path
+- sha256
+- scope
+- material, if the report is from another material
+- case
+- file_kind
+- key_failure_or_lesson
+- projection_or_window_implication
+- how_used_or_rejected_for_current_strategy
 
-```json
-{{
-  "target_material": "{material}",
-  "expected_file_count": {expected_self_debug_file_count},
-  "read_file_count": {expected_self_debug_file_count},
-  "all_files_read": true,
-  "files": [
-    {{
-      "app_path": "/app/self_debug_context/raw/.../self_debug_report.md",
-      "sha256": "...",
-      "key_failure_or_lesson": "...",
-      "projection_or_window_implication": "...",
-      "used_in_current_strategy": true
-    }}
-  ],
-  "cross_report_lessons": [],
-  "current_strategy_implications": []
-}}
-```
+The summary must also include:
+- target_material
+- expected_file_count
+- read_file_count
+- all_files_read
+- scope_counts
+- cross_report_lessons
+- current_strategy_implications
 
-Hard gate: if `workflow/SELF_DEBUG_CONTEXT_SUMMARY.json` is missing, invalid,
-claims `all_files_read != true`, or has `read_file_count != expected_file_count`,
-do not proceed. Return `status: "failed"` and explain that the self-debug
-preflight was incomplete.
+Hard gate: if the summary is missing, invalid, claims `all_files_read != true`,
+has `read_file_count != expected_file_count`, has fewer file entries than
+`expected_file_count`, or omits any file listed in `index.json`, do not proceed.
+Return `status: "failed"` and explain that the self-debug preflight was
+incomplete.
 """
 
 
