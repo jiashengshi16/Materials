@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
-"""Compare projection modes for case1 lower-error runs against higher-error runs.
+"""Compare .win choice similarity for case1 lower-error runs against higher-error runs.
 
 Hardcoded paths only, by request.  The case1 JSON values are interpreted as:
 
 * value[0], value[2] -> lower-number run, treated as the "new" run
 * value[1], value[3] -> higher-number run, treated as the "original" run
 
-Projection categories use the same rule as the existing Gemini projection
-analysis:
-
-* begin projections containing only random -> random_projection_runs
-* any other begin projections block -> explicit_projection_runs
-* no projections block -> none_or_implicit_projection_runs
+The heatmap compares the higher-number and lower-number submitted .win files
+using the same orange/green choice columns as compare_self_critique:
+projection similarity, strict window equality, and likely window equality.
 """
 
 from __future__ import annotations
@@ -45,12 +42,17 @@ from cluster_gemini_wout_failures import (
     PROCESS_FEATURES,
     FEATURE_DIRECTIONS,
     MISSING_COLOR,
-    PROJECTION_COLORS,
     number,
     parse_wout,
     safe_log,
     safe_log_ratio,
     spread_stats,
+)
+from compare_wannier_choices import (
+    compare_window_masks,
+    find_eig_near_win,
+    multiset_jaccard,
+    parse_win,
 )
 
 JOBS_ROOT = ROOT / "jobs"
@@ -63,6 +65,10 @@ OUTPUT_JSON = OUTPUT_DIR / "projection_mode_comparison_summary.json"
 OUTPUT_ERROR_CSV = OUTPUT_DIR / "projection_error_ratio_comparison.csv"
 OUTPUT_ERROR_JSON = OUTPUT_DIR / "projection_error_ratio_comparison.json"
 OUTPUT_HEATMAP = OUTPUT_DIR / "projection_mode_delta_heatmap"
+PROJECTION_SIMILARITY_CMAP = LinearSegmentedColormap.from_list(
+    "projection_similarity_orange_to_green",
+    ["#D95F02", "#2E8B57"],  # orange -> green
+)
 
 ERROR_CMAP = LinearSegmentedColormap.from_list(
     "error_pink_to_purple",
@@ -73,7 +79,7 @@ DELTA_CMAP = LinearSegmentedColormap.from_list(
     ["#2D70B8", "#FFFFFF", "#B83A3A"],
 )
 ERROR_RATIO_COLUMNS = ("higher-number run", "lower-number run")
-PROJECTION_COLUMNS = ("higher-number projection", "lower-number projection")
+CHOICE_COLUMNS = ("projection similarity", "window strict equal", "window similarity")
 
 CATEGORY_KEYS = (
     "random_projection_runs",
@@ -358,22 +364,87 @@ def error_ratio_color_values(values: pd.DataFrame) -> np.ndarray:
                 rgba[row_index, col_index] = ERROR_CMAP(norm(float(value)))
     return rgba
 
+def compare_win_choices_for_pair(
+    original_win: Path | None,
+    new_win: Path | None,
+    material: str,
+) -> dict[str, object]:
+    if original_win is None or new_win is None or not original_win.is_file() or not new_win.is_file():
+        return {
+            "projection_similarity": "",
+            "window_strict_equal": "",
+            "outer_window_similarity": "",
+            "frozen_window_similarity": "",
+            "window_similarity": "",
+        }
 
-def projection_color_values(values: pd.DataFrame) -> np.ndarray:
+    original_data = parse_win(original_win)
+    new_data = parse_win(new_win)
+
+    original_params = original_data["params"]
+    new_params = new_data["params"]
+
+    original_eig = find_eig_near_win(original_win, material)
+    new_eig = find_eig_near_win(new_win, material)
+
+    mask_compare = compare_window_masks(
+        original_params,
+        new_params,
+        original_eig,
+        new_eig,
+    )
+
+    window_strict_equal = all(
+        original_params.get(key) == new_params.get(key)
+        for key in ("dis_win_min", "dis_win_max", "dis_froz_min", "dis_froz_max")
+    )
+
+    def fmt(value: object) -> str:
+        return "" if value is None else f"{float(value):.6f}"
+
+    return {
+        "projection_similarity": f"{multiset_jaccard(original_data['projections'], new_data['projections']):.6f}",
+        "window_strict_equal": window_strict_equal,
+        "outer_window_similarity": fmt(mask_compare["outer_similarity"]),
+        "frozen_window_similarity": fmt(mask_compare["frozen_similarity"]),
+        "window_similarity": fmt(mask_compare["combined_similarity"]),
+    }
+
+def choice_color_values(values: pd.DataFrame) -> np.ndarray:
+    colors = {
+        True: "#2E8B57",
+        False: "#D95F02",
+    }
     rgba = np.ones((*values.shape, 4))
     for row_index in range(values.shape[0]):
         for col_index in range(values.shape[1]):
-            color = PROJECTION_COLORS.get(str(values.iat[row_index, col_index]), MISSING_COLOR)
-            rgba[row_index, col_index] = to_rgba(color)
+            value = values.iat[row_index, col_index]
+            if col_index in {0, 2}:
+                numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iat[0]
+                if pd.notna(numeric):
+                    # projection similarity is in [0, 1]:
+                    # 0 = orange (dissimilar), 1 = green (similar)
+                    rgba[row_index, col_index] = PROJECTION_SIMILARITY_CMAP(
+                        float(np.clip(numeric, 0.0, 1.0))
+                    )
+                else:
+                    rgba[row_index, col_index] = to_rgba(MISSING_COLOR)
+            elif value in colors:
+                rgba[row_index, col_index] = to_rgba(colors[value])
+            else:
+                rgba[row_index, col_index] = to_rgba(MISSING_COLOR)
     return rgba
 
 
-def projection_code(category: object) -> str:
-    return {
-        "explicit_projection_runs": "E",
-        "random_projection_runs": "R",
-        "none_or_implicit_projection_runs": "N",
-    }.get(str(category), "?")
+def choice_label(value: object, col_index: int) -> str:
+    if col_index == 0:
+        numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iat[0]
+        return f"{float(numeric):.2f}" if pd.notna(numeric) else ""
+    if value is True:
+        return "T"
+    if value is False:
+        return "F"
+    return ""
 
 
 def make_delta_heatmap(rows: list[dict[str, object]]) -> None:
@@ -397,10 +468,11 @@ def make_delta_heatmap(rows: list[dict[str, object]]) -> None:
             "new_error_ratio": ERROR_RATIO_COLUMNS[1],
         }
     )
-    projection_df = df[["original_projection_category", "new_projection_category"]].rename(
+    choice_df = df[["projection_similarity", "window_strict_equal", "window_similarity"]].rename(
         columns={
-            "original_projection_category": PROJECTION_COLUMNS[0],
-            "new_projection_category": PROJECTION_COLUMNS[1],
+            "projection_similarity": CHOICE_COLUMNS[0],
+            "window_strict_equal": CHOICE_COLUMNS[1],
+            "window_similarity": CHOICE_COLUMNS[2],
         }
     )
 
@@ -422,7 +494,7 @@ def make_delta_heatmap(rows: list[dict[str, object]]) -> None:
     gs = fig.add_gridspec(
         1,
         4,
-        width_ratios=[0.95, 0.95, 7.0, 0.35],
+        width_ratios=[0.95, 1.45, 7.0, 0.35],
         left=0.08,
         right=0.92,
         top=0.90,
@@ -430,7 +502,7 @@ def make_delta_heatmap(rows: list[dict[str, object]]) -> None:
         wspace=0.04,
     )
     ratio_ax = fig.add_subplot(gs[0, 0])
-    projection_ax = fig.add_subplot(gs[0, 1], sharey=ratio_ax)
+    choice_ax = fig.add_subplot(gs[0, 1], sharey=ratio_ax)
     heatmap_ax = fig.add_subplot(gs[0, 2], sharey=ratio_ax)
     cbar_ax = fig.add_subplot(gs[0, 3])
 
@@ -443,24 +515,23 @@ def make_delta_heatmap(rows: list[dict[str, object]]) -> None:
         extent=(0, len(ratio_df.columns), nrows, 0),
     )
 
-    projection_ax.imshow(
-        projection_color_values(projection_df),
+    choice_ax.imshow(
+        choice_color_values(choice_df),
         aspect="auto",
         interpolation="nearest",
-        extent=(0, len(projection_df.columns), nrows, 0),
+        extent=(0, len(choice_df.columns), nrows, 0),
     )
-    for row_index in range(len(projection_df)):
-        for col_index in range(len(projection_df.columns)):
-            category = projection_df.iat[row_index, col_index]
-            color = "white" if category in {"random_projection_runs", "none_or_implicit_projection_runs"} else "black"
-            projection_ax.text(
+    for row_index in range(len(choice_df)):
+        for col_index in range(len(choice_df.columns)):
+            value = choice_df.iat[row_index, col_index]
+            choice_ax.text(
                 col_index + 0.5,
                 row_index + 0.5,
-                projection_code(category),
+                choice_label(value, col_index),
                 ha="center",
                 va="center",
                 fontsize=6,
-                color=color,
+                color="black",
                 fontweight="bold",
             )
 
@@ -485,7 +556,7 @@ def make_delta_heatmap(rows: list[dict[str, object]]) -> None:
         ha="right",
     )
 
-    for ax, columns in ((ratio_ax, ERROR_RATIO_COLUMNS), (projection_ax, PROJECTION_COLUMNS)):
+    for ax, columns in ((ratio_ax, ERROR_RATIO_COLUMNS), (choice_ax, CHOICE_COLUMNS)):
         ax.set_xticks(np.arange(len(columns)) + 0.5)
         ax.set_xticklabels(columns, rotation=35, ha="right")
         ax.set_yticks(np.arange(len(df)) + 0.5)
@@ -494,7 +565,7 @@ def make_delta_heatmap(rows: list[dict[str, object]]) -> None:
             spine.set_visible(False)
 
     ratio_ax.set_yticklabels(df["material"].tolist(), fontsize=7)
-    projection_ax.tick_params(labelleft=False)
+    choice_ax.tick_params(labelleft=False)
     heatmap_ax.set_yticks(np.arange(len(df)) + 0.5)
     heatmap_ax.tick_params(axis="y", labelleft=False, labelright=True, right=False, length=0)
     heatmap_ax.set_yticklabels(df["material"].tolist(), rotation=0, fontsize=7)
@@ -504,10 +575,10 @@ def make_delta_heatmap(rows: list[dict[str, object]]) -> None:
     ratio_ax.set_ylabel("Material")
 
     legend = [
-        Patch(facecolor=PROJECTION_COLORS["explicit_projection_runs"], label="Explicit projections"),
-        Patch(facecolor=PROJECTION_COLORS["random_projection_runs"], label="Random projections"),
-        Patch(facecolor=PROJECTION_COLORS["none_or_implicit_projection_runs"], label="None/implicit projections"),
-        Patch(facecolor=MISSING_COLOR, label="Missing projection"),
+        Patch(facecolor="#2E8B57", label="Window equal"),
+        Patch(facecolor="#D95F02", label="Window different"),
+        Patch(facecolor=PROJECTION_SIMILARITY_CMAP(1.0), label="Higher projection similarity"),
+        Patch(facecolor=MISSING_COLOR, label="Missing .win choice"),
         Patch(facecolor=ERROR_CMAP(0.15), label="Lower error ratio"),
         Patch(facecolor=ERROR_CMAP(0.95), label="Higher error ratio"),
     ]
@@ -583,6 +654,7 @@ def main() -> None:
         new_wout = find_submitted_wout(new_job_folder, material)
         original_category = classify_win(original_win)
         new_category = classify_win(new_win)
+        win_choice_comparison = compare_win_choices_for_pair(original_win, new_win, material)
         delta_ratio = new_ratio - original_ratio
         ratio_fold_change = new_ratio / original_ratio if original_ratio > 0 else None
         delta_log10_ratio = (
@@ -616,6 +688,11 @@ def main() -> None:
             "delta_error_ratio_new_minus_original": delta_ratio,
             "ratio_fold_change_new_over_original": ratio_fold_change,
             "delta_log10_error_ratio_new_minus_original": delta_log10_ratio,
+            "projection_similarity": win_choice_comparison["projection_similarity"],
+            "window_strict_equal": win_choice_comparison["window_strict_equal"],
+            "outer_window_similarity": win_choice_comparison["outer_window_similarity"],
+            "frozen_window_similarity": win_choice_comparison["frozen_window_similarity"],
+            "window_similarity": win_choice_comparison["window_similarity"],
             "original_projection_category": original_category,
             "new_projection_category": new_category,
             "changed_projection_category": str(original_category != new_category),
@@ -691,6 +768,11 @@ def main() -> None:
         "delta_error_ratio_new_minus_original",
         "ratio_fold_change_new_over_original",
         "delta_log10_error_ratio_new_minus_original",
+        "projection_similarity",
+        "window_strict_equal",
+        "outer_window_similarity",
+        "frozen_window_similarity",
+        "window_similarity",
         "original_projection_category",
         "new_projection_category",
         "original_case_path",
@@ -732,9 +814,15 @@ def main() -> None:
             "run rmse_eV divided by reference_offmesh_rmse_eV for matching "
             "material and num_wann."
         ),
+        "win_choice_comparison": (
+            "projection_similarity is the multiset Jaccard similarity of normalized projections between "
+            "the higher-number and lower-number submitted .win files. window_strict_equal and "
+            "window_similarity is the combined 0-1 Jaccard similarity of actual outer and frozen "
+            "window band masks computed from the paired .eig files."
+        ),
         "classification": (
-            "begin projections with only random => random_projection_runs; "
-            "any other projections block => explicit_projection_runs; "
+            "Projection categories are still written to the CSV/JSON for audit: begin projections with "
+            "only random => random_projection_runs; any other projections block => explicit_projection_runs; "
             "no block or missing .win => none_or_implicit_projection_runs"
         ),
         "compared_materials": len(rows),
