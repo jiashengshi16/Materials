@@ -11,7 +11,7 @@ from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
 
-DEFAULT_GEMINI_RUN_TIMEOUT_SEC = "5400"
+DEFAULT_GEMINI_RUN_TIMEOUT_SEC = "4500"
 
 
 class CachedGeminiCli(GeminiCli):
@@ -122,6 +122,14 @@ class CachedGeminiCli(GeminiCli):
         extra_flags = (cli_flags + " ") if cli_flags else ""
         run_model = shlex.quote(model_alias or model)
 
+        wrapper = os.environ.get("HARBOR_AGENT_COMMAND_WRAPPER", "").strip()
+        wrapper_prefix = ""
+        if wrapper:
+            wrapper_prefix = f"{shlex.quote(wrapper)} "
+            env["HARBOR_AGENT_COMMAND_WRAPPER"] = wrapper
+
+        self.logger.info("HARBOR_AGENT_COMMAND_WRAPPER=%r", wrapper)
+        
         try:
             await self.exec_as_agent(
                 environment,
@@ -130,7 +138,7 @@ class CachedGeminiCli(GeminiCli):
                     ". ~/.nvm/nvm.sh; "
                     "timeout --kill-after=10s "
                     '"${HARBOR_GEMINI_RUN_TIMEOUT_SEC:-600}s" '
-                    f"gemini --yolo {extra_flags}--model={run_model} "
+                    f"{wrapper_prefix}gemini --yolo {extra_flags}--model={run_model} "
                     f"--prompt={escaped_instruction} "
                     "2>&1 </dev/null | stdbuf -oL tee /logs/agent/gemini-cli.txt"
                 ),

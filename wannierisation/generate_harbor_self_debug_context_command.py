@@ -46,7 +46,7 @@ QE_SAVE_RELATIVE_PATH = Path("environment") / "material" / "qe_save"
 QE_SAVE_INSTALLER = ROOT / "scripts" / "install_harbor_qe_save.py"
 HOST_NETWORK_COMPOSE = ROOT / "docker" / "harbor-host-network.compose.yml"
 GEMINI_IPV4_NODE_OPTIONS = "NODE_OPTIONS=--dns-result-order=ipv4first"
-GEMINI_RUN_TIMEOUT_ENV = "HARBOR_GEMINI_RUN_TIMEOUT_SEC=4000"
+GEMINI_RUN_TIMEOUT_ENV = "HARBOR_GEMINI_RUN_TIMEOUT_SEC=4500"
 CACHED_GEMINI_AGENT_IMPORT = "harbor_agents.cached_gemini_cli:CachedGeminiCli"
 DEFAULT_GEMINI_AGENT_TIMEOUT_MULTIPLIER = "1.1"
 DEFAULT_MAX_RETRIES = "2"
@@ -566,6 +566,10 @@ def verify(index_path: Path, summary_path: Path, trace_path: Path) -> list[str]:
     index = load_json(index_path)
     summary = load_json(summary_path)
     trace_text = trace_path.read_text(encoding=\"utf-8\", errors=\"replace\")
+    if \"trace_wrapper_not_invoked\" in trace_text:
+        errors.append(
+            \"trace wrapper was not invoked; HARBOR_AGENT_COMMAND_WRAPPER was ignored or not supported\"
+        )
 
     for required_path in REQUIRED_TRACE_PATHS:
         if not trace_has_path_access(trace_text, required_path):
@@ -663,7 +667,9 @@ def inject_trace_tools_into_dockerfile(dockerfile_text: str) -> str:
     copy_snippet = (
         f"COPY {TRACE_WRAPPER_NAME} /app/{TRACE_WRAPPER_NAME}\n"
         f"COPY {TRACE_VERIFIER_NAME} /app/{TRACE_VERIFIER_NAME}\n"
-        f"RUN chmod +x /app/{TRACE_WRAPPER_NAME} /app/{TRACE_VERIFIER_NAME}\n"
+        f"RUN chmod +x /app/{TRACE_WRAPPER_NAME} /app/{TRACE_VERIFIER_NAME} && "
+        "mkdir -p /app/workflow && "
+        "printf 'ERROR: trace_wrapper_not_invoked\\n' > /app/workflow/gemini_file_trace.log\n"
     )
 
     if (
@@ -1238,7 +1244,7 @@ def print_target_success_loop(args: argparse.Namespace, tasks: list[tuple[int, s
     print("        return False")
     print("    return True")
     print("")
-    print("def job_has_success(job_dir, task_dir):")
+    print("def job_success_status(job_dir, task_dir):")
     print("    job_path = Path(job_dir)")
     print("    diagnostics_success = False")
     print("    for diagnostics_path in job_path.rglob('diagnostics.json'):")
@@ -1254,8 +1260,10 @@ def print_target_success_loop(args: argparse.Namespace, tasks: list[tuple[int, s
     print("            diagnostics_success = True")
     print("            break")
     print("    if not diagnostics_success:")
-    print("        return False")
-    print("    return self_debug_gate_passes(job_dir, task_dir)")
+    print("        return False, 'diagnostics_not_success'")
+    print("    if not self_debug_gate_passes(job_dir, task_dir):")
+    print("        return False, 'self_debug_gate_failed'")
+    print("    return True, 'success'")
     print("")
     print("def select_wave(counts, wave_index):")
     print("    pending = [")
@@ -1325,14 +1333,17 @@ def print_target_success_loop(args: argparse.Namespace, tasks: list[tuple[int, s
     print("        wave_status = 0")
     print("        for item in processes:")
     print("            status = item['process'].wait()")
-    print("            success = job_has_success(item['job_dir'], item['task_dir'])")
+    print("            success, reason = job_success_status(item['job_dir'], item['task_dir'])")
     print("            if success:")
     print("                print(f\"  success: {item['material']} ({item['job_name']})\", flush=True)")
     print("                continue")
     print("            wave_status = 1")
-    print("            print(f\"  non-success: {item['material']} ({item['job_name']}), exit={status}\", flush=True)")
+    print("            print(f\"  non-success: {item['material']} ({item['job_name']}), exit={status}, reason={reason}\", flush=True)")
     print("            if DELETE_FAILED_ATTEMPT_FOLDERS:")
-    print("                shutil.rmtree(item['job_dir'], ignore_errors=True)")
+    print("                if reason == 'self_debug_gate_failed':")
+    print("                    print(f\"  preserving job folder because self-debug gate failed: {item['job_dir']}\", flush=True)")
+    print("                else:")
+    print("                    shutil.rmtree(item['job_dir'], ignore_errors=True)")
     print("        prune_status = run_prune()")
     print("        if prune_status != 0:")
     print("            wave_status = prune_status")
