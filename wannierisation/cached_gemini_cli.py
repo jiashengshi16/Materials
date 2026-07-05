@@ -122,14 +122,21 @@ class CachedGeminiCli(GeminiCli):
         extra_flags = (cli_flags + " ") if cli_flags else ""
         run_model = shlex.quote(model_alias or model)
 
-        wrapper = os.environ.get("HARBOR_AGENT_COMMAND_WRAPPER", "").strip()
+        wrapper = (
+            self._get_env("HARBOR_AGENT_COMMAND_WRAPPER")
+            or os.environ.get("HARBOR_AGENT_COMMAND_WRAPPER")
+            or ""
+        ).strip()
         wrapper_prefix = ""
         if wrapper:
             wrapper_prefix = f"{shlex.quote(wrapper)} "
             env["HARBOR_AGENT_COMMAND_WRAPPER"] = wrapper
+        
+        if os.environ.get("HARBOR_REQUIRE_AGENT_COMMAND_WRAPPER") == "1" and not wrapper:
+            raise RuntimeError("HARBOR_AGENT_COMMAND_WRAPPER is required but was not visible to CachedGeminiCli")
 
         self.logger.info("HARBOR_AGENT_COMMAND_WRAPPER=%r", wrapper)
-        
+
         try:
             await self.exec_as_agent(
                 environment,

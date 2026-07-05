@@ -209,16 +209,18 @@ def retry_includes(extra_args: list[str]) -> set[str]:
             values.add(extra_args[index + 1])
     return values
 
+def is_gemini_agent(agent: str) -> bool:
+    return agent in {"gemini-cli", CACHED_GEMINI_AGENT_IMPORT}
 
 def gemini_default_extra_args(args: argparse.Namespace) -> list[str]:
-    if args.agent != "gemini-cli" or args.no_gemini_cached_defaults:
+    if not is_gemini_agent(args.agent) or args.no_gemini_cached_defaults:
         return []
 
     extra: list[str] = []
-    if not has_option(args.extra_arg, {"--agent-import-path"}):
-        extra.extend(["--agent-import-path", CACHED_GEMINI_AGENT_IMPORT])
+
     if not has_option(args.extra_arg, {"--agent-timeout-multiplier"}):
         extra.extend(["--agent-timeout-multiplier", DEFAULT_GEMINI_AGENT_TIMEOUT_MULTIPLIER])
+
     if args.target_success_runs is None and not has_option(args.extra_arg, {"--max-retries", "-r"}):
         extra.extend(["--max-retries", DEFAULT_MAX_RETRIES])
 
@@ -930,16 +932,16 @@ def build_command(args: argparse.Namespace, dataset: Path, *, n_concurrent: int 
     default_extra_args = gemini_default_extra_args(args)
     all_extra_args = [*default_extra_args, *args.extra_arg]
 
-    if args.gemini_ipv4_first and args.agent == "gemini-cli" and not has_agent_node_options(all_extra_args):
+    if args.gemini_ipv4_first and is_gemini_agent(args.agent) and not has_agent_node_options(all_extra_args):
         command.extend(["--agent-env", GEMINI_IPV4_NODE_OPTIONS])
     if (
-        args.agent == "gemini-cli"
+        is_gemini_agent(args.agent)
         and not args.no_gemini_run_timeout
         and not has_agent_env(all_extra_args, "HARBOR_GEMINI_RUN_TIMEOUT_SEC")
     ):
         command.extend(["--agent-env", GEMINI_RUN_TIMEOUT_ENV])
     if (
-        args.agent == "gemini-cli"
+        is_gemini_agent(args.agent)
         and not args.no_gemini_file_trace
         and args.trace_agent_wrapper_env_name
         and not has_agent_env(all_extra_args, args.trace_agent_wrapper_env_name)
@@ -949,7 +951,7 @@ def build_command(args: argparse.Namespace, dataset: Path, *, n_concurrent: int 
             f"{args.trace_agent_wrapper_env_name}={TRACE_WRAPPER_APP_PATH}",
         ])
     if (
-        args.agent == "gemini-cli"
+        is_gemini_agent(args.agent)
         and not args.no_gemini_host_network
         and not has_extra_docker_compose(all_extra_args)
     ):
@@ -1364,7 +1366,7 @@ def main() -> None:
         )
     )
     parser.add_argument("--dataset", "-p", type=Path, default=DEFAULT_DATASET)
-    parser.add_argument("--agent", "-a", default="gemini-cli")
+    parser.add_argument("--agent", "-a", default=CACHED_GEMINI_AGENT_IMPORT)
     parser.add_argument("--model", "-m", default="google/gemini-3.1-pro-preview")
     parser.add_argument(
         "--n-concurrent",
