@@ -46,7 +46,7 @@ QE_SAVE_RELATIVE_PATH = Path("environment") / "material" / "qe_save"
 QE_SAVE_INSTALLER = ROOT / "scripts" / "install_harbor_qe_save.py"
 HOST_NETWORK_COMPOSE = ROOT / "docker" / "harbor-host-network.compose.yml"
 GEMINI_IPV4_NODE_OPTIONS = "NODE_OPTIONS=--dns-result-order=ipv4first"
-GEMINI_RUN_TIMEOUT_ENV = "HARBOR_GEMINI_RUN_TIMEOUT_SEC=4500"
+GEMINI_RUN_TIMEOUT_ENV = "HARBOR_GEMINI_RUN_TIMEOUT_SEC=4000"
 CACHED_GEMINI_AGENT_IMPORT = "harbor_agents.cached_gemini_cli:CachedGeminiCli"
 DEFAULT_GEMINI_AGENT_TIMEOUT_MULTIPLIER = "1.1"
 DEFAULT_MAX_RETRIES = "2"
@@ -388,6 +388,13 @@ def write_self_debug_context_bundle(
         f"Target material: `{material}`",
         f"Expected self-debug file count: {len(records)}",
         "",
+        "## CRITICAL scope meanings",
+        "",
+        "- `same_material`: prior self-debug report for the current target material. Lessons may transfer directly.",
+        "- `candidate_material`: report from a chemically similar material selected as relevant context for the current target material. It may help with projection choices, energy-window choices, disentanglement decisions, convergence troubleshooting, validation strategy, or other pipeline decisions. However, it is still a different material: do not blindly copy exact band counts, exact windows, exact projections, or final status unless they are justified for the current target material.",
+        "",
+        "Before using any report below, identify its `scope`. Candidate-material reports are not reports for the target material.",
+        "",
         "The agent must read every file section below before choosing projections, windows, target-band handling, or final status.",
         "This bundle is generated from `self_debug_context/index.json`; do not treat a subset as representative.",
         "",
@@ -463,6 +470,15 @@ This bundle contains **{expected_self_debug_file_count} required self-debug file
 They are also enumerated in:
 
 `/app/self_debug_context/index.json`
+
+This bundle may contain reports with different `scope` values.
+
+CRITICAL scope meanings:
+- `same_material`: prior self-debug report for the current target material. Lessons may transfer directly.
+- `candidate_material`: report from a chemically similar material selected as relevant context for the current target material. It may help with projection choices, energy-window choices, disentanglement decisions, convergence troubleshooting, validation strategy, or other pipeline decisions. However, it is still a different material: do not blindly copy exact band counts, exact windows, exact projections, or final status unless they are justified for the current target material.
+
+Before using any report, identify its `scope`. Candidate-material reports are not reports for the target material.
+
 
 You must not sample these files. You must not read only the first few. You must not
 infer that the remaining files are similar. Read every section in the bundle.
@@ -1569,10 +1585,10 @@ def main() -> None:
     parser.add_argument(
         "--success-wave-timeout-sec",
         type=int,
-        default=3500,
+        default=4000,
         help=(
             "For --target-success-runs, run each wave for at most this many wall-clock "
-            "seconds before terminating unfinished Harbor attempts. Default: 3500."
+            "seconds before terminating unfinished Harbor attempts. Default: 4000."
         ),
     )
     parser.add_argument(
