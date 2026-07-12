@@ -70,7 +70,12 @@ DELTA_CMAP = LinearSegmentedColormap.from_list(
     "delta_blue_white_red",
     ["#2D70B8", "#FFFFFF", "#B83A3A"],
 )
-ERROR_RATIO_COLUMNS = ("original run BEST", "new run BEST")
+ERROR_RATIO_COLUMNS = (
+    "original run BEST",
+    "new run BEST",
+    "avg original run error ratio",
+    "avg new run error ratio",
+)
 CHOICE_COLUMNS = ("projection similarity", "window strict equal", "window similarity")
 
 
@@ -269,7 +274,7 @@ def job_folder_from_run_id(run_id: object) -> Path | None:
     return candidate if candidate.is_dir() else None
 
 
-def write_all_error_ratios_csv(new_by_material: dict[str, list[Path]]) -> int:
+def write_all_error_ratios_csv(new_by_material: dict[str, list[Path]]) -> tuple[int, dict[tuple[str, int], dict[str, float | None]]]:
     original_df = pd.DataFrame(load_original_rows())
     original_df["num_wann"] = pd.to_numeric(original_df["num_wann"], errors="coerce")
     original_df["gemini_to_reference_ratio"] = pd.to_numeric(original_df["gemini_to_reference_ratio"], errors="coerce")
@@ -277,6 +282,7 @@ def write_all_error_ratios_csv(new_by_material: dict[str, list[Path]]) -> int:
     original_df = original_df.dropna(subset=["material", "num_wann"])
 
     rows: list[dict[str, object]] = []
+    average_by_key: dict[tuple[str, int], dict[str, float | None]] = {}
     max_original_runs = 0
     max_new_runs = 0
 
@@ -316,12 +322,21 @@ def write_all_error_ratios_csv(new_by_material: dict[str, list[Path]]) -> int:
 
             max_original_runs = max(max_original_runs, len(original_ratios))
             max_new_runs = max(max_new_runs, len(new_ratios))
+            avg_original = float(np.mean(original_ratios)) if original_ratios else None
+            avg_new = float(np.mean(new_ratios)) if new_ratios else None
+            average_by_key[(material, num_wann)] = {
+                "avg_original_run_error_ratio": avg_original,
+                "avg_new_run_error_ratio": avg_new,
+            }
+
             row: dict[str, object] = {
                 "material": material,
                 "num_wann": num_wann,
+                "avg_original_run_error_ratio": avg_original,
             }
             for index, ratio in enumerate(original_ratios, start=1):
                 row[f"original_run_{index}_error_ratio"] = ratio
+            row["avg_new_run_error_ratio"] = avg_new
             for index, ratio in enumerate(new_ratios, start=1):
                 row[f"new_run_{index}_error_ratio"] = ratio
             rows.append(row)
@@ -329,7 +344,9 @@ def write_all_error_ratios_csv(new_by_material: dict[str, list[Path]]) -> int:
     fieldnames = (
         ["material", "num_wann"]
         + [f"original_run_{index}_error_ratio" for index in range(1, max_original_runs + 1)]
+        + ["avg_original_run_error_ratio"]
         + [f"new_run_{index}_error_ratio" for index in range(1, max_new_runs + 1)]
+        + ["avg_new_run_error_ratio"]
     )
     OUTPUT_ALL_RATIOS_CSV.parent.mkdir(parents=True, exist_ok=True)
     with OUTPUT_ALL_RATIOS_CSV.open("w", newline="", encoding="utf-8") as handle:
@@ -337,7 +354,7 @@ def write_all_error_ratios_csv(new_by_material: dict[str, list[Path]]) -> int:
         writer.writeheader()
         writer.writerows(rows)
 
-    return len(rows)
+    return len(rows), average_by_key
 
 
 def finite(value: object) -> float | None:
@@ -538,10 +555,19 @@ def make_delta_heatmap(rows: list[dict[str, object]]) -> None:
 
     df = df.sort_values(["delta_log_error_ratio", "material"], na_position="last").reset_index(drop=True)
     heatmap_df = df[feature_columns].apply(pd.to_numeric, errors="coerce").rename(columns=labels)
-    ratio_df = df[["original_error_ratio", "new_error_ratio"]].rename(
+    ratio_df = df[
+        [
+            "original_error_ratio",
+            "new_error_ratio",
+            "avg_original_run_error_ratio",
+            "avg_new_run_error_ratio",
+        ]
+    ].rename(
         columns={
             "original_error_ratio": ERROR_RATIO_COLUMNS[0],
             "new_error_ratio": ERROR_RATIO_COLUMNS[1],
+            "avg_original_run_error_ratio": ERROR_RATIO_COLUMNS[2],
+            "avg_new_run_error_ratio": ERROR_RATIO_COLUMNS[3],
         }
     )
     choice_df = df[["projection_similarity", "window_strict_equal", "window_similarity"]].rename(
@@ -570,7 +596,7 @@ def make_delta_heatmap(rows: list[dict[str, object]]) -> None:
     gs = fig.add_gridspec(
         1,
         4,
-        width_ratios=[0.95, 1.45, 7.0, 0.35],
+        width_ratios=[1.9, 1.45, 7.0, 0.35],
         left=0.08,
         right=0.92,
         top=0.90,
@@ -640,6 +666,9 @@ def make_delta_heatmap(rows: list[dict[str, object]]) -> None:
         for spine in ax.spines.values():
             spine.set_visible(False)
 
+    # Separate the two BEST-run columns from the two average columns.
+    ratio_ax.axvline(2, color="black", linewidth=2.5)
+
     ratio_ax.set_yticklabels(df["material"].tolist(), fontsize=7)
     choice_ax.tick_params(labelleft=False)
     heatmap_ax.set_yticks(np.arange(len(df)) + 0.5)
@@ -668,7 +697,7 @@ def make_delta_heatmap(rows: list[dict[str, object]]) -> None:
 def main() -> None:
     original_best_by_key = load_original_best_rows()
     new_by_material = job_folders_by_material(REVIEWS_ROOT)
-    all_ratio_row_count = write_all_error_ratios_csv(new_by_material)
+    all_ratio_row_count, average_error_ratios_by_key = write_all_error_ratios_csv(new_by_material)
 
     rows: list[dict[str, object]] = []
     skipped: list[dict[str, str]] = []
@@ -758,6 +787,8 @@ def main() -> None:
                     else None
                 )
 
+            averages = average_error_ratios_by_key.get((material, num_wann), {})
+
             row: dict[str, object] = {
                 "material": material,
                 "num_wann": num_wann,
@@ -765,7 +796,9 @@ def main() -> None:
                 "original_rmse_eV": original_rmse,
                 "new_rmse_eV": new_rmse,
                 "original_error_ratio": original_ratio,
+                "avg_original_run_error_ratio": averages.get("avg_original_run_error_ratio"),
                 "new_error_ratio": new_ratio,
+                "avg_new_run_error_ratio": averages.get("avg_new_run_error_ratio"),
                 "delta_error_ratio_new_minus_original": delta_ratio,
                 "ratio_fold_change_new_over_original": ratio_fold_change,
                 "delta_log10_error_ratio_new_minus_original": delta_log10_ratio,
@@ -822,7 +855,9 @@ def main() -> None:
         "original_rmse_eV",
         "new_rmse_eV",
         "original_error_ratio",
+        "avg_original_run_error_ratio",
         "new_error_ratio",
+        "avg_new_run_error_ratio",
         "delta_error_ratio_new_minus_original",
         "ratio_fold_change_new_over_original",
         "delta_log10_error_ratio_new_minus_original",
