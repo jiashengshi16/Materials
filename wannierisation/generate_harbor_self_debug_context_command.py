@@ -523,7 +523,7 @@ preflight was incomplete.
 
 def trace_wrapper_script() -> str:
     return """#!/usr/bin/env bash
-set -euo pipefail
+set -euo pipefail 
 mkdir -p /app/workflow
 : > /app/workflow/gemini_file_trace.log
 if ! command -v strace >/dev/null 2>&1; then
