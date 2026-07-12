@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shlex
+from typing import Any
 
 from harbor.agents.installed.base import with_prompt_template
 from harbor.agents.installed.gemini_cli import GeminiCli
@@ -60,6 +61,25 @@ class CachedGeminiCli(GeminiCli):
             return
 
         await super().install(environment)
+
+    def _build_settings_config(
+        self,
+        model: str | None = None,
+        auth_type: str | None = None,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        config, model_alias = super()._build_settings_config(model, auth_type)
+        if model == "gemini-2.5-flash":
+            if config is None:
+                config = {}
+            experimental = config.setdefault("experimental", {})
+            experimental["dynamicModelConfiguration"] = True
+            model_configs = config.setdefault("modelConfigs", {})
+            model_id_resolutions = model_configs.setdefault("modelIdResolutions", {})
+            model_id_resolutions["gemini-2.5-flash"] = {
+                "default": "gemini-2.5-flash",
+                "contexts": [],
+            }
+        return config, model_alias
 
     @with_prompt_template
     async def run(
@@ -167,6 +187,62 @@ class CachedGeminiCli(GeminiCli):
                 )
             except Exception:
                 pass
+            try:
+                await self.exec_as_agent(
+                    environment,
+                    command=(
+                        "python3 -c "
+                        + shlex.quote(
+                            "from pathlib import Path\n"
+                            "import json, os, sys\n"
+                            "expected = os.environ.get('HARBOR_EXPECTED_GEMINI_MODEL')\n"
+                            "if not expected:\n"
+                            "    raise SystemExit(0)\n"
+                            "paths = [\n"
+                            "    Path('/logs/agent/gemini-cli.trajectory.jsonl'),\n"
+                            "    Path('/logs/agent/gemini-cli.trajectory.json'),\n"
+                            "]\n"
+                            "path = next((candidate for candidate in paths if candidate.is_file()), None)\n"
+                            "if path is None:\n"
+                            "    print('HARBOR_GEMINI_MODEL_MISSING_TRAJECTORY', file=sys.stderr)\n"
+                            "    raise SystemExit(43)\n"
+                            "actual = None\n"
+                            "text = path.read_text(encoding='utf-8', errors='replace')\n"
+                            "items = []\n"
+                            "try:\n"
+                            "    parsed = json.loads(text)\n"
+                            "    if isinstance(parsed, list):\n"
+                            "        items.extend(parsed)\n"
+                            "    elif isinstance(parsed, dict):\n"
+                            "        items.append(parsed)\n"
+                            "except Exception:\n"
+                            "    pass\n"
+                            "for line in text.splitlines():\n"
+                            "    if not line.strip():\n"
+                            "        continue\n"
+                            "    try:\n"
+                            "        items.append(json.loads(line))\n"
+                            "    except Exception:\n"
+                            "        continue\n"
+                            "for item in items:\n"
+                            "    if not isinstance(item, dict):\n"
+                            "        continue\n"
+                            "    if item.get('type') == 'gemini' and item.get('model'):\n"
+                            "        actual = item['model']\n"
+                            "        break\n"
+                            "if actual is None:\n"
+                            "    print('HARBOR_GEMINI_MODEL_MISSING_IN_TRAJECTORY', file=sys.stderr)\n"
+                            "    raise SystemExit(44)\n"
+                            "if actual and actual != expected:\n"
+                            "    print(f'HARBOR_GEMINI_MODEL_MISMATCH expected={expected} actual={actual}', file=sys.stderr)\n"
+                            "    raise SystemExit(42)\n"
+                        )
+                    ),
+                    env={**env, "HARBOR_EXPECTED_GEMINI_MODEL": model},
+                )
+            except Exception:
+                self.logger.exception("Gemini CLI model mismatch check failed")
+                raise
             try:
                 await self.exec_as_agent(
                     environment,
