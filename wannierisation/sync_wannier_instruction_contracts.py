@@ -16,7 +16,7 @@ DEFAULT_DATASET_DIRS = (
     Path("harbor_datasets/wannier_200__needs_eval_with_qe_save"),
 )
 DEFAULT_SOURCE = Path(
-    "harbor_datasets/wannier_200__needs_eval_with_qe_save/Al24W6/instruction.md"
+    "harbor_datasets/wannier_200/Al24W6/instruction.md"
 )
 SYNC_HEADING = "## Harbor grading note"
 EARLY_HEADING = "## Workflow provenance rules"
@@ -25,10 +25,9 @@ RECOMMENDED_HEADING = "## Recommended QE-save workflow"
 STARTING_POINT_MARKER = "scientific starting point."
 BENCHMARK_MARKER = "\n\nFor this benchmark,"
 LEGACY_PSEUDO_NOTE = """If `material/pseudo/` contains UPF files, those are the pseudopotentials that
-match the supplied QE inputs. Prefer rerunning SCF/NSCF with
-`pseudo_dir = './pseudo/'` from a workflow run directory that symlinks or copies
-`material/pseudo/`, especially when the supplied QE 6.3 XML cannot be consumed
-directly by the installed `pw2wannier90.x`."""
+match the supplied QE inputs. Do not rerun SCF/NSCF when a valid QE NSCF save tree is available. Rerun DFT
+only if the save-tree workflow is technically impossible, and record the exact
+error that made it impossible."""
 
 EARLY_CONTRACT = """## Workflow provenance rules
 
@@ -42,8 +41,7 @@ use them, and record this in `REPORT.md`.
 If `material/` or a copied `materials/` package contains a QE NSCF save tree,
 use that save tree as the DFT-side input for Wannierisation. Do not rerun SCF
 or NSCF unless the provided save tree is missing or unusable. If you rerun any
-DFT-side step, record the reason explicitly in `run_manifest.json`,
-`report.json`, and `REPORT.md`."""
+DFT-side step, record the reason explicitly in `run_manifest.json` and `REPORT.md`."""
 
 DECISION_RATIONALE_CONTRACT = """## Decision rationale requirement
 
@@ -68,12 +66,40 @@ PROJECTION CHOICES MUST NOT BE RANDOM. Do not use `random`, randomized trial pro
 as a fallback.
 
 At the end, copy the decision rationales into `REPORT.md` and summarize the key
-rationales in `report.json.runtime_notes` and
-`artifacts/attempt_<N>/run_manifest.json.notes`."""
+rationales in `artifacts/attempt_<N>/run_manifest.json.notes`."""
 
 PSEUDO_NOTE = LEGACY_PSEUDO_NOTE
 
+NO_MANUAL_WANNIER_REPAIR_CONTRACT = """## Generated-file provenance rules
+
+Never hand-edit, pad, truncate, reorder, synthesize, or fabricate `.amn`,
+`.mmn`, `.eig`, `.nnkp`, `.chk`, `_hr.dat`, or files inside a QE `.save` tree.
+
+If Wannier90 reports a mismatch among `.win`, `.eig`, `.amn`, `.mmn`, or
+`.nnkp`, regenerate the derived files from a consistent `.win` and the QE save
+tree. The only workflow files you may author manually are scripts, `.win`,
+`.pw2wan`, reports, and manifests."""
+
+MATERIAL_READ_ONLY_CONTRACT = """## Material package is read-only
+
+Treat `material/` as immutable input. Never delete, overwrite, patch, download
+into, chmod, chown, or regenerate files under `material/`. If a file is needed,
+copy it into `workflow/run_dir/` first and modify only files under `workflow/`
+or `artifacts/`.
+
+Do not write pseudopotentials, QE XML, save-tree files, Wannier files, or helper
+outputs into `material/`. A run that modifies `material/` is invalid."""
+
 RECOMMENDED_QE_SAVE_WORKFLOW = """## Recommended QE-save workflow
+
+First normalize the QE save tree. Check these paths, in order:
+
+- `material/qe_save/out/aiida.save`
+- `material/qe_save/aiida.save`
+- `material/out/aiida.save`
+- `material/aiida.save`
+
+Create `workflow/run_dir/out/aiida.save` from the first valid one.
 
 When `material/qe_save/out/aiida.save` exists, use it directly as the DFT-side
 input to `pw2wannier90.x`; do not inspect or print the wavefunction files.
@@ -125,6 +151,8 @@ include large binary/checkpoint listings or long radial numeric tables."""
 SHARED_EARLY_BLOCK = "\n\n".join(
     [
         EARLY_CONTRACT,
+        MATERIAL_READ_ONLY_CONTRACT,
+        NO_MANUAL_WANNIER_REPAIR_CONTRACT,
         DECISION_RATIONALE_CONTRACT,
         PSEUDO_NOTE,
         RECOMMENDED_QE_SAVE_WORKFLOW,
@@ -201,8 +229,14 @@ def remove_known_shared_blocks(text: str) -> str:
     )
     return text.replace("\n\n\n", "\n\n")
 
+def normalize_material_preamble(text: str) -> str:
+    return text.replace(
+        "Build and, if feasible within 2 hours, run a Wannierisation workflow.",
+        "Build and run a Wannierisation workflow.",
+    )
 
 def sync_shared_contract_text(text: str) -> str:
+    text = normalize_material_preamble(text)
     text = remove_known_shared_blocks(text)
 
     insert_at = text.find(STARTING_POINT_MARKER)
@@ -266,8 +300,8 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help=(
             "Instruction file to copy the synced Harbor/JSON tail from. "
-            "Defaults to the Al24W6 instruction in the needs-eval-with-QE-save "
-            "dataset view."
+            "Defaults to the Al24W6 instruction in the base wannier_200 "
+            "dataset."
         ),
     )
     parser.add_argument(
