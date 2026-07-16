@@ -729,6 +729,9 @@ def materialize_self_debug_context_dataset(
     target_dataset.mkdir(parents=True, exist_ok=False)
 
     def link_or_copy(src: str, dst: str) -> None:
+        if Path(src).name == "Dockerfile":
+            shutil.copy2(src, dst)
+            return
         try:
             os.link(src, dst)
         except OSError as exc:
@@ -884,7 +887,14 @@ def materialize_self_debug_context_dataset(
                 )
             else:
                 dockerfile_text += "\nCOPY self_debug_context /app/self_debug_context\n"
-        target_dockerfile.write_text(dockerfile_text, encoding="utf-8")
+        # Dockerfile is intentionally rewritten for the augmented dataset.
+        # Replace it via a separate inode so a hardlinked source Dockerfile
+        # cannot be modified in place.
+        replacement_dockerfile = target_dockerfile.with_name(
+            f"{target_dockerfile.name}.tmp"
+        )
+        replacement_dockerfile.write_text(dockerfile_text, encoding="utf-8")
+        replacement_dockerfile.replace(target_dockerfile)
 
         instruction_text = (source_task / "instruction.md").read_text(encoding="utf-8")
         instruction_text += context_instruction_appendix(
