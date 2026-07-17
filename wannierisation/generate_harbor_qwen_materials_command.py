@@ -43,49 +43,59 @@ import generate_harbor_num_wann_order_command as harbor_generator
 #     'Ne',
 # ]
 
+# MATERIALS = [
+# 'Al12Ni4',
+# 'Al4Y2',
+# 'Kr2',
+# 'Au2Y',
+# 'Ag2Sc',
+# 'Ag2Y',
+# 'B2Mn',
+# 'B2Ta',
+# 'B2Ti',
+# 'O2Sr',
+# 'Br2V',
+# 'Cl2Ti',
+# 'Mg4O12Se4',
+# 'Li4O6Si2',
+# 'F4Ni2',
+# 'Co2F4',
+# 'Cr6Ga2',
+# 'Mo6Si2',
+# 'Al2Mo6',
+# 'Ga2Mo6',
+# 'B8H16O16',
+# 'Hf6Si4',
+# 'Hf4Si2',
+# 'Si6Y10',
+# 'Co2O8W2',
+# 'CTi',
+# 'Hf4Ni4',
+# 'Pt4Y4',
+# 'O2Pb2',
+# 'Ru4S8',
+# 'Co4S8',
+# 'FeTi',
+# 'RuZr',
+# 'RhSc',
+# 'FLi',
+# 'BrNa',
+# 'AgSc',
+# ]
+
 MATERIALS = [
-'Al12Ni4',
-'Al4Y2',
-'Kr2',
-'Au2Y',
-'Ag2Sc',
-'Ag2Y',
-'B2Mn',
-'B2Ta',
-'B2Ti',
-'O2Sr',
-'Br2V',
-'Cl2Ti',
-'Mg4O12Se4',
+
+'Al18Co4',
+'Al4Sc2',
 'Li4O6Si2',
-'F4Ni2',
-'Co2F4',
-'Cr6Ga2',
-'Mo6Si2',
-'Al2Mo6',
-'Ga2Mo6',
-'B8H16O16',
-'Hf6Si4',
-'Hf4Si2',
 'Si6Y10',
-'Co2O8W2',
-'CTi',
-'Hf4Ni4',
-'Pt4Y4',
-'O2Pb2',
-'Ru4S8',
-'Co4S8',
-'FeTi',
-'RuZr',
-'RhSc',
-'FLi',
-'BrNa',
-'AgSc',
+'Mg2O10Ti4'
 ]
 
-
 #Deepseek
+#copied existing deepseek-v4-pro metadata into /home/jiasheng/miniconda3/lib/python3.13/site-packages/litellm/model_prices_and_context_window_backup.json
 """
+export LITELLM_LOCAL_MODEL_COST_MAP=True
 export OPENAI_API_KEY="sk-your-new-deepseek-key"
 export OPENAI_BASE_URL="https://api.deepseek.com"
 """
@@ -93,6 +103,8 @@ export OPENAI_BASE_URL="https://api.deepseek.com"
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 
 MODEL = "openai/deepseek-v4-pro"
+
+
 
 
 #GLM Alibaba
@@ -261,7 +273,7 @@ def main() -> None:
         artifact=[],
         no_default_artifacts=False,
         save_generated_qe_save=False,
-        jobs_root=harbor_generator.ROOT / "jobsDeepseekProTerminus2Candidates",
+        jobs_root=harbor_generator.ROOT / "jobsDeepseekProInstructionTest",
 
         target_success_runs=2 if cli.target_runs is None else None,
         target_runs=cli.target_runs,
@@ -269,9 +281,10 @@ def main() -> None:
         validate_new_success=False,
         max_attempts_per_needed_success=0,
         delete_failed_attempt_folders=False,
+        #success_wave_timeout_sec=11000,
         success_wave_timeout_sec=4500,
         success_wave_kill_after_sec=30,
-        success_roots=[harbor_generator.ROOT / "jobsDeepseekProTerminus2Candidates"],
+        success_roots=[harbor_generator.ROOT / "jobsDeepseekPronstructionTest"],
         include_result_dir_name=[],
         least_success_first=False,
         no_gemini_cached_defaults=True,

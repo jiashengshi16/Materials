@@ -26,82 +26,57 @@ ROOT = Path(__file__).resolve().parents[1]
 HARBOR_DATASET_ROOT = ROOT / "harbor_datasets" / "wannier_200"
 
 # Hardcoded experiment controls.
-# MATERIALS = [
-#     "Al12Ni4",
-#     "Al4Mn2O8",
-#     "Al4O8Zn2",
-#     'Al4Y2',
-#     "Al8Zr4",
-#     "Al4Sc2",
-# "Kr2",
-# 'Au2Y',
-# 'Ag2Sc',
-# 'Ag2Y',
-# 'B2Mn',
-# 'B2Ta',
-# 'B2Ti',
-# 'C2Cu2O6',
-# 'C4O12Sr4',
-# 'C2Cd2O6',
-# 'O2Sr',
-# 'Br2V',
-# 'Cl2Ti',
-# 'Mg4O12Se4',
-# 'Li4O6Si2',
-# 'F4Ni2',
-# 'Co2F4',
-# 'Cr6Ga2',
-# 'Mo6Si2',
-# 'Al2Mo6',
-# 'Ga2Mo6',
-# 'B8H16O16',
-# 'Ne',
-# 'Hf6Si4',
-# 'Hf4Si2',
-# 'Si6Y10',
-# 'O2Pd2',
-# 'Co2O8W2',
-# 'CTi',
-# 'Hf4Ni4',
-# 'Pt4Y4',
-# 'Hg3O3',
-# 'O2Pb2',
-# 'Ru4S8',
-# 'Co4S8',
-# 'FeTi',
-# 'RuZr',
-# 'RhSc',
-# 'FLi',
-# 'BrNa',
-# 'Ar2',
-# 'AgSc',
-# ]
-
 MATERIALS = [
-    'Al4Mn2O8',
-    'Al4O8Zn2',
-    'Al4Sc2',
-    'Al8Zr4',
-    'C2Cd2O6',
-    'C2Cu2O6',
-    'Ar2',
-#     'C4O12Sr4',
-#     'Cl2V',
-#     'Cl4Li4O16',
-#     'Co4Sc8',
-#     'Cr2F4',
-#     'Cr6Si2',
-#     'H8O16W4',
-#     'He',
-#     'Hf10Si6',
-    'Hg3O3',
-#     'Mg2O10Ti4',
-#     'NNb',
-#     'Ni4Zr4',
-    'O2Pd2',
-#     'Pd4S8',
-#     'RuTi',
+    "Al12Ni4",
+    "Al4Mn2O8",
+    "Al4O8Zn2",
+    'Al4Y2',
+    "Al8Zr4",
+    "Al4Sc2",
+"Kr2",
+'Au2Y',
+'Ag2Sc',
+'Ag2Y',
+'B2Mn',
+'B2Ta',
+'B2Ti',
+'C2Cu2O6',
+'C4O12Sr4',
+'C2Cd2O6',
+'O2Sr',
+'Br2V',
+'Cl2Ti',
+'Mg4O12Se4',
+'Li4O6Si2',
+'F4Ni2',
+'Co2F4',
+'Cr6Ga2',
+'Mo6Si2',
+'Al2Mo6',
+'Ga2Mo6',
+'B8H16O16',
+'Ne',
+'Hf6Si4',
+'Hf4Si2',
+'Si6Y10',
+'O2Pd2',
+'Co2O8W2',
+'CTi',
+'Hf4Ni4',
+'Pt4Y4',
+'Hg3O3',
+'O2Pb2',
+'Ru4S8',
+'Co4S8',
+'FeTi',
+'RuZr',
+'RhSc',
+'FLi',
+'BrNa',
+'Ar2',
+'AgSc',
 ]
+
 """
 export OPENAI_API_KEY="sk-your-new-deepseek-key"
 export OPENAI_BASE_URL="https://api.deepseek.com"
@@ -116,13 +91,13 @@ def normalize_deepseek_model(model: str) -> str:
 
 
 MODEL = normalize_deepseek_model(os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro"))
-MAX_CONCURRENT_DEEPSEEK = 8
+MAX_CONCURRENT_DEEPSEEK = 12
 REQUEST_TIMEOUT_SEC = 900
-MAX_FILE_CHARS = 45_000
+ZILE_CHARS = 45_000
 MAX_TOTAL_CASE_FILE_CHARS = 220_000
 OUTPUT_ROOT = ROOT / "jobsDeepseekProTerminus2" / "deepseek_pro_debug_reviews"
 RUN_ROOTS = [
-    ROOT / "jobsDeepseekProTerminus2",
+    ROOT / "jobsDeepseekProTerminus2Candidates",
 ]
 NUM_WANN_JOB_RE = re.compile(
     r"^num_wann_ordered__(?P<timestamp>.+?)__pid(?P<pid>\d+)__"
@@ -547,8 +522,8 @@ For every decision review, answer all of these forensic questions:
 - What later evidence in `.wout`, verifier diagnostics, or trajectory contradicts
   or weakens that decision?
 - Was the mistake avoidable without seeing the hidden reference recipe?
-- What concrete second-attempt change should have been tried instead, staying
-  WITHIN the original task instructions?
+- What CONCRETE second-attempt change should have been tried instead, staying
+  WITHIN the original task instructions? These better choices MUST BE CONCRETE and EXPLICIT. NOTHING VAGUE.
 - What remains uncertain because the logs do not contain enough information?
 
 Be especially suspicious of:
@@ -585,7 +560,7 @@ The JSON report must have this shape:
   "trial_folder": "{case.trial_dir.name}",
   "num_wann_from_job_folder": {json.dumps(num_wann)},
   "verdict": "good | mixed | bad | uncertain",
-  "projection_verdict": "not_used | bad | uncertain",
+  "projection_verdict": "good | not_used | bad | uncertain",
   "decision_reviews": [
     {{
       "decision": "short name",
@@ -594,11 +569,11 @@ The JSON report must have this shape:
       "old_claim_or_decision": "what the old run said or did",
       "observed_failure_signal": "what later output showed",
       "why": "specific explanation",
-      "better_choice": "concrete second-attempt change if the decision was an avoidable issue, otherwise null"
+      "better_choice": "CONCRETE second-attempt change if the decision was an avoidable issue, otherwise null"
     }}
   ],
   "failure_chain": ["ordered specific causes, or empty if no avoidable failure chain is supported"],
-  "recommended_next_run_changes": ["specific changes, or empty if the trajectory was reasonable and no supported changes are warranted"]
+  "recommended_next_run_changes": ["SPECIFIC CHANGES, or empty if the trajectory was reasonable and no supported changes are warranted"]
 }}
 ```
 
@@ -807,7 +782,7 @@ this shape:
     "trial_folder": "...",
     "num_wann_from_job_folder": null,
     "verdict": "good | mixed | bad | uncertain",
-    "projection_verdict": "not_used | bad | uncertain",
+    "projection_verdict": "good| not_used | bad | uncertain",
     "decision_reviews": [],
     "failure_chain": [],
     "recommended_next_run_changes": []
