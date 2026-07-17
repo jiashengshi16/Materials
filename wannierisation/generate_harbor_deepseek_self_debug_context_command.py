@@ -12,6 +12,7 @@ import argparse
 from collections import Counter
 import json
 from pathlib import Path
+import re
 import sys
 
 import generate_harbor_num_wann_order_command as harbor_generator
@@ -20,17 +21,37 @@ import generate_harbor_self_debug_context_command as self_debug_generator
 
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 MODEL = "openai/deepseek-v4-pro"
+
+# Hardcoded workflow selector.
+# - "chemically similar": existing workflow; candidate-material self-debug reports
+#   from include_only_candidates.csv are copied as context.
+# - "codex_self_review": only Codex next-run recommendations are copied as context.
+WORKFLOW = "codex_self_review"
+SUPPORTED_WORKFLOWS = {"chemically similar", "codex_self_review"}
+
 DEEPSEEK_SELF_DEBUG_REVIEWS_ROOT = (
     self_debug_generator.ROOT
     / "jobsDeepseekProTerminus2"
     / "deepseek_pro_debug_reviews"
+)
+DEFAULT_CODEX_NEXT_RUN_DIAGNOSES = (
+    self_debug_generator.ROOT
+    / "jobsDeepseekProTerminus2InstructionTest"
+    / "codex_next_run_diagnoses.md"
 )
 DEFAULT_CANDIDATE_RUN_ERROR_TABLE = (
     self_debug_generator.ROOT
     / "jobsDeepseekProTerminus2Candidates"
     / "include_only_candidates.csv"
 )
-DEFAULT_JOBS_ROOT = self_debug_generator.ROOT / "jobsDeepseekProTerminus2SelfDebugContext"
+DEFAULT_JOBS_ROOT = (
+    self_debug_generator.ROOT / "jobsDeepseekProTerminus2CodexSelfReview"
+    if WORKFLOW == "codex_self_review"
+    else self_debug_generator.ROOT / "jobsDeepseekProTerminus2SelfDebugContext"
+)
+DEFAULT_SELF_DEBUG_REVIEWS_ROOT = (
+    DEEPSEEK_SELF_DEBUG_REVIEWS_ROOT
+)
 
 # Leave empty to use all materials that have DeepSeek self-debug reports.
 MATERIALS: list[str] = [
@@ -56,7 +77,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--self-debug-reviews-root",
         type=Path,
-        default=DEEPSEEK_SELF_DEBUG_REVIEWS_ROOT,
+        default=DEFAULT_SELF_DEBUG_REVIEWS_ROOT,
         help="Root containing per-material self_debug_report.md/json folders.",
     )
     parser.add_argument("--jobs-root", type=Path, default=DEFAULT_JOBS_ROOT)
@@ -152,7 +173,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--candidate-self-debug-reviews-root",
         type=Path,
-        default=DEEPSEEK_SELF_DEBUG_REVIEWS_ROOT,
+        default=DEFAULT_SELF_DEBUG_REVIEWS_ROOT,
+    )
+    parser.add_argument(
+        "--next-run-diagnoses",
+        type=Path,
+        default=None,
+        help=(
+            "Codex-reviewed next-run diagnosis markdown. In codex_self_review "
+            "workflow, defaults to jobsDeepseekProTerminus2InstructionTest/"
+            "codex_next_run_diagnoses.md."
+        ),
     )
     return parser.parse_args()
 
@@ -165,6 +196,14 @@ def material_names_with_reports(root: Path) -> set[str]:
         for path in root.iterdir()
         if path.is_dir() and self_debug_generator.self_debug_reports_for_material(path.name, root)
     }
+
+
+def material_names_with_next_run_recommendations(path: Path) -> set[str]:
+    """Find target materials that have per-run sections in the Codex diagnosis."""
+    if not path.is_file():
+        return set()
+    text = path.read_text(encoding="utf-8", errors="replace")
+    return set(re.findall(r"^###\s+\d{4}\s+`([^_`\s]+)__", text, flags=re.MULTILINE))
 
 
 def existing_run_counts(jobs_root: Path, valid_materials: set[str]) -> Counter[str]:
@@ -322,6 +361,10 @@ def selected_materials(cli: argparse.Namespace) -> set[str]:
     if explicit:
         return explicit
 
+    if WORKFLOW == "codex_self_review":
+        diagnoses_path = cli.next_run_diagnoses or DEFAULT_CODEX_NEXT_RUN_DIAGNOSES
+        return material_names_with_next_run_recommendations(diagnoses_path)
+
     if cli.candidate_self_debug_reports_only:
         candidates = candidate_materials_from_include_only_csv(
             cli.candidate_run_error_table.expanduser().resolve()
@@ -333,6 +376,11 @@ def selected_materials(cli: argparse.Namespace) -> set[str]:
 
 def main() -> None:
     cli = parse_args()
+    if WORKFLOW not in SUPPORTED_WORKFLOWS:
+        raise SystemExit(
+            f"Unsupported WORKFLOW={WORKFLOW!r}; choose one of "
+            f"{', '.join(sorted(SUPPORTED_WORKFLOWS))}"
+        )
     if cli.batch_size < 1:
         raise SystemExit("--batch-size must be at least 1")
     if cli.target_runs is not None and cli.target_runs < 1:
@@ -351,10 +399,26 @@ def main() -> None:
     cli.candidate_self_debug_reviews_root = (
         cli.candidate_self_debug_reviews_root.expanduser().resolve()
     )
+    if cli.next_run_diagnoses is not None:
+        cli.next_run_diagnoses = cli.next_run_diagnoses.expanduser().resolve()
 
     self_debug_generator.SELF_DEBUG_REVIEWS_ROOT = cli.self_debug_reviews_root
+
+    if WORKFLOW == "codex_self_review":
+        cli.include_candidate_self_debug_reports = False
+        cli.candidate_self_debug_reports_only = False
+        if cli.next_run_diagnoses is None:
+            cli.next_run_diagnoses = DEFAULT_CODEX_NEXT_RUN_DIAGNOSES
+        if not cli.next_run_diagnoses.is_file():
+            raise SystemExit(f"Codex next-run diagnosis file does not exist: {cli.next_run_diagnoses}")
+
     if cli.candidate_self_debug_reports_only:
         cli.include_candidate_self_debug_reports = True
+
+    include_same_material_reports = (
+        WORKFLOW != "codex_self_review"
+        and not cli.candidate_self_debug_reports_only
+    )
 
     candidate_materials_by_material = None
     if cli.include_candidate_self_debug_reports:
@@ -364,6 +428,11 @@ def main() -> None:
 
     requested = selected_materials(cli)
     if not requested:
+        if WORKFLOW == "codex_self_review":
+            raise SystemExit(
+                "No materials selected. Add names to MATERIALS, pass --material, "
+                f"or add per-material sections to {cli.next_run_diagnoses}."
+            )
         raise SystemExit(
             "No materials selected. Add names to MATERIALS, pass --material, "
             f"or create reports under {cli.self_debug_reviews_root}."
@@ -374,7 +443,7 @@ def main() -> None:
     missing_dataset_materials = sorted(requested - found)
 
     skipped_missing_target_reports: list[str] = []
-    if not cli.candidate_self_debug_reports_only:
+    if include_same_material_reports:
         with_reports = material_names_with_reports(cli.self_debug_reviews_root)
         skipped_missing_target_reports = sorted(found - with_reports)
         tasks = [
@@ -429,6 +498,9 @@ def main() -> None:
         else len(skipped_materials) * cli.target_success_runs
     )
     print("# DeepSeek self-debug context skip summary")
+    print(f"# Workflow: {WORKFLOW}")
+    if cli.next_run_diagnoses is not None:
+        print(f"# Codex next-run diagnoses: {cli.next_run_diagnoses}")
     print(f"# Target materials skipped: {len(skipped_materials)}")
     print(f"# Requested run slots skipped: {requested_run_slots_skipped}")
     print(f"# Missing dataset target materials: {len(missing_dataset_materials)}")
@@ -480,13 +552,14 @@ def main() -> None:
     augmented_dataset, augmented_tasks = self_debug_generator.materialize_self_debug_context_dataset(
         cli.dataset,
         tasks,
-        include_same_material_reports=not cli.candidate_self_debug_reports_only,
+        include_same_material_reports=include_same_material_reports,
         candidate_materials_by_material=candidate_materials_by_material,
         candidate_self_debug_reviews_root=(
             cli.candidate_self_debug_reviews_root
             if cli.include_candidate_self_debug_reports
             else None
         ),
+        next_run_diagnoses_path=cli.next_run_diagnoses,
     )
     args.dataset = augmented_dataset
     if repeats_by_material is not None:

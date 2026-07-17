@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Run DeepSeek directly on prior-run Wannierisation evidence.
+"""Run DeepSeek/Terminus2 on prior-run Wannierisation evidence.
 
 No argparse. Edit MATERIALS below, then run:
 
     scripts/run_deepseek_pro_self_debug_reviews.py
 
-Requires DEEPSEEK_API_KEY or OPENAI_API_KEY.
+Requires Harbor and DEEPSEEK_API_KEY or OPENAI_API_KEY.
 OPENAI_BASE_URL defaults to https://api.deepseek.com.
 """
 
@@ -15,89 +15,105 @@ import json
 import os
 import re
 import shutil
+import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import requests
-
 ROOT = Path(__file__).resolve().parents[1]
 HARBOR_DATASET_ROOT = ROOT / "harbor_datasets" / "wannier_200"
 
 # Hardcoded experiment controls.
+# Choose either "chemically similar" or "list".
+MATERIAL_SELECTION_MODE = "list"
+
 MATERIALS = [
-    "Al12Ni4",
-    "Al4Mn2O8",
-    "Al4O8Zn2",
-    'Al4Y2',
-    "Al8Zr4",
-    "Al4Sc2",
-"Kr2",
-'Au2Y',
-'Ag2Sc',
-'Ag2Y',
-'B2Mn',
-'B2Ta',
-'B2Ti',
-'C2Cu2O6',
-'C4O12Sr4',
-'C2Cd2O6',
-'O2Sr',
-'Br2V',
-'Cl2Ti',
-'Mg4O12Se4',
+
+'Al18Co4',
+'Al4Sc2',
 'Li4O6Si2',
-'F4Ni2',
-'Co2F4',
-'Cr6Ga2',
-'Mo6Si2',
-'Al2Mo6',
-'Ga2Mo6',
-'B8H16O16',
-'Ne',
-'Hf6Si4',
-'Hf4Si2',
 'Si6Y10',
-'O2Pd2',
-'Co2O8W2',
-'CTi',
-'Hf4Ni4',
-'Pt4Y4',
-'Hg3O3',
-'O2Pb2',
-'Ru4S8',
-'Co4S8',
-'FeTi',
-'RuZr',
-'RhSc',
-'FLi',
-'BrNa',
-'Ar2',
-'AgSc',
+'Mg2O10Ti4'
 ]
+
+# MATERIALS = [
+#     "Al12Ni4",
+#     "Al4Mn2O8",
+#     "Al4O8Zn2",
+#     'Al4Y2',
+#     "Al8Zr4",
+#     "Al4Sc2",
+# "Kr2",
+# 'Au2Y',
+# 'Ag2Sc',
+# 'Ag2Y',
+# 'B2Mn',
+# 'B2Ta',
+# 'B2Ti',
+# 'C2Cu2O6',
+# 'C4O12Sr4',
+# 'C2Cd2O6',
+# 'O2Sr',
+# 'Br2V',
+# 'Cl2Ti',
+# 'Mg4O12Se4',
+# 'Li4O6Si2',
+# 'F4Ni2',
+# 'Co2F4',
+# 'Cr6Ga2',
+# 'Mo6Si2',
+# 'Al2Mo6',
+# 'Ga2Mo6',
+# 'B8H16O16',
+# 'Ne',
+# 'Hf6Si4',
+# 'Hf4Si2',
+# 'Si6Y10',
+# 'O2Pd2',
+# 'Co2O8W2',
+# 'CTi',
+# 'Hf4Ni4',
+# 'Pt4Y4',
+# 'Hg3O3',
+# 'O2Pb2',
+# 'Ru4S8',
+# 'Co4S8',
+# 'FeTi',
+# 'RuZr',
+# 'RhSc',
+# 'FLi',
+# 'BrNa',
+# 'Ar2',
+# 'AgSc',
+# ]
 
 """
 export OPENAI_API_KEY="sk-your-new-deepseek-key"
 export OPENAI_BASE_URL="https://api.deepseek.com"
 """
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-def normalize_deepseek_model(model: str) -> str:
+def normalize_terminus_model(model: str) -> str:
     aliases = {
-        "openai/deepseek-v4-pro": "deepseek-v4-pro",
-        "openai/deepseek-v4-flash": "deepseek-v4-flash",
+        "deepseek-v4-pro": "openai/deepseek-v4-pro",
+        "deepseek-v4-flash": "openai/deepseek-v4-flash",
     }
     return aliases.get(model, model)
 
 
-MODEL = normalize_deepseek_model(os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro"))
+MODEL = normalize_terminus_model(
+    os.environ.get("DEEPSEEK_MODEL", "openai/deepseek-v4-pro")
+)
+TERMINUS_AGENT = "terminus-2"
+HARBOR_BIN = "harbor"
+HARBOR_REVIEW_IMAGE = os.environ.get(
+    "DEEPSEEK_REVIEW_DOCKER_IMAGE",
+    "wannier-qe-gemini-base:0.46.0",
+)
 MAX_CONCURRENT_DEEPSEEK = 12
-REQUEST_TIMEOUT_SEC = 900
-ZILE_CHARS = 45_000
-MAX_TOTAL_CASE_FILE_CHARS = 220_000
-OUTPUT_ROOT = ROOT / "jobsDeepseekProTerminus2" / "deepseek_pro_debug_reviews"
+OUTPUT_ROOT = ROOT / "jobsDeepseekProTerminus2InstructionTest" / "deepseek_pro_debug_reviews"
 RUN_ROOTS = [
-    ROOT / "jobsDeepseekProTerminus2Candidates",
+    ROOT / "jobsDeepseekProTerminus2InstructionTest",
 ]
 NUM_WANN_JOB_RE = re.compile(
     r"^num_wann_ordered__(?P<timestamp>.+?)__pid(?P<pid>\d+)__"
@@ -119,6 +135,21 @@ def read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def read_json_if_present(path: Path) -> Any | None:
+    """Return parsed JSON when available and valid; otherwise return None."""
+    if not path.is_file():
+        return None
+    try:
+        return read_json(path)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def read_json_object_if_present(path: Path) -> dict[str, Any]:
+    data = read_json_if_present(path)
+    return data if isinstance(data, dict) else {}
+
+
 def clean_dir(path: Path) -> None:
     if path.exists():
         shutil.rmtree(path)
@@ -130,6 +161,17 @@ def copy_file(src: Path, dst: Path) -> None:
         raise FileNotFoundError(src)
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dst)
+
+
+def copy_file_if_present(src: Path, dst: Path) -> bool:
+    """Copy a file when it exists. Missing files are recorded by the caller, not fatal."""
+    if not src.is_file():
+        return False
+    try:
+        copy_file(src, dst)
+    except OSError:
+        return False
+    return True
 
 
 def write_text(path: Path, text: str) -> None:
@@ -152,6 +194,26 @@ def has_attempt_file(attempt: Path, material: str, suffix: str) -> bool:
     if exact.exists():
         return True
     return bool(sorted(attempt.glob(f"*{suffix}")))
+
+
+def optional_attempt_evidence_files(attempt: Path, material: str) -> list[Path]:
+    """Return optional text-like artifacts that can improve forensic reviews."""
+    patterns = (
+        f"{material}.eig",
+        f"{material}.nnkp",
+        f"{material}_hr.dat",
+        f"{material}.pw2wan",
+        "*.pw2wan",
+        "*pw2wan*.log",
+        "*.werr",
+        "*.err",
+    )
+    files: dict[Path, None] = {}
+    for pattern in patterns:
+        for path in sorted(attempt.glob(pattern)):
+            if path.is_file():
+                files[path] = None
+    return list(files)
 
 
 def display_path(path: Path) -> str:
@@ -218,30 +280,53 @@ def case_id_for(job_metadata: dict[str, Any], trial_dir: Path) -> str:
 
 
 def candidate_trial_dirs(job_dir: Path) -> list[Path]:
-    trials: list[Path] = []
+    # If the job itself looks like a trial, use it.
+    if any(
+        (job_dir / name).exists()
+        for name in ("artifacts", "agent", "verifier")
+    ):
+        return [job_dir]
 
-    if trial_attempt_dir(job_dir) is not None:
-        trials.append(job_dir)
-
-    trials.extend(
+    # Otherwise, look for immediate child trial directories.
+    trials = [
         path
         for path in sorted(job_dir.iterdir())
-        if path.is_dir() and trial_attempt_dir(path) is not None
-    )
+        if path.is_dir()
+        and any(
+            (path / name).exists()
+            for name in ("artifacts", "agent", "verifier")
+        )
+    ]
 
-    return trials
+    # Absolute last resort: still return the job directory.
+    return trials or [job_dir]
 
 
 def trial_attempt_dir(trial_dir: Path) -> Path | None:
-    """Return the attempt artifact directory for known Harbor output layouts."""
+    """Find the best available artifact directory without requiring a fixed layout."""
+
     candidates = [
         trial_dir / "artifacts" / "attempt_1",
         trial_dir / "artifacts" / "logs" / "artifacts" / "attempt_1",
+        trial_dir / "attempt_1",
+        trial_dir / "artifacts",
     ]
+
     for candidate in candidates:
         if candidate.is_dir():
             return candidate
-    return None
+
+    # Search recursively for any attempt_1 directory.
+    matches = sorted(
+        path for path in trial_dir.rglob("attempt_1")
+        if path.is_dir()
+    )
+    if matches:
+        return matches[0]
+
+    # Last resort: use the trial directory itself.
+    # This allows a case to exist even if no artifact directory was produced.
+    return trial_dir
 
 
 def read_json_object(path: Path) -> dict[str, Any]:
@@ -288,21 +373,28 @@ def find_trial_cases(material: str) -> list[TrialCase]:
                 if attempt_dir is None:
                     continue
                 manifest_path = attempt_dir / "run_manifest.json"
+                manifest = read_json_object_if_present(manifest_path)
                 if not manifest_path.is_file():
                     print(
-                        f"Skipping non-reviewable trial for {material}: "
-                        f"missing run_manifest.json at {manifest_path}"
+                        f"Warning for {material}: missing run_manifest.json at {manifest_path}; "
+                        "continuing with empty metadata."
                     )
-                    continue
+                elif not manifest:
+                    print(
+                        f"Warning for {material}: run_manifest.json is invalid or not a JSON object "
+                        f"at {manifest_path}; continuing with empty metadata."
+                    )
+                else:
+                    try:
+                        validate_manifest_material(manifest, material, manifest_path)
+                    except SystemExit as exc:
+                        print(f"Warning for {material}: {exc}; continuing anyway.")
+
                 if not has_attempt_file(attempt_dir, material, ".win"):
                     print(
-                        f"Skipping non-reviewable trial for {material}: "
-                        f"missing .win file in {attempt_dir}"
+                        f"Warning for {material}: missing .win file in {attempt_dir}; "
+                        "continuing with the remaining evidence."
                     )
-                    continue
-
-                manifest = read_json_object(manifest_path)
-                validate_manifest_material(manifest, material, manifest_path)
 
                 cases.append(
                     TrialCase(
@@ -318,7 +410,7 @@ def find_trial_cases(material: str) -> list[TrialCase]:
 
     if not cases:
         print(
-            f"Skipping {material}: no reviewable num_wann_ordered trial folders "
+            f"No discoverable trial folders for {material}: "
             f"under {', '.join(display_path(root) for root in RUN_ROOTS)}"
         )
         return []
@@ -326,7 +418,7 @@ def find_trial_cases(material: str) -> list[TrialCase]:
     return cases
 
 
-def dataset_task_instruction_path(material: str) -> Path:
+def dataset_task_instruction_path(material: str) -> Path | None:
     material_dir = HARBOR_DATASET_ROOT / material
 
     candidates = [
@@ -348,11 +440,7 @@ def dataset_task_instruction_path(material: str) -> Path:
     if len(matches) == 1:
         return matches[0]
 
-    raise SystemExit(
-        f"Could not find original task instructions for {material} in {material_dir}. "
-        "Expected one of: instruction.md, instructions.md, prompt.md, task.md, "
-        "or a unique *instruction*.md file."
-    )
+    return None
 
 
 def first_user_message_from_trajectory(trial_dir: Path) -> str | None:
@@ -362,7 +450,7 @@ def first_user_message_from_trajectory(trial_dir: Path) -> str | None:
 
     try:
         data = read_json(trajectory_path)
-    except json.JSONDecodeError:
+    except (OSError, json.JSONDecodeError):
         return None
 
     if not isinstance(data, dict):
@@ -397,7 +485,16 @@ def original_task_instructions(case: TrialCase) -> tuple[str, str]:
         return trajectory_prompt, "agent/trajectory.json:first user message"
 
     instruction_path = dataset_task_instruction_path(case.material)
-    return instruction_path.read_text(encoding="utf-8"), display_path(instruction_path)
+    if instruction_path is not None:
+        try:
+            return instruction_path.read_text(encoding="utf-8"), display_path(instruction_path)
+        except OSError:
+            pass
+
+    return (
+        "Original task instructions were not available for this case.\n",
+        "not available",
+    )
 
 
 def manifest_summary(manifest: dict[str, Any]) -> dict[str, Any]:
@@ -413,6 +510,81 @@ def manifest_summary(manifest: dict[str, Any]) -> dict[str, Any]:
         "num_bands",
     )
     return {key: manifest.get(key) for key in keys if key in manifest}
+
+
+def terminus_instruction_text(case: TrialCase) -> str:
+    return (
+        prompt_text(case)
+        + """
+
+## Terminus2 workspace note
+
+You are running inside a Harbor Terminus2 task. The review evidence is staged in
+the current working directory, with the same paths named above:
+
+- `case_files/case_metadata.json` if present
+- `case_files/verifier/diagnostics.json` if present
+- `case_files/artifacts/attempt_1/...`
+- `case_files/agent/...`
+- `case_files/original_task_instructions.md` if present
+
+Use shell tools to inspect those files directly. Do not use any embedded
+summary as a substitute for reading the files.
+
+Write the final reports to both of these locations:
+
+- `self_debug_report.md` and `self_debug_report.json` in the current working directory
+- `/logs/artifacts/self_debug_report.md` and `/logs/artifacts/self_debug_report.json`
+
+The `/logs/artifacts` copies are required so Harbor can return the reports to
+the host script.
+"""
+    )
+
+
+def harbor_task_toml() -> str:
+    return f"""schema_version = "1.3"
+
+[agent]
+timeout_sec = 7200
+user = "root"
+
+[verifier]
+timeout_sec = 900
+user = "root"
+
+[environment]
+network_mode = "public"
+docker_image = "{HARBOR_REVIEW_IMAGE}"
+workdir = "/app"
+cpus = 8
+memory_mb = 32768
+storage_mb = 20480
+"""
+
+
+def harbor_task_dir_for_case(case_dir: Path) -> Path:
+    return case_dir / "harbor_task"
+
+
+def prepare_harbor_task_files(case_dir: Path, instruction: str) -> None:
+    """Stage this review case as a minimal Harbor task for Terminus2."""
+    task_dir = harbor_task_dir_for_case(case_dir)
+    if task_dir.exists():
+        shutil.rmtree(task_dir)
+
+    environment_dir = task_dir / "environment"
+    environment_dir.mkdir(parents=True, exist_ok=True)
+
+    write_text(task_dir / "instruction.md", instruction)
+    write_text(task_dir / "task.toml", harbor_task_toml())
+    write_text(environment_dir / "prompt.md", instruction)
+    test_path = task_dir / "tests" / "test.sh"
+    write_text(test_path, "#!/usr/bin/env bash\nset -euo pipefail\nexit 0\n")
+    test_path.chmod(0o755)
+
+    environment_case_files = environment_dir / "case_files"
+    shutil.copytree(case_dir / "case_files", environment_case_files)
 
 
 def prompt_text(case: TrialCase) -> str:
@@ -455,17 +627,29 @@ For any such issue, explain what a scientifically better second try would have
 changed, using only information that would have been available from the task 
 materials and old run logs. 
 
-Read these files:
+Evidence availability varies by case. Do not assume that every listed file exists.
+If all listed files are present, use them all. If one or more files are missing, unreadable,
+empty, or invalid, do not treat that as a task failure and do not invent their contents.
+Continue the forensic review using every available file you can inspect, explicitly note
+which expected evidence was unavailable, and calibrate conclusions to the surviving evidence.
+A missing file by itself is not evidence that the old scientific decision was wrong.
 
-- `case_files/case_metadata.json`
+Read these files if present:
+
+- `case_files/case_metadata.json` if present
 - `case_files/verifier/diagnostics.json` if present
-- `case_files/artifacts/attempt_1/{material}.win`
-- `case_files/artifacts/attempt_1/{material}.wout`
-- `case_files/artifacts/attempt_1/run_manifest.json`
-- `case_files/agent/trajectory.json`
+- `case_files/artifacts/attempt_1/{material}.win` if present
+- `case_files/artifacts/attempt_1/{material}.wout` if present
+- `case_files/artifacts/attempt_1/{material}.eig` if present
+- `case_files/artifacts/attempt_1/{material}.nnkp` if present
+- `case_files/artifacts/attempt_1/{material}_hr.dat` if present
+- `case_files/artifacts/attempt_1/*.pw2wan`, `*pw2wan*.log`, `*.werr`,
+  or `*.err` if present
+- `case_files/artifacts/attempt_1/run_manifest.json` if present
+- `case_files/agent/trajectory.json` if present
 - `case_files/agent/gemini-cli.trajectory.jsonl` if present
 - `case_files/agent/gemini-cli.txt` if present
-- `case_files/original_task_instructions.md`
+- `case_files/original_task_instructions.md` if present
 
 Do not read or rely on these aggregate/reference-analysis files (they are outdated):
 
@@ -487,8 +671,9 @@ requirements, required artifact/status rules, forbidden external lookups, or
 any other original instruction constraints.
 
 Do not handwave from aggregate statistics. The core diagnosis must
-come from this material's `.win`, `.wout`, run manifest, trajectory, and
-per-run verifier diagnostics, if present.
+come from this material's `.win`, `.wout`, `.eig`, `.nnkp`, `_hr.dat`,
+pw2wannier/error logs, run manifest, trajectory, and per-run verifier
+diagnostics, if present.
 
 Write exactly these two files:
 
@@ -587,34 +772,54 @@ def build_case(case: TrialCase) -> Path:
     clean_dir(case_dir)
     case_files = case_dir / "case_files"
 
-    copy_file(
-        find_attempt_file(case.attempt_dir, material, ".win"),
-        case_files / "artifacts" / "attempt_1" / f"{material}.win",
-    )
+    win_dst = case_files / "artifacts" / "attempt_1" / f"{material}.win"
+    try:
+        copy_file(find_attempt_file(case.attempt_dir, material, ".win"), win_dst)
+        win_copied = True
+    except (SystemExit, FileNotFoundError, OSError):
+        win_copied = False
     wout_dst = case_files / "artifacts" / "attempt_1" / f"{material}.wout"
     try:
         copy_file(find_attempt_file(case.attempt_dir, material, ".wout"), wout_dst)
         wout_copied = True
-    except SystemExit:
+    except (SystemExit, FileNotFoundError, OSError):
         write_text(
             wout_dst,
             "No .wout file was present in the source artifacts for this case.\n",
         )
         wout_copied = False
-    copy_file(
+    manifest_copied = copy_file_if_present(
         case.attempt_dir / "run_manifest.json",
         case_files / "artifacts" / "attempt_1" / "run_manifest.json",
     )
-    copy_file(case.trial_dir / "agent" / "trajectory.json", case_files / "agent" / "trajectory.json")
+
+    staged_optional_artifacts: list[dict[str, str]] = []
+    for src in optional_attempt_evidence_files(case.attempt_dir, material):
+        dst = case_files / "artifacts" / "attempt_1" / src.name
+        if not copy_file_if_present(src, dst):
+            continue
+        staged_optional_artifacts.append(
+            {
+                "source": display_path(src),
+                "staged": display_path(dst),
+            }
+        )
+
+    trajectory_copied = copy_file_if_present(
+        case.trial_dir / "agent" / "trajectory.json",
+        case_files / "agent" / "trajectory.json",
+    )
 
     for optional in ("gemini-cli.trajectory.jsonl", "gemini-cli.txt"):
         src = case.trial_dir / "agent" / optional
         if src.exists():
-            copy_file(src, case_files / "agent" / optional)
+            copy_file_if_present(src, case_files / "agent" / optional)
 
     diagnostics_src = case.trial_dir / "verifier" / "diagnostics.json"
-    if diagnostics_src.is_file():
-        copy_file(diagnostics_src, case_files / "verifier" / "diagnostics.json")
+    diagnostics_copied = copy_file_if_present(
+        diagnostics_src,
+        case_files / "verifier" / "diagnostics.json",
+    )
 
     task_text, task_source = original_task_instructions(case)
     write_text(case_files / "original_task_instructions.md", task_text)
@@ -631,9 +836,13 @@ def build_case(case: TrialCase) -> Path:
         "job_metadata": case.job_metadata,
         "manifest_summary": manifest_summary(case.manifest),
         "original_task_instructions_source": task_source,
+        "win_copied": win_copied,
         "wout_copied": wout_copied,
-        "verifier_diagnostics_copied": diagnostics_src.is_file(),
-        "verifier_diagnostics_source": display_path(diagnostics_src) if diagnostics_src.is_file() else None,
+        "run_manifest_copied": manifest_copied,
+        "trajectory_copied": trajectory_copied,
+        "staged_optional_artifacts": staged_optional_artifacts,
+        "verifier_diagnostics_copied": diagnostics_copied,
+        "verifier_diagnostics_source": display_path(diagnostics_src) if diagnostics_copied else None,
         "aggregate_inputs_intentionally_not_copied": [
             "jobs/num_wann_ordered_diagnostics_summary.json",
             "jobs/gemini_vs_reference_errors.xlsx",
@@ -642,7 +851,9 @@ def build_case(case: TrialCase) -> Path:
     }
     write_text(case_files / "case_metadata.json", json.dumps(metadata, indent=2) + "\n")
 
+    instruction = terminus_instruction_text(case)
     write_text(case_dir / "prompt.md", prompt_text(case))
+    prepare_harbor_task_files(case_dir, instruction)
     return case_dir
 
 def report_is_nonempty(case_dir: Path) -> bool:
@@ -679,181 +890,46 @@ def report_is_nonempty(case_dir: Path) -> bool:
     return True
 
 
-def read_text_for_prompt(path: Path) -> tuple[str, bool]:
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
-        return f"<<could not read {path}: {exc}>>\n", False
+def deepseek_harbor_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env.setdefault("OPENAI_BASE_URL", DEFAULT_DEEPSEEK_BASE_URL)
+    if not env.get("OPENAI_API_KEY") and env.get("DEEPSEEK_API_KEY"):
+        env["OPENAI_API_KEY"] = env["DEEPSEEK_API_KEY"]
+    if not env.get("OPENAI_API_KEY") and "localhost" not in env["OPENAI_BASE_URL"]:
+        raise SystemExit("DEEPSEEK_API_KEY or OPENAI_API_KEY is not set.")
+    return env
 
-    if len(text) <= MAX_FILE_CHARS:
-        return text, False
 
-    head_chars = MAX_FILE_CHARS // 2
-    tail_chars = MAX_FILE_CHARS - head_chars
-    return (
-        text[:head_chars]
-        + "\n\n<<TRUNCATED MIDDLE: file exceeded "
-        + f"{MAX_FILE_CHARS} characters; showing head and tail only>>\n\n"
-        + text[-tail_chars:],
-        True,
+def copy_harbor_reports_to_case(case_dir: Path, job_dir: Path) -> bool:
+    if not job_dir.is_dir():
+        return False
+
+    candidates = sorted(
+        job_dir.rglob("self_debug_report.md"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
     )
-
-
-def case_file_prompt_block(case_dir: Path) -> str:
-    files = [
-        "case_files/case_metadata.json",
-        "case_files/verifier/diagnostics.json",
-        "case_files/artifacts/attempt_1/run_manifest.json",
-        "case_files/artifacts/attempt_1",
-        "case_files/agent/trajectory.json",
-        "case_files/agent/gemini-cli.trajectory.jsonl",
-        "case_files/agent/gemini-cli.txt",
-        "case_files/original_task_instructions.md",
-    ]
-
-    blocks: list[str] = []
-    truncations: list[str] = []
-    total_chars = 0
-
-    def add_file(path: Path) -> None:
-        nonlocal total_chars
-        if total_chars >= MAX_TOTAL_CASE_FILE_CHARS:
-            truncations.append(f"{path.relative_to(case_dir)} (omitted: total context budget)")
-            return
-
-        text, truncated = read_text_for_prompt(path)
-        remaining = MAX_TOTAL_CASE_FILE_CHARS - total_chars
-        if len(text) > remaining:
-            text = (
-                text[:remaining]
-                + "\n\n<<TRUNCATED: total case-file context budget reached>>\n"
-            )
-            truncated = True
-        total_chars += len(text)
-        if truncated:
-            truncations.append(str(path.relative_to(case_dir)))
-        blocks.append(f"\n\n===== FILE: {path.relative_to(case_dir)} =====\n{text}")
-
-    for relative in files:
-        path = case_dir / relative
-        if path.is_dir():
-            for child in sorted(path.iterdir()):
-                if child.is_file() and child.suffix in {".win", ".wout", ".json"}:
-                    add_file(child)
+    for md_src in candidates:
+        json_src = md_src.with_name("self_debug_report.json")
+        if not json_src.is_file():
             continue
-        if not path.is_file():
-            continue
-        add_file(path)
+        copy_file(md_src, case_dir / "self_debug_report.md")
+        copy_file(json_src, case_dir / "self_debug_report.json")
+        return True
 
-    truncation_note = ""
-    if truncations:
-        truncation_note = (
-            "\n\nSome large files were truncated in the middle before being sent "
-            "to you. Do not claim evidence from omitted middle sections. "
-            f"Truncated files: {', '.join(truncations)}.\n"
-        )
-
-    return (
-        "\n\nYou do not have filesystem access. The relevant case files are "
-        "embedded below. Use only these embedded file contents as evidence."
-        + truncation_note
-        + "".join(blocks)
-    )
-
-
-def direct_deepseek_prompt(case_dir: Path) -> str:
-    base_prompt = (case_dir / "prompt.md").read_text(encoding="utf-8")
-    return (
-        base_prompt
-        + case_file_prompt_block(case_dir)
-        + """
-
-Because this is a direct DeepSeek API call, you cannot write files yourself.
-Return exactly one valid JSON object, with no surrounding Markdown fences, in
-this shape:
-
-{
-  "markdown_report": "complete contents for self_debug_report.md",
-  "json_report": {
-    "material": "...",
-    "case_id": "...",
-    "run_root": "...",
-    "job_folder": "...",
-    "trial_folder": "...",
-    "num_wann_from_job_folder": null,
-    "verdict": "good | mixed | bad | uncertain",
-    "projection_verdict": "good| not_used | bad | uncertain",
-    "decision_reviews": [],
-    "failure_chain": [],
-    "recommended_next_run_changes": []
-  }
-}
-"""
-    )
-
-
-def parse_deepseek_response(raw_content: str) -> tuple[str, dict[str, Any]]:
-    text = raw_content.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if not match:
-            raise
-        data = json.loads(match.group(0))
-
-    if not isinstance(data, dict):
-        raise ValueError("DeepSeek response root is not a JSON object")
-
-    markdown_report = data.get("markdown_report")
-    json_report = data.get("json_report")
-    if not isinstance(markdown_report, str) or not markdown_report.strip():
-        raise ValueError("DeepSeek response missing non-empty markdown_report")
-    if not isinstance(json_report, dict):
-        raise ValueError("DeepSeek response missing object json_report")
-
-    return markdown_report.rstrip() + "\n", json_report
-
-
-def api_key_for_base_url(base_url: str) -> str:
-    api_key = os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("OPENAI_API_KEY")
-    if api_key:
-        return api_key
-    if "localhost" in base_url or "127.0.0.1" in base_url:
-        return "local-no-key"
-    raise SystemExit("DEEPSEEK_API_KEY or OPENAI_API_KEY is not set.")
+    return False
 
 
 def run_deepseek(case_dir: Path) -> None:
-    prompt = direct_deepseek_prompt(case_dir)
     combined_log_path = case_dir / "deepseek_stdout_stderr.txt"
     status_path = case_dir / "run_status.json"
-    base_url = os.environ.get("OPENAI_BASE_URL", DEFAULT_DEEPSEEK_BASE_URL).rstrip("/")
-    api_key = api_key_for_base_url(base_url)
-
-    endpoint = f"{base_url}/chat/completions"
-    request_body = {
-        "model": MODEL,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are DeepSeek acting as a forensic scientific reviewer. "
-                    "Use only the embedded case files. Return only the requested JSON object."
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.2,
-        "stream": False,
-    }
+    task_dir = harbor_task_dir_for_case(case_dir)
+    harbor_jobs_dir = case_dir / "harbor_runs"
+    harbor_jobs_dir.mkdir(parents=True, exist_ok=True)
+    env = deepseek_harbor_env()
 
     attempts: list[dict[str, Any]] = []
-    max_attempts = 3
+    max_attempts = 10
 
     for attempt_index in range(1, max_attempts + 1):
         # Remove stale outputs so success must come from this attempt.
@@ -862,102 +938,73 @@ def run_deepseek(case_dir: Path) -> None:
             if output_path.exists():
                 output_path.unlink()
 
-        attempt_log_path = case_dir / f"deepseek_attempt_{attempt_index:02d}_api_response.json"
-        error_text = ""
+        job_name = f"terminus2_self_debug_attempt_{attempt_index:02d}"
+        job_dir = harbor_jobs_dir / job_name
+        if job_dir.exists():
+            shutil.rmtree(job_dir)
 
-        try:
-            response = requests.post(
-                endpoint,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=request_body,
-                timeout=REQUEST_TIMEOUT_SEC,
-            )
-            response_payload = response.json()
-        except Exception as exc:
-            response_payload = {"exception": repr(exc)}
-            error_text = repr(exc)
-        else:
-            if response.status_code >= 400:
-                error_text = f"HTTP {response.status_code}: {response.text}"
+        command = [
+            HARBOR_BIN,
+            "run",
+            "--yes",
+            "--quiet",
+            "--path",
+            str(task_dir),
+            "--jobs-dir",
+            str(harbor_jobs_dir),
+            "--job-name",
+            job_name,
+            "--agent",
+            TERMINUS_AGENT,
+            "--model",
+            MODEL,
+            "--n-concurrent",
+            "1",
+            "--agent-timeout-multiplier",
+            "1.1",
+            "--max-retries",
+            "2",
+            "--retry-include",
+            "AgentSetupTimeoutError",
+            "--retry-include",
+            "NonZeroAgentExitCodeError",
+            "--disable-verification",
+        ]
 
-        attempt_log_path.write_text(
-            json.dumps(response_payload, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
+        attempt_log_path = case_dir / f"deepseek_attempt_{attempt_index:02d}_harbor_stdout_stderr.txt"
+        completed = subprocess.run(
+            command,
+            cwd=case_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env,
         )
 
-        if error_text:
-            fatal_error = response_payload.get("error", {}).get("type") == "invalid_request_error"
-            attempt_record = {
-                "attempt": attempt_index,
-                "endpoint": endpoint,
-                "model": MODEL,
-                "attempt_log_path": attempt_log_path.name,
-                "error": error_text,
-                "produced_nonempty_diagnosis": False,
-            }
-            if fatal_error:
-                attempt_record["fatal_error"] = True
-            attempts.append(attempt_record)
-            status_path.write_text(
-                json.dumps(
-                    {
-                        "endpoint": endpoint,
-                        "model": MODEL,
-                        "max_attempts": max_attempts,
-                        "success": False,
-                        "fatal_error": fatal_error,
-                        "attempts": attempts,
-                    },
-                    indent=2,
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            print(
-                f"DeepSeek API attempt {attempt_index}/{max_attempts} failed for "
-                f"{case_dir.name}: {error_text}"
-            )
-            if fatal_error:
-                combined_log_path.write_text(
-                    json.dumps(response_payload, indent=2, ensure_ascii=False) + "\n",
-                    encoding="utf-8",
-                )
-                raise SystemExit(
-                    f"DeepSeek API rejected the request for {case_dir.name}: {error_text}"
-                )
-            continue
-
-        try:
-            raw_content = response_payload["choices"][0]["message"]["content"]
-            markdown_report, json_report = parse_deepseek_response(raw_content)
-            (case_dir / "self_debug_report.md").write_text(markdown_report, encoding="utf-8")
-            (case_dir / "self_debug_report.json").write_text(
-                json.dumps(json_report, indent=2, ensure_ascii=False) + "\n",
-                encoding="utf-8",
-            )
-        except Exception as exc:
-            error_text = f"Could not parse/write DeepSeek report: {exc!r}"
+        stdout_stderr = completed.stdout or ""
+        attempt_log_path.write_text(stdout_stderr, encoding="utf-8")
+        copied_reports = copy_harbor_reports_to_case(case_dir, job_dir)
 
         produced_nonempty_diagnosis = report_is_nonempty(case_dir)
 
         attempt_record = {
             "attempt": attempt_index,
-            "endpoint": endpoint,
+            "command": command,
             "model": MODEL,
+            "agent": TERMINUS_AGENT,
+            "returncode": completed.returncode,
+            "job_dir": display_path(job_dir),
             "attempt_log_path": attempt_log_path.name,
+            "copied_reports_from_harbor": copied_reports,
             "self_debug_report_md_exists": (case_dir / "self_debug_report.md").is_file(),
             "self_debug_report_json_exists": (case_dir / "self_debug_report.json").is_file(),
             "produced_nonempty_diagnosis": produced_nonempty_diagnosis,
         }
-        if error_text:
-            attempt_record["error"] = error_text
         attempts.append(attempt_record)
 
         status = {
-            "endpoint": endpoint,
+            "command": command,
+            "agent": TERMINUS_AGENT,
             "model": MODEL,
             "max_attempts": max_attempts,
             "success": produced_nonempty_diagnosis,
@@ -966,14 +1013,11 @@ def run_deepseek(case_dir: Path) -> None:
         status_path.write_text(json.dumps(status, indent=2) + "\n", encoding="utf-8")
 
         if produced_nonempty_diagnosis:
-            combined_log_path.write_text(
-                json.dumps(response_payload, indent=2, ensure_ascii=False) + "\n",
-                encoding="utf-8",
-            )
+            combined_log_path.write_text(stdout_stderr, encoding="utf-8")
             return
 
         print(
-            f"DeepSeek API attempt {attempt_index}/{max_attempts} did not produce "
+            f"DeepSeek Terminus2 attempt {attempt_index}/{max_attempts} did not produce "
             f"a valid diagnosis for {case_dir.name}; retrying..."
         )
 
@@ -981,7 +1025,7 @@ def run_deepseek(case_dir: Path) -> None:
         "\n\n".join(
             [
                 f"===== ATTEMPT {record['attempt']} "
-                f"model={record['model']} =====\n"
+                f"returncode={record['returncode']} model={record['model']} =====\n"
                 f"{(case_dir / record['attempt_log_path']).read_text(encoding='utf-8')}"
                 for record in attempts
             ]
@@ -1009,14 +1053,49 @@ def run_case(case: TrialCase) -> Path:
     return case_dir
 
 
+def selected_materials() -> list[str]:
+    mode = MATERIAL_SELECTION_MODE.strip().lower()
+
+    if mode == "list":
+        materials = [material.strip() for material in MATERIALS if material.strip()]
+        if not materials:
+            raise SystemExit(
+                'MATERIALS is empty. Add material names at the top of the script '
+                'or set MATERIAL_SELECTION_MODE = "chemically similar".'
+            )
+        if len(materials) != len(set(materials)):
+            raise SystemExit("MATERIALS contains duplicate entries.")
+        return materials
+
+    if mode == "chemically similar":
+        materials: set[str] = set()
+        for run_root in RUN_ROOTS:
+            if not run_root.is_dir():
+                continue
+            for job_dir in run_root.glob("num_wann_ordered*"):
+                if not job_dir.is_dir():
+                    continue
+                material = parse_job_name(job_dir).get("material_from_folder")
+                if isinstance(material, str) and material.strip():
+                    materials.add(material.strip())
+
+        if not materials:
+            raise SystemExit(
+                "No chemically similar candidate materials were found under "
+                + ", ".join(display_path(root) for root in RUN_ROOTS)
+            )
+        return sorted(materials)
+
+    raise SystemExit(
+        'MATERIAL_SELECTION_MODE must be either "chemically similar" or "list".'
+    )
+
+
 def collect_cases() -> list[TrialCase]:
     all_cases: list[TrialCase] = []
 
-    materials = [material.strip() for material in MATERIALS if material.strip()]
-    if not materials:
-        raise SystemExit("MATERIALS is empty. Add candidate material names at the top of the script.")
-    if len(materials) != len(set(materials)):
-        raise SystemExit("MATERIALS contains duplicate entries.")
+    materials = selected_materials()
+    print(f"Material selection mode: {MATERIAL_SELECTION_MODE!r} ({len(materials)} material(s)).")
 
     for material in materials:
         cases = find_trial_cases(material)
@@ -1043,8 +1122,12 @@ def collect_cases() -> list[TrialCase]:
     return unique_cases
 
 def main() -> None:
-    base_url = os.environ.get("OPENAI_BASE_URL", DEFAULT_DEEPSEEK_BASE_URL).rstrip("/")
-    api_key_for_base_url(base_url)
+    if shutil.which(HARBOR_BIN) is None:
+        raise SystemExit(
+            f"Could not find {HARBOR_BIN!r} on PATH. Run this in the same "
+            "environment where Harbor is installed."
+        )
+    deepseek_harbor_env()
 
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     cases = collect_cases()
