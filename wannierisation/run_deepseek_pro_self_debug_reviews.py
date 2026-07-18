@@ -711,6 +711,42 @@ For every decision review, answer all of these forensic questions:
   WITHIN the original task instructions? These better choices MUST BE CONCRETE and EXPLICIT. NOTHING VAGUE.
 - What remains uncertain because the logs do not contain enough information?
 
+
+
+For recommendations, do not only describe the scientific idea. Produce an
+operational next-run playbook that a future model can follow without looping.
+
+The playbook must include:
+- exact next actions, in order;
+- the evidence each action should check;
+- the success condition for each action;
+- what to change if the action fails;
+- what NOT to change while debugging that failure;
+- a maximum retry count;
+- when to stop and report partial/failed instead of continuing.
+
+Every recommendation must be testable. Avoid recommendations like "improve
+projections" or "try better windows" unless you specify the exact validation
+step, e.g. "`wannier90.x -pp <seed>` must produce `.nnkp` and the projection
+count must equal `num_wann`."
+
+Include anti-loop rules. At minimum:
+- If the same command fails twice with the same error, stop retrying it.
+- If `wannier90.x -pp` fails, change only projection syntax/count or `.win`
+  syntax needed for `-pp`; do not change energy windows, `num_bands`, or run
+  `pw2wannier90.x`.
+- If `.nnkp` is produced successfully, do not discard it or restart unrelated
+  unit/cell/k-point experiments unless `pw2wannier90.x` gives a concrete
+  mismatch error.
+- Never recommend `bohr = .true.` for this Wannier90 build.
+- Never recommend long interactive heredocs for workflow scripts.
+- If the shell enters heredoc/input mode, send Ctrl-C once; if still stuck,
+  stop and report partial/failed.
+- Do not recommend random projections if the original task forbids random or
+  arbitrary fallback projections.
+- Do not mark success unless `<seed>_hr.dat` exists and is non-empty.
+
+
 Be especially suspicious of:
 
 - accepting a result after checking only that `<seed>_hr.dat` exists;
@@ -758,9 +794,29 @@ The JSON report must have this shape:
     }}
   ],
   "failure_chain": ["ordered specific causes, or empty if no avoidable failure chain is supported"],
-  "recommended_next_run_changes": ["SPECIFIC CHANGES, or empty if the trajectory was reasonable and no supported changes are warranted"]
+"recommended_next_run_changes": ["SPECIFIC CHANGES, or empty if the trajectory was reasonable and no supported changes are warranted"],
+"next_run_playbook": [
+  {{
+    "step": "exact action for the future run",
+    "purpose": "why this action is needed",
+    "evidence_to_check": ["files, command output, or metrics to inspect"],
+    "success_condition": "concrete pass condition",
+    "if_fails": "specific next change",
+    "do_not_change_yet": ["parameters or workflow parts that should stay fixed while debugging this step"],
+    "max_retries": 1
+  }}
+],
+"stop_conditions": ["conditions where the future run should stop and report partial/failed"],
+"forbidden_next_run_actions": ["actions the future run should not take"],
+"must_verify_before_success": ["checks required before status=success"],
+"uncertain_recommendations_to_verify": ["recommendations that are plausible but must be verified before use"]
+
 }}
 ```
+
+If you cannot provide a safe exact projection/window recipe from the evidence,
+say so explicitly. In that case, recommend the validation procedure rather than
+pretending the recipe is known.
 
 Your final response should be a concise JSON object pointing to
 `self_debug_report.md` and `self_debug_report.json`.
