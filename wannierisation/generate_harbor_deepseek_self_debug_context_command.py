@@ -13,6 +13,7 @@ from collections import Counter
 import json
 from pathlib import Path
 import re
+import shlex
 import sys
 
 import generate_harbor_num_wann_order_command as harbor_generator
@@ -64,6 +65,177 @@ MATERIALS: list[str] = [
     # "C2Cu2O6",
     # "Hg3O3",
 ]
+
+NEXT_RUN_TRACE_ARTIFACTS = [
+    "/app/workflow/next_run_file_trace.log",
+    "/app/workflow/NEXT_RUN_CONTEXT_SUMMARY.json",
+]
+NEXT_RUN_TRACE_WRAPPER_NAME = "trace_next_run_file_access.sh"
+NEXT_RUN_TRACE_VERIFIER_NAME = "verify_next_run_context_access.py"
+NEXT_RUN_TRACE_WRAPPER_APP_PATH = "/app/trace_next_run_file_access.sh"
+
+
+def next_run_trace_wrapper_script() -> str:
+    return """#!/usr/bin/env bash
+set -euo pipefail
+TRACE_PATH=/app/workflow/next_run_file_trace.log
+mkdir -p /app/workflow
+: > "$TRACE_PATH"
+if ! command -v strace >/dev/null 2>&1; then
+  echo "ERROR: strace is not installed in the task image; cannot enforce next-run context reads" >&2
+  echo "ERROR: strace_missing" > "$TRACE_PATH"
+  exit 127
+fi
+exec strace -f \
+  -e trace=openat,open,read,close,stat,newfstatat,access \
+  -s 300 \
+  -o "$TRACE_PATH" \
+  "$@"
+"""
+
+
+def terminus_login_trace_profile_script() -> str:
+    return """# Auto-start Terminus login shells under the configured file-access tracer.
+if [ -n "${HARBOR_AGENT_COMMAND_WRAPPER:-}" ] \
+  && [ -z "${HARBOR_AGENT_COMMAND_WRAPPER_ACTIVE:-}" ] \
+  && [ -x "${HARBOR_AGENT_COMMAND_WRAPPER:-}" ]; then
+  export HARBOR_AGENT_COMMAND_WRAPPER_ACTIVE=1
+  exec "${HARBOR_AGENT_COMMAND_WRAPPER}" /bin/bash --login
+fi
+"""
+
+
+def next_run_trace_verifier_script() -> str:
+    return """#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+
+def load_json(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise SystemExit(f"failed to read JSON {path}: {exc}")
+    if not isinstance(data, dict):
+        raise SystemExit(f"expected JSON object in {path}")
+    return data
+
+
+def trace_has_path_access(trace_text: str, app_path: str) -> bool:
+    escaped = re.escape(app_path)
+    return re.search(r"\\b(openat|open|stat|newfstatat|access)\\([^\\n]*" + escaped, trace_text) is not None
+
+
+def read_bytes_by_path(trace_text: str) -> dict[str, int]:
+    fd_paths: dict[tuple[str, str], str] = {}
+    totals: dict[str, int] = {}
+    open_re = re.compile(
+        r"^\\s*(?P<pid>\\d+)\\s+(?:openat|open)\\([^\\n]*?\\\"(?P<path>/app/next_run_context/[^\\\"]+)\\\"[^\\n]*\\)\\s+=\\s+(?P<fd>\\d+)"
+    )
+    read_re = re.compile(
+        r"^\\s*(?P<pid>\\d+)\\s+read\\((?P<fd>\\d+),.*\\)\\s+=\\s+(?P<count>-?\\d+)"
+    )
+    close_re = re.compile(r"^\\s*(?P<pid>\\d+)\\s+close\\((?P<fd>\\d+)\\)\\s+=\\s+0")
+
+    for line in trace_text.splitlines():
+        open_match = open_re.match(line)
+        if open_match:
+            fd_paths[(open_match.group("pid"), open_match.group("fd"))] = open_match.group("path")
+            continue
+        read_match = read_re.match(line)
+        if read_match:
+            count = int(read_match.group("count"))
+            path = fd_paths.get((read_match.group("pid"), read_match.group("fd")))
+            if path and count > 0:
+                totals[path] = totals.get(path, 0) + count
+            continue
+        close_match = close_re.match(line)
+        if close_match:
+            fd_paths.pop((close_match.group("pid"), close_match.group("fd")), None)
+    return totals
+
+
+def verify(index_path: Path, summary_path: Path, trace_path: Path) -> list[str]:
+    errors: list[str] = []
+    if not index_path.is_file():
+        return [f"missing index.json: {index_path}"]
+    if not summary_path.is_file():
+        return [f"missing NEXT_RUN_CONTEXT_SUMMARY.json: {summary_path}"]
+    if not trace_path.is_file():
+        return [f"missing next_run_file_trace.log: {trace_path}"]
+
+    index = load_json(index_path)
+    summary = load_json(summary_path)
+    trace_text = trace_path.read_text(encoding="utf-8", errors="replace")
+    if "trace_wrapper_not_invoked" in trace_text:
+        errors.append("trace wrapper was not invoked; the Terminus shell was not run under strace")
+    if "strace_missing" in trace_text:
+        errors.append("strace is missing in the task image")
+    if "read(" not in trace_text:
+        errors.append("trace contains no read(2) syscalls")
+
+    required_paths = [
+        "/app/next_run_context/index.json",
+        index.get("required_bundle_path"),
+        index.get("raw_source_path"),
+    ]
+    required_paths = [path for path in required_paths if isinstance(path, str) and path]
+    byte_totals = read_bytes_by_path(trace_text)
+    for required_path in required_paths:
+        if not trace_has_path_access(trace_text, required_path):
+            errors.append(f"no OS trace evidence of opening/stat/access for {required_path}")
+        if byte_totals.get(required_path, 0) <= 0:
+            errors.append(f"no positive read(2) bytes recorded for {required_path}")
+
+    if summary.get("target_material") != index.get("target_material"):
+        errors.append(
+            f"summary target_material={summary.get('target_material')!r} "
+            f"does not match index target_material={index.get('target_material')!r}"
+        )
+    if summary.get("bundle_path") != index.get("required_bundle_path"):
+        errors.append(
+            f"summary bundle_path={summary.get('bundle_path')!r} "
+            f"does not match index required_bundle_path={index.get('required_bundle_path')!r}"
+        )
+    if summary.get("index_path") != "/app/next_run_context/index.json":
+        errors.append(
+            f"summary index_path={summary.get('index_path')!r} "
+            "does not match /app/next_run_context/index.json"
+        )
+    if summary.get("read_complete_bundle") is not True:
+        errors.append("summary read_complete_bundle is not true")
+
+    print(json.dumps({
+        "required_paths": required_paths,
+        "read_bytes": {path: byte_totals.get(path, 0) for path in required_paths},
+    }, indent=2, sort_keys=True))
+    return errors
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--index", default="/app/next_run_context/index.json")
+    parser.add_argument("--summary", default="/app/workflow/NEXT_RUN_CONTEXT_SUMMARY.json")
+    parser.add_argument("--trace", default="/app/workflow/next_run_file_trace.log")
+    args = parser.parse_args()
+    errors = verify(Path(args.index), Path(args.summary), Path(args.trace))
+    if errors:
+        print("NEXT_RUN_CONTEXT_ACCESS_VERIFICATION_FAILED", file=sys.stderr)
+        for error in errors:
+            print(f"- {error}", file=sys.stderr)
+        return 1
+    print("NEXT_RUN_CONTEXT_ACCESS_VERIFICATION_OK")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+"""
 
 
 def parse_args() -> argparse.Namespace:
@@ -310,7 +482,91 @@ def preview_list(values: list[str], *, limit: int = 12) -> str:
     return ", ".join(shown) + suffix
 
 
+def inject_next_run_trace_tools_into_dockerfile(dockerfile_text: str) -> str:
+    install_snippet = (
+        "RUN if command -v apt-get >/dev/null 2>&1; then "
+        "apt-get update && apt-get install -y --no-install-recommends strace && "
+        "rm -rf /var/lib/apt/lists/*; "
+        "elif command -v apk >/dev/null 2>&1; then apk add --no-cache strace; "
+        "elif command -v dnf >/dev/null 2>&1; then dnf install -y strace && dnf clean all; "
+        "else echo 'WARNING: no known package manager for installing strace' >&2; fi\n"
+    )
+    copy_snippet = (
+        f"COPY {NEXT_RUN_TRACE_WRAPPER_NAME} /app/{NEXT_RUN_TRACE_WRAPPER_NAME}\n"
+        f"COPY {NEXT_RUN_TRACE_VERIFIER_NAME} /app/{NEXT_RUN_TRACE_VERIFIER_NAME}\n"
+        f"RUN chmod +x /app/{NEXT_RUN_TRACE_WRAPPER_NAME} "
+        f"/app/{NEXT_RUN_TRACE_VERIFIER_NAME} && "
+        "mkdir -p /app/workflow && "
+        "printf 'ERROR: trace_wrapper_not_invoked\\n' > "
+        "/app/workflow/next_run_file_trace.log\n"
+    )
+    profile_lines = " ".join(
+        shlex.quote(line)
+        for line in terminus_login_trace_profile_script().splitlines()
+    )
+    profile_hook = (
+        "RUN mkdir -p /etc/profile.d && printf '%s\\n' "
+        f"{profile_lines} > /etc/profile.d/harbor-agent-trace.sh\n"
+    )
+
+    if (
+        "apt-get install -y --no-install-recommends strace" not in dockerfile_text
+        and "apk add --no-cache strace" not in dockerfile_text
+        and "dnf install -y strace" not in dockerfile_text
+    ):
+        lines = dockerfile_text.splitlines(keepends=True)
+        for index, line in enumerate(lines):
+            if line.lstrip().upper().startswith("FROM "):
+                lines.insert(index + 1, install_snippet)
+                dockerfile_text = "".join(lines)
+                break
+        else:
+            dockerfile_text = install_snippet + dockerfile_text
+
+    additions = ""
+    if f"COPY {NEXT_RUN_TRACE_WRAPPER_NAME} /app/{NEXT_RUN_TRACE_WRAPPER_NAME}" not in dockerfile_text:
+        additions += copy_snippet
+    if "harbor-agent-trace.sh" not in dockerfile_text:
+        additions += profile_hook
+    if not additions:
+        return dockerfile_text
+
+    marker = "COPY material /app/material\n"
+    if marker in dockerfile_text:
+        return dockerfile_text.replace(marker, additions + marker, 1)
+    return dockerfile_text + "\n" + additions
+
+
+def install_next_run_trace_tools(tasks: list[tuple[int, str, Path]]) -> None:
+    for _num_wann, _material, task_dir in tasks:
+        environment_dir = task_dir / "environment"
+        wrapper_path = environment_dir / NEXT_RUN_TRACE_WRAPPER_NAME
+        wrapper_path.write_text(next_run_trace_wrapper_script(), encoding="utf-8")
+        wrapper_path.chmod(0o755)
+
+        verifier_path = environment_dir / NEXT_RUN_TRACE_VERIFIER_NAME
+        verifier_path.write_text(next_run_trace_verifier_script(), encoding="utf-8")
+        verifier_path.chmod(0o755)
+
+        dockerfile_path = environment_dir / "Dockerfile"
+        dockerfile_text = dockerfile_path.read_text(encoding="utf-8")
+        dockerfile_path.write_text(
+            inject_next_run_trace_tools_into_dockerfile(dockerfile_text),
+            encoding="utf-8",
+        )
+
+
 def deepseek_harbor_args(cli: argparse.Namespace) -> argparse.Namespace:
+    trace_wrapper_path = (
+        NEXT_RUN_TRACE_WRAPPER_APP_PATH
+        if WORKFLOW == "codex_self_review"
+        else self_debug_generator.TRACE_WRAPPER_APP_PATH
+    )
+    trace_artifacts = (
+        list(NEXT_RUN_TRACE_ARTIFACTS)
+        if WORKFLOW == "codex_self_review"
+        else []
+    )
     return argparse.Namespace(
         dataset=cli.dataset,
         agent="terminus-2",
@@ -324,7 +580,7 @@ def deepseek_harbor_args(cli: argparse.Namespace) -> argparse.Namespace:
         extra_arg=[
             "--agent-env",
             f"{self_debug_generator.DEFAULT_TRACE_AGENT_WRAPPER_ENV}="
-            f"{self_debug_generator.TRACE_WRAPPER_APP_PATH}",
+            f"{trace_wrapper_path}",
             "--agent-timeout-multiplier",
             "1.1",
             "--max-retries",
@@ -334,7 +590,7 @@ def deepseek_harbor_args(cli: argparse.Namespace) -> argparse.Namespace:
             "--retry-include",
             "NonZeroAgentExitCodeError",
         ],
-        artifact=[],
+        artifact=trace_artifacts,
         no_default_artifacts=False,
         save_generated_qe_save=False,
         jobs_root=cli.jobs_root,
@@ -351,7 +607,7 @@ def deepseek_harbor_args(cli: argparse.Namespace) -> argparse.Namespace:
         gemini_ipv4_first=False,
         no_gemini_run_timeout=True,
         no_gemini_host_network=True,
-        no_gemini_file_trace=False,
+        no_gemini_file_trace=WORKFLOW == "codex_self_review",
         trace_agent_wrapper_env_name=self_debug_generator.DEFAULT_TRACE_AGENT_WRAPPER_ENV,
     )
 
@@ -561,6 +817,8 @@ def main() -> None:
         ),
         next_run_diagnoses_path=cli.next_run_diagnoses,
     )
+    if WORKFLOW == "codex_self_review":
+        install_next_run_trace_tools(augmented_tasks)
     args.dataset = augmented_dataset
     if repeats_by_material is not None:
         augmented_tasks = [
