@@ -92,13 +92,46 @@ MATERIALS = [
 'Mg2O10Ti4'
 ]
 
-#Deepseek
+#Deepseek with Terminus 2
 #copied existing deepseek-v4-pro metadata into /home/jiasheng/miniconda3/lib/python3.13/site-packages/litellm/model_prices_and_context_window_backup.json
 """
 export LITELLM_LOCAL_MODEL_COST_MAP=True
 export OPENAI_API_KEY="sk-your-new-deepseek-key"
 export OPENAI_BASE_URL="https://api.deepseek.com"
 """
+
+#for deepseek with OpenCode, in one terminal/shell use
+"""
+cat >/tmp/litellm_deepseek_v4pro.yaml <<'YAML'
+model_list:
+  - model_name: deepseek-v4-pro
+    litellm_params:
+      model: deepseek/deepseek-v4-pro
+      api_key: os.environ/DEEPSEEK_API_KEY
+
+  # OpenCode tries to use this for session title generation.
+  # Map it too so it doesn't 404.
+  - model_name: gpt-5.4-nano
+    litellm_params:
+      model: deepseek/deepseek-v4-pro
+      api_key: os.environ/DEEPSEEK_API_KEY
+YAML
+
+export DEEPSEEK_API_KEY="sk-your-real-deepseek-key"
+export LITELLM_MASTER_KEY="sk-litellm-local"
+
+litellm --config /tmp/litellm_deepseek_v4pro.yaml \
+  --host 0.0.0.0 \
+  --port 4000
+"""
+#then in the other one run 
+
+"""
+export OPENAI_BASE_URL="http://127.0.0.1:4000/v1"
+export OPENAI_API_KEY="sk-litellm-local"
+export LITELLM_LOCAL_MODEL_COST_MAP=True
+"""
+
 
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 
@@ -252,7 +285,8 @@ def main() -> None:
 
     args = argparse.Namespace(
         dataset=cli.dataset,
-        agent="terminus-2",
+        #agent="terminus-2",
+        agent="opencode",
         model=MODEL,
         n_concurrent=1,
         batch_size=cli.batch_size,
@@ -269,11 +303,13 @@ def main() -> None:
             "AgentSetupTimeoutError",
             "--retry-include",
             "NonZeroAgentExitCodeError",
+            "--extra-docker-compose",
+            "docker/harbor-host-network.compose.yml",
         ],
         artifact=[],
         no_default_artifacts=False,
         save_generated_qe_save=False,
-        jobs_root=harbor_generator.ROOT / "jobsDeepseekProInstructionTest",
+        jobs_root=harbor_generator.ROOT / "jobsDeepseekProOpenCode",
 
         target_success_runs=2 if cli.target_runs is None else None,
         target_runs=cli.target_runs,
@@ -284,7 +320,7 @@ def main() -> None:
         #success_wave_timeout_sec=11000,
         success_wave_timeout_sec=4500,
         success_wave_kill_after_sec=30,
-        success_roots=[harbor_generator.ROOT / "jobsDeepseekPronstructionTest"],
+        success_roots=[harbor_generator.ROOT / "jobsDeepseekProOpenCode"],
         include_result_dir_name=[],
         least_success_first=False,
         no_gemini_cached_defaults=True,
