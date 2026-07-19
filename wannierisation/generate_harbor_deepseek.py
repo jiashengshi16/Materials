@@ -45,16 +45,19 @@ DEFAULT_AUGMENTED_DATASET_PARENT = harbor_generator.ROOT / "harbor_datasets"
 
 LOCKED_RUNNER_NAME = controlled.LOCKED_RUNNER_NAME
 LOCKED_RUNNER_APP_PATH = controlled.LOCKED_RUNNER_APP_PATH
+COMPILE_RECIPE_NAME = "compile_recipe.py"
+COMPILE_RECIPE_APP_PATH = f"/app/{COMPILE_RECIPE_NAME}"
 LOCKED_COMMAND_WRAPPER_NAME = controlled.LOCKED_COMMAND_WRAPPER_NAME
 LOCKED_COMMAND_WRAPPER_APP_PATH = controlled.LOCKED_COMMAND_WRAPPER_APP_PATH
 LOCKED_BIN_APP_DIR = controlled.LOCKED_BIN_APP_DIR
 LOCKED_DENIED_COMMANDS = controlled.LOCKED_DENIED_COMMANDS
 LOCKED_RUNNER_VERIFIER_HOOK_MARKER = controlled.LOCKED_RUNNER_VERIFIER_HOOK_MARKER
 
-DEFAULT_RECIPE_AGENT_TIMEOUT_SEC = 1200
-DEFAULT_SUCCESS_WAVE_TIMEOUT_SEC = 4800
+DEFAULT_RECIPE_AGENT_TIMEOUT_SEC = 1800
+DEFAULT_SUCCESS_WAVE_TIMEOUT_SEC = 5400
 CONTROLLED_ARTIFACTS = [
     "/app/workflow/recipe_request.json",
+    "/app/workflow/compile_recipe_report.json",
     "/app/workflow/LOCKED_RECIPE.json",
     "/app/workflow/DECISIONS.md",
     "/app/workflow/locked_runner.log",
@@ -833,6 +836,245 @@ if __name__ == "__main__":
 """
 
 
+def compile_recipe_script() -> str:
+    return r"""#!/usr/bin/env python3
+from __future__ import annotations
+
+import importlib.util
+import json
+import shutil
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+
+APP = Path("/app")
+WORKFLOW_DIR = APP / "workflow"
+RUNNER_PATH = APP / "locked_wannier_runner.py"
+REPORT_PATH = WORKFLOW_DIR / "compile_recipe_report.json"
+MAX_LOG_CHARS = 6000
+
+
+def load_runner() -> Any:
+    spec = importlib.util.spec_from_file_location("locked_wannier_runner", RUNNER_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not load {RUNNER_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def log_tail(path: Path, *, max_chars: int = MAX_LOG_CHARS) -> str:
+    if not path.is_file():
+        return ""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    return text[-max_chars:]
+
+
+def eig_by_k(path: Path) -> dict[int, dict[int, float]]:
+    values: dict[int, dict[int, float]] = {}
+    if not path.is_file():
+        return values
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        try:
+            band = int(parts[0])
+            kpt = int(parts[1])
+            energy = float(parts[2])
+        except ValueError:
+            continue
+        values.setdefault(kpt, {})[band] = energy
+    return values
+
+
+def window_report(recipe: dict[str, Any], eig_path: Path) -> dict[str, Any]:
+    values = eig_by_k(eig_path)
+    if not values:
+        return {
+            "passed": False,
+            "errors": ["missing_or_empty_eig_file"],
+            "hints": ["Check that pw2wannier90.x completed and wrote the .eig file."],
+        }
+
+    num_wann = int(recipe["num_wann"])
+    windows = recipe["windows"]
+    dis_win_min = float(windows["dis_win_min"])
+    dis_win_max = float(windows["dis_win_max"])
+    dis_froz_min = float(windows["dis_froz_min"])
+    dis_froz_max = float(windows["dis_froz_max"])
+
+    outer_counts: dict[int, int] = {}
+    frozen_counts: dict[int, int] = {}
+    details: dict[int, dict[str, Any]] = {}
+    errors: list[str] = []
+    hints: list[str] = []
+
+    for kpt, bands in sorted(values.items()):
+        energies = bands.values()
+        outer_count = sum(dis_win_min <= energy <= dis_win_max for energy in energies)
+        frozen_count = sum(dis_froz_min <= energy <= dis_froz_max for energy in energies)
+        outer_counts[kpt] = outer_count
+        frozen_counts[kpt] = frozen_count
+
+        if outer_count < num_wann or frozen_count > num_wann:
+            first_energy = bands.get(1)
+            target_energy = bands.get(num_wann)
+            next_energy = bands.get(num_wann + 1)
+            details[kpt] = {
+                "outer_count": outer_count,
+                "frozen_count": frozen_count,
+                "band_1_energy_ev": first_energy,
+                f"band_{num_wann}_energy_ev": target_energy,
+                f"band_{num_wann + 1}_energy_ev": next_energy,
+            }
+            if outer_count < num_wann:
+                errors.append(
+                    f"k-point {kpt}: outer window contains {outer_count} states, "
+                    f"but num_wann is {num_wann}"
+                )
+            if frozen_count > num_wann:
+                errors.append(
+                    f"k-point {kpt}: frozen window contains {frozen_count} states, "
+                    f"but num_wann is {num_wann}"
+                )
+
+    if errors:
+        first_bad = next(iter(details.values()), {})
+        band_1 = first_bad.get("band_1_energy_ev")
+        band_n = first_bad.get(f"band_{num_wann}_energy_ev")
+        band_next = first_bad.get(f"band_{num_wann + 1}_energy_ev")
+        if band_1 is not None:
+            hints.append(
+                "If low bands are excluded, lower dis_win_min below "
+                f"{float(band_1):.6f} eV with margin."
+            )
+        if band_n is not None:
+            hints.append(
+                f"Set dis_win_max above band {num_wann} energy "
+                f"{float(band_n):.6f} eV at every k-point, with margin."
+            )
+        if band_next is not None:
+            hints.append(
+                f"Keep dis_froz_max below the minimum band {num_wann + 1} "
+                "energy across k-points, with margin."
+            )
+
+    return {
+        "passed": not errors,
+        "errors": errors,
+        "hints": hints,
+        "num_kpoints": len(values),
+        "min_outer_count": min(outer_counts.values()) if outer_counts else None,
+        "max_frozen_count": max(frozen_counts.values()) if frozen_counts else None,
+        "bad_kpoint_details": {
+            str(kpt): detail
+            for kpt, detail in list(details.items())[:8]
+        },
+    }
+
+
+def write_report(report: dict[str, Any]) -> None:
+    WORKFLOW_DIR.mkdir(parents=True, exist_ok=True)
+    REPORT_PATH.write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    print(json.dumps(report, indent=2, sort_keys=True), flush=True)
+
+
+def fail(stage: str, message: str, **extra: Any) -> int:
+    write_report({
+        "status": "failed",
+        "stage": stage,
+        "message": message,
+        "recipe_path": "workflow/recipe_request.json",
+        "report_path": "workflow/compile_recipe_report.json",
+        **extra,
+    })
+    return 1
+
+
+def main() -> int:
+    WORKFLOW_DIR.mkdir(parents=True, exist_ok=True)
+    runner = load_runner()
+    compile_dir = WORKFLOW_DIR / "compile_run"
+    if compile_dir.exists():
+        shutil.rmtree(compile_dir)
+    compile_dir.mkdir(parents=True)
+
+    try:
+        material = runner.material_id()
+        nscf = runner.parse_nscf_input(runner.MATERIAL_DIR / "nscf" / "input" / "nscf.in")
+        expected = runner.expected_from_instruction()
+        request = runner.read_json(runner.RECIPE_REQUEST_PATH)
+        recipe = runner.normalize_recipe(material, request, expected, nscf)
+        runner.install_qe_save(compile_dir)
+        runner.copy_pseudos(compile_dir)
+        seed = recipe["seedname"]
+        runner.write_win(compile_dir / f"{seed}.win", recipe, nscf)
+        runner.write_pw2wan(compile_dir / f"{seed}.pw2wan", seed)
+
+        pp = runner.run_command(
+            ["wannier90.x", "-pp", seed],
+            compile_dir,
+            f"{seed}.compile.pp.log",
+            600,
+        )
+        if pp.returncode != 0:
+            return fail(
+                "wannier90_pp",
+                "wannier90.x -pp failed; revise projection syntax/counts or window syntax",
+                log_tail=log_tail(compile_dir / f"{seed}.compile.pp.log"),
+            )
+
+        pw2 = runner.run_command(
+            ["pw2wannier90.x", "-in", f"{seed}.pw2wan"],
+            compile_dir,
+            f"{seed}.compile.pw2wannier90.log",
+            3600,
+        )
+        if pw2.returncode != 0:
+            return fail(
+                "pw2wannier90",
+                "pw2wannier90.x failed during compile; revise the recipe",
+                log_tail=log_tail(compile_dir / f"{seed}.compile.pw2wannier90.log"),
+            )
+
+        windows = window_report(recipe, compile_dir / f"{seed}.eig")
+        if not windows["passed"]:
+            return fail(
+                "window_sanity",
+                "recipe would crash or be invalid in final Wannier90 window setup",
+                window_diagnostics=windows,
+            )
+
+        write_report({
+            "status": "passed",
+            "stage": "complete",
+            "message": "recipe passed compile checks; do not change it before final verifier",
+            "material_id": recipe["material_id"],
+            "seedname": seed,
+            "num_wann": recipe["num_wann"],
+            "num_bands": recipe["num_bands"],
+            "windows": recipe["windows"],
+            "window_diagnostics": windows,
+            "recipe_path": "workflow/recipe_request.json",
+            "report_path": "workflow/compile_recipe_report.json",
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        })
+        return 0
+    except Exception as exc:
+        return fail("exception", str(exc))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+"""
+
+
 def locked_runner_instruction_appendix(material: str) -> str:
     return f"""
 
@@ -903,10 +1145,12 @@ exit, before grading. This prevents agent tokens from being spent while
 Wannier90 is computing.
 
 Do not run `wannier90.x`, `pw2wannier90.x`, `pw.x`, `rm`, `kill`, `pkill`, or
-`killall` yourself. Do not edit `.win`, `.pw2wan`, generated Wannier files, or
-files under `material/` yourself. Do not send `C-c`, `Ctrl-C`, `SIGINT`,
-terminal interrupt keys, or EOF/control keys. Do not poll for `report.json`,
-do not inspect execution logs, and do not attempt any manual rescue path.
+`killall` yourself. The only allowed preflight execution path is
+`/app/compile_recipe.py`. Do not edit `.win`, `.pw2wan`, generated Wannier
+files, or files under `material/` yourself. Do not send `C-c`, `Ctrl-C`,
+`SIGINT`, terminal interrupt keys, or EOF/control keys. Do not poll for
+`report.json`, do not inspect final execution logs, and do not attempt any
+manual rescue path.
 
 The locked runner will author `.win` and `.pw2wan` from your recipe, copy the
 provided QE save tree into `workflow/run_dir`, run `wannier90.x -pp`,
@@ -915,14 +1159,28 @@ If your recipe is invalid or the commands fail, the attempt should fail rather
 than be silently corrected. The runner only performs broad JSON validation
 before execution; it will not repair projection syntax or projection counts.
 
-After writing `workflow/recipe_request.json`, stop. Return only a concise final
-JSON status like:
+After writing `workflow/recipe_request.json`, run:
+
+`/app/compile_recipe.py`
+
+This compile step runs only preflight checks: JSON/schema validation,
+`wannier90.x -pp`, `pw2wannier90.x`, and `.eig`-based window sanity. It does
+not run final `wannier90.x`, does not create the final Hamiltonian, and does
+not edit your recipe.
+
+If `/app/compile_recipe.py` fails, read the printed JSON diagnostics, update
+`workflow/recipe_request.json` yourself, and run `/app/compile_recipe.py`
+again. You may make at most 3 compile attempts. Do not stop until the compile
+report says `"status": "passed"`, unless you cannot produce a valid recipe.
+
+After compile passes, stop. Return only a concise final JSON status like:
 
 ```json
 {{
   "status": "recipe_submitted",
   "task_complete": true,
   "recipe_path": "workflow/recipe_request.json",
+  "compile_report_path": "workflow/compile_recipe_report.json",
   "runner": "deferred_to_harbor_verifier"
 }}
 ```
@@ -940,9 +1198,10 @@ def inject_locked_tools_into_dockerfile(dockerfile_text: str) -> str:
     denied_commands = " ".join(shlex.quote(name) for name in LOCKED_DENIED_COMMANDS)
     copy_snippet = (
         f"COPY {LOCKED_RUNNER_NAME} {LOCKED_RUNNER_APP_PATH}\n"
+        f"COPY {COMPILE_RECIPE_NAME} {COMPILE_RECIPE_APP_PATH}\n"
         f"COPY {LOCKED_COMMAND_WRAPPER_NAME} {LOCKED_COMMAND_WRAPPER_APP_PATH}\n"
         f"COPY instruction.md /app/instruction.md\n"
-        f"RUN chmod +x {LOCKED_RUNNER_APP_PATH} {LOCKED_COMMAND_WRAPPER_APP_PATH} && "
+        f"RUN chmod +x {LOCKED_RUNNER_APP_PATH} {COMPILE_RECIPE_APP_PATH} {LOCKED_COMMAND_WRAPPER_APP_PATH} && "
         f"mkdir -p {LOCKED_BIN_APP_DIR} && "
         f"for name in {denied_commands}; do "
         f"ln -sf {LOCKED_COMMAND_WRAPPER_APP_PATH} {LOCKED_BIN_APP_DIR}/$name; "
@@ -960,6 +1219,11 @@ def inject_locked_tools_into_dockerfile(dockerfile_text: str) -> str:
     additions = ""
     if f"COPY {LOCKED_RUNNER_NAME} {LOCKED_RUNNER_APP_PATH}" not in dockerfile_text:
         additions += copy_snippet
+    elif f"COPY {COMPILE_RECIPE_NAME} {COMPILE_RECIPE_APP_PATH}" not in dockerfile_text:
+        additions += (
+            f"COPY {COMPILE_RECIPE_NAME} {COMPILE_RECIPE_APP_PATH}\n"
+            f"RUN chmod +x {COMPILE_RECIPE_APP_PATH}\n"
+        )
     if (
         "COPY instruction.md /app/instruction.md" not in dockerfile_text
         and "COPY instruction.md /app/instruction.md" not in additions
@@ -999,7 +1263,9 @@ def materialize_controlled_dataset(
             shutil.copy2(src, dst)
 
     runner_text = generic_locked_runner_script()
+    compile_text = compile_recipe_script()
     compile(runner_text, LOCKED_RUNNER_NAME, "exec")
+    compile(compile_text, COMPILE_RECIPE_NAME, "exec")
 
     augmented_tasks: list[tuple[int, str, Path]] = []
     for num_wann, material, source_task in tasks:
@@ -1017,6 +1283,7 @@ def materialize_controlled_dataset(
                     copy_function=link_or_copy,
                     ignore=shutil.ignore_patterns(
                         LOCKED_RUNNER_NAME,
+                        COMPILE_RECIPE_NAME,
                         LOCKED_COMMAND_WRAPPER_NAME,
                     ),
                 )
@@ -1038,6 +1305,10 @@ def materialize_controlled_dataset(
         runner_path = target_task / "environment" / LOCKED_RUNNER_NAME
         runner_path.write_text(runner_text, encoding="utf-8")
         runner_path.chmod(0o755)
+
+        compile_path = target_task / "environment" / COMPILE_RECIPE_NAME
+        compile_path.write_text(compile_text, encoding="utf-8")
+        compile_path.chmod(0o755)
 
         command_wrapper_path = target_task / "environment" / LOCKED_COMMAND_WRAPPER_NAME
         command_wrapper_path.write_text(
