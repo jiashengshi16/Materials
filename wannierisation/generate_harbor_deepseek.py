@@ -50,10 +50,10 @@ LOCKED_BIN_APP_DIR = controlled.LOCKED_BIN_APP_DIR
 LOCKED_DENIED_COMMANDS = controlled.LOCKED_DENIED_COMMANDS
 LOCKED_RUNNER_VERIFIER_HOOK_MARKER = controlled.LOCKED_RUNNER_VERIFIER_HOOK_MARKER
 
-DEFAULT_RECIPE_AGENT_TIMEOUT_SEC = 600
+DEFAULT_RECIPE_AGENT_TIMEOUT_SEC = 1200
 DEFAULT_SUCCESS_WAVE_TIMEOUT_SEC = 4800
 TASK_AGENT_TIMEOUT_SEC = 7200
-TASK_VERIFIER_TIMEOUT_SEC = 900
+TASK_VERIFIER_TIMEOUT_SEC = 1500
 CONTROLLED_ARTIFACTS = [
     "/app/workflow/recipe_request.json",
     "/app/workflow/LOCKED_RECIPE.json",
@@ -813,12 +813,10 @@ def locked_runner_instruction_appendix(material: str) -> str:
 # Locked DeepSeek Execution Contract
 
 For this DeepSeek run, you are not the workflow executor. You are the recipe
-proposer only.
+proposer only. YOU HAVE 600 SECONDS to propose a recipe and write it to `workflow/recipe_request.json`.
 
 Use the original task instructions and the supplied files under `/app/material`
-to decide the Wannierisation recipe yourself. No prior successful recipe,
-self-debug report, next-run diagnosis, or material-specific answer table is
-provided. You may inspect compact metadata/log snippets, but keep terminal
+to decide the Wannierisation recipe yourself. You may inspect compact metadata/log snippets, but keep terminal
 output small.
 
 Write exactly one proposed recipe file:
@@ -847,10 +845,31 @@ The recipe must be valid JSON. Use only this schema:
 }}
 ```
 
+`use_exclude_bands` must always be false. DO NOT SET IT TO TRUE. 
+All four window fields must be numeric. Do not leave any window value as null.
+
 `projections` must contain the actual Wannier90 projection lines you choose,
 for example strings in the syntax you would place between `begin projections`
 and `end projections`. The runner will not choose projections or windows for
-you.
+you. Use standard Wannier90 projection syntax, such as `Si:l=0;l=1` or
+`Y:l=0;l=1;l=2`. Use coordinate-centered projections only as
+`f=x,y,z:l=...` for fractional coordinates or `c=x,y,z:l=...` for Cartesian
+coordinates. Do not use atom-index projection selectors such as `Si=1:l=...` 
+or `Y=1,2:l=...`; this workflow writes atom labels as repeated species names,
+ and Wannier90 will not recognize those selectors here.
+ Your projection lines must generate exactly `num_wann` usable
+projections. If they generate fewer or more than `num_wann`, the runner will
+fail. Count projections by angular momentum multiplicity: 
+`l=0` gives 1 function per selected site, `l=1` gives 3, `l=2` gives 5, and `l=3` 
+gives 7. Do not multiply these counts by the number of beta projectors in the 
+UPF unless you use an explicitly supported radial-projector syntax.
+
+Window values must be in eV, because the runner writes them directly into the 
+Wannier90 `.win` file. If you parse eigenvalues in Hartree, convert them to eV 
+before writing the recipe. `dis_win_min` and `dis_win_max` must contain at 
+least `num_wann` states at every k-point. `dis_froz_max` must not freeze 
+more than `num_wann` states at any k-point; keep it below the minimum energy 
+of band `num_wann + 1` across k-points, with margin.
 
 Do not run `/app/locked_wannier_runner.py`. Direct agent-side calls are
 rejected. Harbor's verifier will run that deterministic executor after you
@@ -867,7 +886,8 @@ The locked runner will author `.win` and `.pw2wan` from your recipe, copy the
 provided QE save tree into `workflow/run_dir`, run `wannier90.x -pp`,
 `pw2wannier90.x`, and `wannier90.x`, then collect artifacts and reports.
 If your recipe is invalid or the commands fail, the attempt should fail rather
-than be silently corrected.
+than be silently corrected. The runner only performs broad JSON validation
+before execution; it will not repair projection syntax or projection counts.
 
 After writing `workflow/recipe_request.json`, stop. Return only a concise final
 JSON status like:
