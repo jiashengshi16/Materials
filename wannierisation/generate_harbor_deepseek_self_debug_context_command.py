@@ -377,11 +377,11 @@ RECIPE_TABLE: dict[str, dict[str, Any]] = {
         "default_windows": [-52.0, 45.0, -52.0, 19.5],
         "window_bounds": {"dis_win_min": [-60.0, -40.0], "dis_win_max": [35.0, 55.0], "dis_froz_min": [-60.0, -40.0], "dis_froz_max": [18.0, 20.0]},
         "projection_variants": {
-            "reference": [],
+            "reference": ["Mg:s;p", "O:s;p", "Ti:s;p;d", "Ti:s:r=2"],
             "fallback_1": ["Mg:s;p", "O:s;p", "Ti:s;p;d", "Ti:s:r=2"],
         },
-        "allowed_modes": ["scdm", "reference", "explicit"],
-        "default_mode": "scdm",
+        "allowed_modes": ["reference", "explicit"],
+        "default_mode": "explicit",
     },
     "Al18Co4": {
         "num_wann": 124,
@@ -553,6 +553,9 @@ def normalize_recipe(material: str, request: dict[str, Any], table: dict[str, An
         raise ValueError(f"projection_mode {mode!r} is not allowed for {material}")
     if variant not in table["projection_variants"]:
         raise ValueError(f"projection_variant {variant!r} is not allowed for {material}")
+    projections = list(table["projection_variants"][variant])
+    if mode != "scdm" and not projections:
+        raise ValueError(f"projection_variant {variant!r} has no projections for non-SCDM mode {mode!r}")
 
     requested_windows = request.get("windows", {})
     if requested_windows is None:
@@ -582,7 +585,7 @@ def normalize_recipe(material: str, request: dict[str, Any], table: dict[str, An
         "target_dft_band_end": target_end,
         "projection_mode": mode,
         "projection_variant": variant,
-        "projections": list(table["projection_variants"][variant]),
+        "projections": projections,
         "windows": windows,
         "rerun_dft": False,
         "use_exclude_bands": False,
@@ -994,12 +997,13 @@ def main() -> int:
             write_locked_recipe(recipe)
             write_win(run_dir / f"{seed}.win", recipe, nscf)
             result = run_command(["wannier90.x", "-pp", seed], run_dir, f"{seed}.pp.log", 600)
-            if result.returncode == 0:
+            nnkp_path = run_dir / f"{seed}.nnkp"
+            if result.returncode == 0 and nnkp_path.is_file() and nnkp_path.stat().st_size > 0:
                 pp_ok = True
                 if variant != variants_to_try[0]:
                     notes.append(f"allowed repair: switched projections to {variant} after -pp failure")
                 break
-            notes.append(f"wannier90 -pp failed for projection variant {variant}")
+            notes.append(f"wannier90 -pp failed for projection variant {variant}: returncode={result.returncode}, nnkp_present={nnkp_path.is_file()}")
         if not pp_ok:
             write_decisions(recipe, notes)
             collect_artifacts(seed, run_dir, recipe, "failed", notes)
