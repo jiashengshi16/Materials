@@ -24,6 +24,7 @@ import re
 import shutil
 import shlex
 import sys
+import tomllib
 
 import generate_harbor_num_wann_order_command as harbor_generator
 import generate_harbor_deepseek_self_debug_context_command as controlled
@@ -52,8 +53,6 @@ LOCKED_RUNNER_VERIFIER_HOOK_MARKER = controlled.LOCKED_RUNNER_VERIFIER_HOOK_MARK
 
 DEFAULT_RECIPE_AGENT_TIMEOUT_SEC = 1200
 DEFAULT_SUCCESS_WAVE_TIMEOUT_SEC = 4800
-TASK_AGENT_TIMEOUT_SEC = 7200
-TASK_VERIFIER_TIMEOUT_SEC = 1500
 CONTROLLED_ARTIFACTS = [
     "/app/workflow/recipe_request.json",
     "/app/workflow/LOCKED_RECIPE.json",
@@ -167,6 +166,33 @@ def existing_run_counts(jobs_root: Path, valid_materials: set[str]) -> Counter[s
             counts[material] += 1
 
     return counts
+
+
+def task_timeout_sec(task_dir: Path, section: str) -> int:
+    task_toml = task_dir / "task.toml"
+    data = tomllib.loads(task_toml.read_text(encoding="utf-8"))
+    timeout_sec = data.get(section, {}).get("timeout_sec")
+    if type(timeout_sec) is not int or timeout_sec < 1:
+        raise ValueError(
+            f"{task_toml} must define [{section}].timeout_sec as a positive integer"
+        )
+    return timeout_sec
+
+
+def common_task_timeout_sec(
+    tasks: list[tuple[int, str, Path]],
+    section: str,
+) -> int:
+    timeouts = {
+        task_timeout_sec(task_dir, section)
+        for _num_wann, _material, task_dir in tasks
+    }
+    if len(timeouts) != 1:
+        raise ValueError(
+            f"selected tasks have different [{section}].timeout_sec values: "
+            f"{sorted(timeouts)}"
+        )
+    return timeouts.pop()
 
 
 def generic_locked_runner_script() -> str:
@@ -813,7 +839,7 @@ def locked_runner_instruction_appendix(material: str) -> str:
 # Locked DeepSeek Execution Contract
 
 For this DeepSeek run, you are not the workflow executor. You are the recipe
-proposer only. YOU HAVE 600 SECONDS to propose a recipe and write it to `workflow/recipe_request.json`.
+proposer only. YOU HAVE {DEFAULT_RECIPE_AGENT_TIMEOUT_SEC} SECONDS to propose a recipe and write it to `workflow/recipe_request.json`.
 
 Use the original task instructions and the supplied files under `/app/material`
 to decide the Wannierisation recipe yourself. You may inspect compact metadata/log snippets, but keep terminal
@@ -1061,7 +1087,12 @@ def materialize_controlled_dataset(
     return target_dataset, augmented_tasks
 
 
-def deepseek_harbor_args(cli: argparse.Namespace) -> argparse.Namespace:
+def deepseek_harbor_args(
+    cli: argparse.Namespace,
+    tasks: list[tuple[int, str, Path]],
+) -> argparse.Namespace:
+    agent_timeout_sec = common_task_timeout_sec(tasks, "agent")
+    verifier_timeout_sec = common_task_timeout_sec(tasks, "verifier")
     return argparse.Namespace(
         dataset=cli.dataset,
         agent="terminus-2",
@@ -1074,9 +1105,9 @@ def deepseek_harbor_args(cli: argparse.Namespace) -> argparse.Namespace:
         delete_after_run=True,
         extra_arg=[
             "--agent-timeout-multiplier",
-            f"{cli.recipe_agent_timeout_sec / TASK_AGENT_TIMEOUT_SEC:.6g}",
+            f"{cli.recipe_agent_timeout_sec / agent_timeout_sec:.6g}",
             "--verifier-timeout-multiplier",
-            f"{cli.success_wave_timeout_sec / TASK_VERIFIER_TIMEOUT_SEC:.6g}",
+            f"{cli.success_wave_timeout_sec / verifier_timeout_sec:.6g}",
             "--max-retries",
             "2",
             "--retry-include",
@@ -1141,8 +1172,6 @@ def main() -> None:
             "Unknown material directory/directories: " + ", ".join(missing)
         )
 
-    args = deepseek_harbor_args(cli)
-
     print("# DeepSeek controlled materials run")
     print("# Input task surface: generate_harbor_qwen_materials_command.py")
     print("# Execution path: Terminus recipe proposal, locked verifier execution")
@@ -1157,7 +1186,7 @@ def main() -> None:
     repeats_by_material: dict[str, int] | None = None
     if cli.target_runs is not None:
         counts = existing_run_counts(
-            args.jobs_root,
+            cli.jobs_root,
             valid_materials=requested,
         )
         repeats_by_material = {}
@@ -1184,6 +1213,7 @@ def main() -> None:
         cli.dataset,
         tasks,
     )
+    args = deepseek_harbor_args(cli, augmented_tasks)
     args.dataset = augmented_dataset
 
     if repeats_by_material is not None:
