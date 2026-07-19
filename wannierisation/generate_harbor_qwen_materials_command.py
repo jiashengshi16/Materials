@@ -131,13 +131,8 @@ export OPENAI_BASE_URL="http://127.0.0.1:4000/v1"
 export OPENAI_API_KEY="sk-litellm-local"
 export LITELLM_LOCAL_MODEL_COST_MAP=True
 """
-
-
-DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-
-MODEL = "openai/deepseek-v4-pro"
-
-
+# DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+# MODEL = "openai/deepseek-v4-pro"
 
 
 #GLM Alibaba
@@ -159,12 +154,19 @@ export OPENAI_BASE_URL="https://api.z.ai/api/paas/v4"
 
 
 #ChatGPT
-
-"""
-
-"""
 # DEFAULT_DEEPSEEK_BASE_URL = "https://api.openai.com/v1"
 # MODEL = "gpt-5.4-mini"
+
+#KIMI3
+"""
+export KIMI_API_KEY="your-key"
+export OPENAI_API_KEY="$KIMI_API_KEY"
+export OPENAI_BASE_URL="https://api.moonshot.ai/v1"
+
+"""
+DEFAULT_DEEPSEEK_BASE_URL = "https://api.moonshot.ai/v1"
+MODEL = "openai/kimi-k3"
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -285,8 +287,8 @@ def main() -> None:
 
     args = argparse.Namespace(
         dataset=cli.dataset,
-        #agent="terminus-2",
-        agent="opencode",
+        agent="terminus-2",
+        #agent="opencode",
         model=MODEL,
         n_concurrent=1,
         batch_size=cli.batch_size,
@@ -309,7 +311,7 @@ def main() -> None:
         artifact=[],
         no_default_artifacts=False,
         save_generated_qe_save=False,
-        jobs_root=harbor_generator.ROOT / "jobsDeepseekProOpenCode",
+        jobs_root=harbor_generator.ROOT / "jobsKIMI3Terminus2",
 
         target_success_runs=2 if cli.target_runs is None else None,
         target_runs=cli.target_runs,
@@ -320,7 +322,7 @@ def main() -> None:
         #success_wave_timeout_sec=11000,
         success_wave_timeout_sec=4500,
         success_wave_kill_after_sec=30,
-        success_roots=[harbor_generator.ROOT / "jobsDeepseekProOpenCode"],
+        success_roots=[harbor_generator.ROOT / "jobsKIMI3Terminus2"],
         include_result_dir_name=[],
         least_success_first=False,
         no_gemini_cached_defaults=True,
