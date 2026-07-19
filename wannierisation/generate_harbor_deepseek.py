@@ -55,6 +55,7 @@ LOCKED_RUNNER_VERIFIER_HOOK_MARKER = controlled.LOCKED_RUNNER_VERIFIER_HOOK_MARK
 
 DEFAULT_RECIPE_AGENT_TIMEOUT_SEC = 1800
 DEFAULT_SUCCESS_WAVE_TIMEOUT_SEC = 5400
+LOCKED_FINAL_TIMEOUT_CLEANUP_BUFFER_SEC = 300
 CONTROLLED_ARTIFACTS = [
     "/app/workflow/recipe_request.json",
     "/app/workflow/compile_recipe_report.json",
@@ -198,8 +199,13 @@ def common_task_timeout_sec(
     return timeouts.pop()
 
 
-def generic_locked_runner_script() -> str:
-    return r"""#!/usr/bin/env python3
+def locked_final_timeout_sec(success_wave_timeout_sec: int) -> int:
+    return max(1, success_wave_timeout_sec - LOCKED_FINAL_TIMEOUT_CLEANUP_BUFFER_SEC)
+
+
+def generic_locked_runner_script(success_wave_timeout_sec: int) -> str:
+    final_timeout_sec = locked_final_timeout_sec(success_wave_timeout_sec)
+    script = r"""#!/usr/bin/env python3
 from __future__ import annotations
 
 import json
@@ -486,12 +492,11 @@ def write_win(path: Path, recipe: dict[str, Any], nscf: dict[str, Any]) -> None:
     lines: list[str] = [
         f"num_wann = {recipe['num_wann']}",
         f"num_bands = {recipe['num_bands']}",
-        "num_iter = 1000",
-        "dis_num_iter = 1000",
+        "num_iter = 500",
+        "dis_num_iter = 500",
         "conv_tol = 1.0d-8",
         "dis_conv_tol = 1.0d-8",
         "write_hr = .true.",
-        "guiding_centres = .true.",
         f"mp_grid = {mp_grid[0]} {mp_grid[1]} {mp_grid[2]}",
         f"dis_win_min = {windows['dis_win_min']:.8f}",
         f"dis_win_max = {windows['dis_win_max']:.8f}",
@@ -834,6 +839,10 @@ def shlex_quote(value: str) -> str:
 if __name__ == "__main__":
     raise SystemExit(main())
 """
+    return script.replace(
+        "def run_wannier_final(seed: str, run_dir: Path, timeout_sec: int = 7200) -> int:",
+        f"def run_wannier_final(seed: str, run_dir: Path, timeout_sec: int = {final_timeout_sec}) -> int:",
+    )
 
 
 def compile_recipe_script() -> str:
@@ -842,6 +851,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import shutil
 import sys
 import time
@@ -870,6 +880,153 @@ def log_tail(path: Path, *, max_chars: int = MAX_LOG_CHARS) -> str:
         return ""
     text = path.read_text(encoding="utf-8", errors="replace")
     return text[-max_chars:]
+
+
+def projection_count_diagnostics(recipe: dict[str, Any], nscf: dict[str, Any]) -> dict[str, Any]:
+    species_counts: dict[str, int] = {}
+    for atom in nscf.get("atoms", []):
+        if not atom:
+            continue
+        species = str(atom[0])
+        species_counts[species] = species_counts.get(species, 0) + 1
+
+    total = 0
+    details: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    species_pattern = re.compile(r"^([A-Za-z][A-Za-z0-9_+-]*)\s*:\s*(.+)$")
+    center_pattern = re.compile(r"^[fc]\s*=\s*[^:]+:\s*(.+)$", flags=re.IGNORECASE)
+    l_pattern = re.compile(r"\bl\s*=\s*([0-3])\b", flags=re.IGNORECASE)
+
+    for projection in recipe.get("projections", []):
+        line = str(projection).strip()
+        site_count = None
+        kind = None
+        selector_text = ""
+        species_match = species_pattern.match(line)
+        center_match = center_pattern.match(line)
+        if species_match:
+            species = species_match.group(1)
+            selector_text = species_match.group(2)
+            site_count = species_counts.get(species)
+            kind = "species"
+            if site_count is None:
+                warnings.append(f"projection {line!r} refers to species not found in nscf atoms")
+                site_count = 0
+        elif center_match:
+            selector_text = center_match.group(1)
+            site_count = 1
+            kind = "coordinate_center"
+        else:
+            warnings.append(f"projection {line!r} is not countable by the locked recipe diagnostics")
+            details.append({"line": line, "kind": "unknown", "count": None})
+            continue
+
+        angular_l_values = [int(value) for value in l_pattern.findall(selector_text)]
+        if not angular_l_values:
+            warnings.append(f"projection {line!r} has no explicit l= angular momentum selector")
+            details.append({"line": line, "kind": kind, "site_count": site_count, "count": None})
+            continue
+        count = int(site_count) * sum(2 * angular_l + 1 for angular_l in angular_l_values)
+        total += count
+        details.append({
+            "line": line,
+            "kind": kind,
+            "site_count": site_count,
+            "l_values": angular_l_values,
+            "count": count,
+        })
+
+    num_wann = int(recipe["num_wann"])
+    missing = num_wann - total
+    hints: list[str] = []
+    if missing > 0:
+        hints.append(
+            f"Projection count is {total}, but num_wann is {num_wann}; "
+            f"add {missing} more projection functions."
+        )
+        if missing <= 12:
+            hints.append(
+                "Safest repair: add coordinate-centered scalar projections "
+                "f=x,y,z:l=0 until the count matches num_wann."
+            )
+        else:
+            hints.append(
+                "Add coordinate-centered f=... or c=... projections using l=0/l=1/l=2 "
+                "multiplicities so the total equals num_wann exactly."
+            )
+        hints.append(
+            "Do not repair an undercount by duplicating l= channels, using pseudo-orbital "
+            "labels such as Co:3S, or inventing radial-projector selectors."
+        )
+    elif missing < 0:
+        hints.append(
+            f"Projection count is {total}, but num_wann is {num_wann}; "
+            f"remove {-missing} projection functions."
+        )
+    else:
+        hints.append(f"Projection count matches num_wann exactly at {num_wann}.")
+
+    return {
+        "num_wann": num_wann,
+        "estimated_projection_count": total,
+        "difference_num_wann_minus_count": missing,
+        "details": details,
+        "warnings": warnings,
+        "hints": hints,
+    }
+
+
+def upstream_pp_diagnostics(
+    compile_dir: Path,
+    seed: str,
+    recipe: dict[str, Any],
+    nscf: dict[str, Any],
+) -> dict[str, Any]:
+    pp_log_path = compile_dir / f"{seed}.compile.pp.log"
+    wout_path = compile_dir / f"{seed}.wout"
+    pp_log = log_tail(pp_log_path)
+    wout_tail = log_tail(wout_path)
+    combined = "\n".join(part for part in [pp_log, wout_tail] if part)
+    lower = combined.lower()
+
+    primary_cause = "wannier90.x -pp did not generate the .nnkp file"
+    hints: list[str] = []
+    if "too few projection functions" in lower:
+        primary_cause = "too few projection functions defined"
+        hints.append(
+            "Wannier90 rejected the projection block before writing .nnkp because "
+            "the usable projection count is smaller than num_wann."
+        )
+    elif "too many projection functions" in lower:
+        primary_cause = "too many projection functions defined"
+        hints.append(
+            "Wannier90 rejected the projection block before writing .nnkp because "
+            "the usable projection count is larger than num_wann."
+        )
+    elif "param_get_projection" in lower or "projection" in lower:
+        primary_cause = "projection syntax rejected by wannier90.x -pp"
+        hints.append(
+            "Inspect the projection block; use recipe-supported Wannier90 projection "
+            "syntax and avoid unsupported selector variants."
+        )
+
+    count_diagnostics = projection_count_diagnostics(recipe, nscf)
+    hints.extend(count_diagnostics["hints"])
+    return {
+        "primary_cause": primary_cause,
+        "hints": hints,
+        "projection_count_diagnostics": count_diagnostics,
+        "wannier90_pp_log_tail": pp_log,
+        "wout_tail": wout_tail,
+    }
+
+
+def missing_nnkp_message(seed: str, diagnostics: dict[str, Any]) -> str:
+    return (
+        f"wannier90.x -pp did not generate {seed}.nnkp. "
+        f"Primary cause: {diagnostics['primary_cause']}. "
+        "Revise the recipe projection block using the diagnostics in this report."
+    )
 
 
 def eig_by_k(path: Path) -> dict[int, dict[int, float]]:
@@ -1024,10 +1181,18 @@ def main() -> int:
             600,
         )
         if pp.returncode != 0:
+            diagnostics = upstream_pp_diagnostics(compile_dir, seed, recipe, nscf)
             return fail(
                 "wannier90_pp",
-                "wannier90.x -pp failed; revise projection syntax/counts or window syntax",
-                log_tail=log_tail(compile_dir / f"{seed}.compile.pp.log"),
+                missing_nnkp_message(seed, diagnostics),
+                upstream_diagnostics=diagnostics,
+            )
+        if not (compile_dir / f"{seed}.nnkp").is_file():
+            diagnostics = upstream_pp_diagnostics(compile_dir, seed, recipe, nscf)
+            return fail(
+                "wannier90_pp",
+                missing_nnkp_message(seed, diagnostics),
+                upstream_diagnostics=diagnostics,
             )
 
         pw2 = runner.run_command(
@@ -1037,10 +1202,19 @@ def main() -> int:
             3600,
         )
         if pw2.returncode != 0:
+            pw2_tail = log_tail(compile_dir / f"{seed}.compile.pw2wannier90.log")
+            if f"{seed}.nnkp" in pw2_tail and not (compile_dir / f"{seed}.nnkp").is_file():
+                diagnostics = upstream_pp_diagnostics(compile_dir, seed, recipe, nscf)
+                return fail(
+                    "wannier90_pp",
+                    missing_nnkp_message(seed, diagnostics),
+                    upstream_diagnostics=diagnostics,
+                    pw2wannier90_log_tail=pw2_tail,
+                )
             return fail(
                 "pw2wannier90",
                 "pw2wannier90.x failed during compile; revise the recipe",
-                log_tail=log_tail(compile_dir / f"{seed}.compile.pw2wannier90.log"),
+                log_tail=pw2_tail,
             )
 
         windows = window_report(recipe, compile_dir / f"{seed}.eig")
@@ -1118,26 +1292,49 @@ All four window fields must be numeric. Do not leave any window value as null.
 
 `projections` must contain the actual Wannier90 projection lines you choose,
 for example strings in the syntax you would place between `begin projections`
-and `end projections`. The runner will not choose projections or windows for
-you. Use standard Wannier90 projection syntax, such as `Si:l=0;l=1` or
-`Y:l=0;l=1;l=2`. Use coordinate-centered projections only as
-`f=x,y,z:l=...` for fractional coordinates or `c=x,y,z:l=...` for Cartesian
-coordinates. Do not use atom-index projection selectors such as `Si=1:l=...` 
-or `Y=1,2:l=...`; this workflow writes atom labels as repeated species names,
- and Wannier90 will not recognize those selectors here.
- Your projection lines must generate exactly `num_wann` usable
-projections. If they generate fewer or more than `num_wann`, the runner will
-fail. Count projections by angular momentum multiplicity: 
-`l=0` gives 1 function per selected site, `l=1` gives 3, `l=2` gives 5, and `l=3` 
-gives 7. Do not multiply these counts by the number of beta projectors in the 
-UPF unless you use an explicitly supported radial-projector syntax.
+and `end projections`. 
 
-Window values must be in eV, because the runner writes them directly into the 
-Wannier90 `.win` file. If you parse eigenvalues in Hartree, convert them to eV 
-before writing the recipe. `dis_win_min` and `dis_win_max` must contain at 
-least `num_wann` states at every k-point. `dis_froz_max` must not freeze 
-more than `num_wann` states at any k-point; keep it below the minimum energy 
-of band `num_wann + 1` across k-points, with margin.
+Only use projection forms that this workflow is known to handle reliably.
+
+Allowed species-centered forms:
+`Element:l=0`
+`Element:l=0;l=1`
+`Element:l=0;l=1;l=2`
+`Element:l=0;l=1;l=2;l=3`
+
+Allowed coordinate-centered forms:
+`f=x,y,z:l=0`
+`f=x,y,z:l=1`
+`f=x,y,z:l=0;l=1`
+`c=x,y,z:l=0`
+`c=x,y,z:l=1`
+`c=x,y,z:l=0;l=1`
+
+Do not use pseudo-orbital labels, principal-shell labels, radial-projector selectors, or atom-index selectors. Do not write selectors such as `Element=1:l=...`, repeated angular channels on one line, `l=0,mr=...`, `l=0(r=...)`, `r=...`, `mr=...`, or similar syntax.
+
+Projection counts are computed only from accepted lines:
+- `Element:l=L` contributes `number_of_Element_atoms * (2L + 1)`
+- `f=x,y,z:l=L` contributes `2L + 1`
+- `c=x,y,z:l=L` contributes `2L + 1`
+
+If multiple angular channels appear on one accepted line, add their multiplicities. 
+The total projection count must equal `num_wann` exactly. 
+If standard species-centered projections are too few, add coordinate-centered 
+`f=...` or `c=...` projections. Do not try to access extra UPF beta projectors or 
+radial projectors directly.
+
+Window values are absolute energies in eV, not Fermi-relative offsets. Before
+writing the recipe, compute per k-point counts from the QE eigenvalues:
+
+outer_count(k) = # bands with dis_win_min <= E_nk <= dis_win_max
+frozen_count(k) = # bands with dis_froz_min <= E_nk <= dis_froz_max
+
+The recipe is invalid unless min_k outer_count(k) >= num_wann and
+max_k frozen_count(k) <= num_wann. For target bands 1-N, choose dis_win_min
+below min_k E_1k and dis_win_max above max_k E_Nk, with margin. Keep
+dis_froz_max below the minimum energy of band N+1 across all k-points, with
+margin; if bands N and N+1 overlap, freeze fewer bands rather than freezing
+more than num_wann.
 
 Do not run `/app/locked_wannier_runner.py`. Direct agent-side calls are
 rejected. Harbor's verifier will run that deterministic executor after you
@@ -1243,6 +1440,7 @@ def inject_locked_tools_into_dockerfile(dockerfile_text: str) -> str:
 def materialize_controlled_dataset(
     source_dataset: Path,
     tasks: list[tuple[int, str, Path]],
+    success_wave_timeout_sec: int,
 ) -> tuple[Path, list[tuple[int, str, Path]]]:
     timestamp = datetime.now().strftime("%Y-%m-%d__%H-%M-%S")
     target_dataset = (
@@ -1262,7 +1460,7 @@ def materialize_controlled_dataset(
                 raise
             shutil.copy2(src, dst)
 
-    runner_text = generic_locked_runner_script()
+    runner_text = generic_locked_runner_script(success_wave_timeout_sec)
     compile_text = compile_recipe_script()
     compile(runner_text, LOCKED_RUNNER_NAME, "exec")
     compile(compile_text, COMPILE_RECIPE_NAME, "exec")
@@ -1483,6 +1681,7 @@ def main() -> None:
     augmented_dataset, augmented_tasks = materialize_controlled_dataset(
         cli.dataset,
         tasks,
+        cli.success_wave_timeout_sec,
     )
     args = deepseek_harbor_args(cli, augmented_tasks)
     args.dataset = augmented_dataset
