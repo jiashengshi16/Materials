@@ -13,6 +13,7 @@ from collections import Counter
 import json
 from pathlib import Path
 import re
+import shutil
 import shlex
 import sys
 
@@ -71,6 +72,11 @@ LOCKED_RUNNER_APP_PATH = "/app/locked_wannier_runner.py"
 LOCKED_COMMAND_WRAPPER_NAME = "locked_command_wrapper.sh"
 LOCKED_COMMAND_WRAPPER_APP_PATH = "/app/locked_command_wrapper.sh"
 LOCKED_BIN_APP_DIR = "/app/locked_bin"
+LOCKED_RUNNER_VERIFIER_HOOK_MARKER = "# Harbor deterministic locked runner pre-verifier hook"
+DEFAULT_RECIPE_AGENT_TIMEOUT_SEC = 600
+DEFAULT_SUCCESS_WAVE_TIMEOUT_SEC = 4800
+TASK_AGENT_TIMEOUT_SEC = 7200
+TASK_VERIFIER_TIMEOUT_SEC = 900
 LOCKED_DENIED_COMMANDS = [
     "wannier90.x",
     "pw2wannier90.x",
@@ -343,6 +349,8 @@ LOCKED_RECIPE_PATH = WORKFLOW_DIR / "LOCKED_RECIPE.json"
 NEXT_SUMMARY_PATH = WORKFLOW_DIR / "NEXT_RUN_CONTEXT_SUMMARY.json"
 LOG_PATH = WORKFLOW_DIR / "locked_runner.log"
 RUNNER_STATE_PATH = WORKFLOW_DIR / "locked_runner_state.json"
+RUNNER_EXECUTOR_ENV = "HARBOR_LOCKED_RUNNER_EXECUTOR"
+RUNNER_EXECUTOR_VALUE = "harbor_verifier"
 
 
 RECIPE_TABLE: dict[str, dict[str, Any]] = {
@@ -545,8 +553,6 @@ def normalize_recipe(material: str, request: dict[str, Any], table: dict[str, An
         variant = "reference"
     elif mode == "explicit":
         variant = str(request.get("projection_variant") or "reference")
-    elif mode == "scdm":
-        variant = "reference"
     else:
         raise ValueError(f"unsupported projection_mode {mode!r}")
     if mode not in table["allowed_modes"]:
@@ -554,8 +560,10 @@ def normalize_recipe(material: str, request: dict[str, Any], table: dict[str, An
     if variant not in table["projection_variants"]:
         raise ValueError(f"projection_variant {variant!r} is not allowed for {material}")
     projections = list(table["projection_variants"][variant])
-    if mode != "scdm" and not projections:
-        raise ValueError(f"projection_variant {variant!r} has no projections for non-SCDM mode {mode!r}")
+    if not projections:
+        raise ValueError(
+            f"projection_variant {variant!r} has no projections"
+        )
 
     requested_windows = request.get("windows", {})
     if requested_windows is None:
@@ -674,12 +682,9 @@ def write_win(path: Path, recipe: dict[str, Any], nscf: dict[str, Any], *, dis_c
         f"dis_froz_min = {windows['dis_froz_min']:.8f}",
         f"dis_froz_max = {windows['dis_froz_max']:.8f}",
     ]
-    if recipe["projection_mode"] == "scdm":
-        lines.extend(["auto_projections = .true.", "scdm_entanglement = erfc"])
-    else:
-        lines.append("begin projections")
-        lines.extend(f"  {projection}" for projection in recipe["projections"])
-        lines.append("end projections")
+    lines.append("begin projections")
+    lines.extend(f"  {projection}" for projection in recipe["projections"])
+    lines.append("end projections")
     lines.extend(["begin unit_cell_cart", "Ang"])
     lines.extend(f"  {row[0]: .12f} {row[1]: .12f} {row[2]: .12f}" for row in nscf["cell"])
     lines.extend(["end unit_cell_cart", "begin atoms_cart", "Ang"])
@@ -754,20 +759,38 @@ def run_wannier_final(seed: str, run_dir: Path, timeout_sec: int = 7200) -> int:
             text=True,
         )
         start = time.monotonic()
+        last_heartbeat = start
         while True:
             return_code = process.poll()
             if return_code is not None:
                 log(f"EXIT {return_code} wannier90.x {seed}")
                 return return_code
-            if time.monotonic() - start > timeout_sec:
-                process.kill()
-                process.wait()
+            now = time.monotonic()
+            if now - last_heartbeat >= 60:
+                wout_path = run_dir / f"{seed}.wout"
+                if wout_path.is_file():
+                    try:
+                        lines = wout_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                        tail = lines[-1].strip() if lines else ""
+                        size = wout_path.stat().st_size
+                        log(f"STILL_RUNNING wannier90.x {seed} elapsed_sec={int(now - start)} wout_size={size} last_wout_line={tail[:180]!r}")
+                    except OSError as exc:
+                        log(f"STILL_RUNNING wannier90.x {seed} elapsed_sec={int(now - start)} wout_read_error={exc}")
+                else:
+                    log(f"STILL_RUNNING wannier90.x {seed} elapsed_sec={int(now - start)} wout_missing=true")
+                last_heartbeat = now
+            if now - start > timeout_sec:
+                process.terminate()
+                try:
+                    process.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
                 raise TimeoutError(f"wannier90.x {seed} exceeded locked wall timeout")
             time.sleep(30)
 
 
-def write_pw2wan(path: Path, seed: str, mode: str) -> None:
-    extra = "  scdm_proj = .true.\\n" if mode == "scdm" else ""
+def write_pw2wan(path: Path, seed: str) -> None:
     path.write_text(
         "&inputpp\\n"
         "  outdir = './out'\\n"
@@ -776,7 +799,6 @@ def write_pw2wan(path: Path, seed: str, mode: str) -> None:
         "  write_mmn = .true.\\n"
         "  write_amn = .true.\\n"
         "  write_eig = .true.\\n"
-        f"{extra}"
         "/\\n",
         encoding="utf-8",
     )
@@ -946,6 +968,13 @@ def fail(material: str, message: str) -> int:
 
 
 def main() -> int:
+    if os.environ.get(RUNNER_EXECUTOR_ENV) != RUNNER_EXECUTOR_VALUE:
+        print(
+            "LOCKED_WORKFLOW_POLICY_DENIED: locked_wannier_runner.py is deferred "
+            "to Harbor's verifier and may not be run directly by the agent",
+            file=sys.stderr,
+        )
+        return 126
     configure_interrupt_policy()
     WORKFLOW_DIR.mkdir(parents=True, exist_ok=True)
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -989,7 +1018,7 @@ def main() -> int:
 
         pp_ok = False
         variants_to_try = [recipe["projection_variant"]]
-        if recipe["projection_variant"] != "fallback_1" and "fallback_1" in table["projection_variants"] and recipe["projection_mode"] != "scdm":
+        if (recipe["projection_variant"] != "fallback_1" and "fallback_1" in table["projection_variants"]):
             variants_to_try.append("fallback_1")
         for variant in variants_to_try:
             recipe["projection_variant"] = variant
@@ -1010,7 +1039,7 @@ def main() -> int:
             write_runner_state("failed", message="wannier90 -pp failed")
             return 1
 
-        write_pw2wan(run_dir / f"{seed}.pw2wan", seed, recipe["projection_mode"])
+        write_pw2wan(run_dir / f"{seed}.pw2wan", seed, )
         pw2 = run_command(["pw2wannier90.x", "-in", f"{seed}.pw2wan"], run_dir, f"{seed}.pw2wannier90.log", 3600)
         if pw2.returncode != 0:
             notes.append("pw2wannier90.x failed; no arbitrary DFT rerun is allowed")
@@ -1026,13 +1055,31 @@ def main() -> int:
             write_win(run_dir / f"{seed}.win", recipe, nscf)
             run_command(["wannier90.x", "-pp", seed], run_dir, f"{seed}.pp_after_window_repair.log", 600)
 
-        return_code = run_wannier_final(seed, run_dir)
+        try:
+            return_code = run_wannier_final(seed, run_dir)
+        except TimeoutError as exc:
+            notes.append(str(exc))
+            write_locked_recipe(recipe)
+            write_decisions(recipe, notes)
+            collect_artifacts(seed, run_dir, recipe, "failed", notes)
+            log("COMPLETE status=failed")
+            write_runner_state("failed", message=str(exc))
+            return 1
         wout_text = (run_dir / f"{seed}.wout").read_text(encoding="utf-8", errors="replace") if (run_dir / f"{seed}.wout").is_file() else ""
         if return_code != 0 or not (run_dir / f"{seed}_hr.dat").is_file():
             if "disentanglement" in wout_text.lower() and "conver" in wout_text.lower():
                 notes.append("allowed repair: relaxed disentanglement tolerance once after nonconvergence")
                 write_win(run_dir / f"{seed}.win", recipe, nscf, dis_conv_tol="1.0d-4", conv_tol="1.0d-6")
-                run_wannier_final(seed, run_dir)
+                try:
+                    run_wannier_final(seed, run_dir)
+                except TimeoutError as exc:
+                    notes.append(str(exc))
+                    write_locked_recipe(recipe)
+                    write_decisions(recipe, notes)
+                    collect_artifacts(seed, run_dir, recipe, "failed", notes)
+                    log("COMPLETE status=failed")
+                    write_runner_state("failed", message=str(exc))
+                    return 1
         status = "success" if (run_dir / f"{seed}_hr.dat").is_file() and (run_dir / f"{seed}_hr.dat").stat().st_size > 0 else "failed"
         if status != "success":
             notes.append("final Hamiltonian was not produced")
@@ -1077,7 +1124,7 @@ The recipe must be valid JSON. Use only this schema:
   "num_wann": null,
   "num_bands": null,
   "target_dft_band_end": null,
-  "projection_mode": "reference | explicit | scdm",
+  "projection_mode": "reference | explicit",
   "projection_variant": "reference | fallback_1",
   "windows": {{
     "dis_win_min": null,
@@ -1091,20 +1138,18 @@ The recipe must be valid JSON. Use only this schema:
 }}
 ```
 
-Then run exactly:
-
-```bash
-/app/locked_wannier_runner.py
-```
+Do not run `/app/locked_wannier_runner.py`. Direct agent-side calls are rejected.
+Harbor's verifier will run that deterministic executor after you exit, before
+grading. This prevents agent tokens from being spent while Wannier90 is
+computing.
 
 Do not run `wannier90.x`, `pw2wannier90.x`, `pw.x`, `rm`, `kill`, `pkill`, or
 `killall` yourself. Do not edit `.win`, `.pw2wan`, generated Wannier files, or
 files under `material/` yourself. Do not change kmesh, `num_wann`, `num_bands`,
-target bands, projections, windows, or DFT inputs after deterministic preflight.
-Do not send `C-c`, `Ctrl-C`, `SIGINT`, terminal interrupt keys, or EOF/control
-keys to the runner or to a productive `wannier90.x`/`pw2wannier90.x` process
-because it is taking time. Do not rerun `/app/locked_wannier_runner.py`; it is a
-single-shot executor.
+target bands, projections, windows, or DFT inputs after writing the recipe. Do
+not send `C-c`, `Ctrl-C`, `SIGINT`, terminal interrupt keys, or EOF/control
+keys. Do not poll for `report.json`, do not inspect logs, and do not attempt any
+manual rescue path.
 
 The locked runner owns all execution, generated files, deterministic checks,
 and the only allowed repair table:
@@ -1114,10 +1159,25 @@ and the only allowed repair table:
 - relax disentanglement tolerance once after a final Wannier90 nonconvergence;
 - fail with reports instead of improvising any other change.
 
-After `/app/locked_wannier_runner.py` exits, inspect `report.json` and return
-the final JSON status. If the runner fails, report its failure. Do not attempt a
-manual rescue path.
+After writing `workflow/recipe_request.json`, stop. Return only a concise final
+JSON status like:
+
+```json
+{{
+  "status": "recipe_submitted",
+  "task_complete": true,
+  "recipe_path": "workflow/recipe_request.json",
+  "runner": "deferred_to_harbor_verifier"
+}}
+```
 """
+
+
+def upsert_locked_runner_instruction_appendix(instruction_text: str, material: str) -> str:
+    marker = "# Locked DeepSeek Execution Contract"
+    if marker in instruction_text:
+        instruction_text = instruction_text.split(marker, 1)[0].rstrip() + "\n"
+    return instruction_text + locked_runner_instruction_appendix(material)
 
 
 def parse_args() -> argparse.Namespace:
@@ -1168,14 +1228,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--success-wave-timeout-sec",
         type=int,
-        default=4500,
-        help="Wall timeout for each target-success wave. Default: 4500.",
+        default=DEFAULT_SUCCESS_WAVE_TIMEOUT_SEC,
+        help=(
+            "Wall timeout for each target-success wave. Default: "
+            f"{DEFAULT_SUCCESS_WAVE_TIMEOUT_SEC}."
+        ),
     )
     parser.add_argument(
         "--success-wave-kill-after-sec",
         type=int,
         default=30,
         help="Seconds to wait after SIGTERM before SIGKILL. Default: 30.",
+    )
+    parser.add_argument(
+        "--recipe-agent-timeout-sec",
+        type=int,
+        default=DEFAULT_RECIPE_AGENT_TIMEOUT_SEC,
+        help=(
+            "Agent timeout for the recipe-only DeepSeek planning phase. The "
+            "locked runner executes later in the verifier phase. Default: "
+            f"{DEFAULT_RECIPE_AGENT_TIMEOUT_SEC}."
+        ),
     )
     parser.add_argument(
         "--stop-on-error",
@@ -1429,6 +1502,46 @@ def inject_next_run_trace_tools_into_dockerfile(dockerfile_text: str) -> str:
     return dockerfile_text + "\n" + additions
 
 
+def locked_runner_verifier_hook_script() -> str:
+    return f"""{LOCKED_RUNNER_VERIFIER_HOOK_MARKER}
+if [ -x {LOCKED_RUNNER_APP_PATH} ] && [ -f /app/workflow/recipe_request.json ]; then
+    if [ ! -s /app/report.json ]; then
+        echo "HARBOR_LOCKED_RUNNER_PRE_VERIFIER: starting deterministic locked runner" >&2
+        if ! HARBOR_LOCKED_RUNNER_EXECUTOR=harbor_verifier {LOCKED_RUNNER_APP_PATH}; then
+            echo "HARBOR_LOCKED_RUNNER_PRE_VERIFIER: locked runner exited nonzero; grading generated failure artifacts" >&2
+        fi
+    else
+        echo "HARBOR_LOCKED_RUNNER_PRE_VERIFIER: report.json already exists; skipping locked runner" >&2
+    fi
+else
+    echo "HARBOR_LOCKED_RUNNER_PRE_VERIFIER: missing locked runner or recipe_request.json; verifier will grade current artifacts" >&2
+fi
+
+"""
+
+
+def inject_locked_runner_verifier_hook(test_script_text: str) -> str:
+    if LOCKED_RUNNER_VERIFIER_HOOK_MARKER in test_script_text:
+        return test_script_text
+    hook = locked_runner_verifier_hook_script()
+    trap_marker = "trap preserve_artifacts EXIT\n"
+    if trap_marker in test_script_text:
+        return test_script_text.replace(trap_marker, trap_marker + hook, 1)
+    lines = test_script_text.splitlines(keepends=True)
+    if lines and lines[0].startswith("#!"):
+        return lines[0] + hook + "".join(lines[1:])
+    return hook + test_script_text
+
+
+def ensure_local_tests_dir(task_dir: Path) -> None:
+    tests_dir = task_dir / "tests"
+    if not tests_dir.is_symlink():
+        return
+    source_tests_dir = tests_dir.resolve(strict=True)
+    tests_dir.unlink()
+    shutil.copytree(source_tests_dir, tests_dir, symlinks=True)
+
+
 def install_next_run_trace_tools(tasks: list[tuple[int, str, Path]]) -> None:
     for _num_wann, material, task_dir in tasks:
         environment_dir = task_dir / "environment"
@@ -1440,8 +1553,10 @@ def install_next_run_trace_tools(tasks: list[tuple[int, str, Path]]) -> None:
         verifier_path.write_text(next_run_trace_verifier_script(), encoding="utf-8")
         verifier_path.chmod(0o755)
 
+        runner_text = locked_runner_script()
+        compile(runner_text, LOCKED_RUNNER_NAME, "exec")
         runner_path = environment_dir / LOCKED_RUNNER_NAME
-        runner_path.write_text(locked_runner_script(), encoding="utf-8")
+        runner_path.write_text(runner_text, encoding="utf-8")
         runner_path.chmod(0o755)
 
         command_wrapper_path = environment_dir / LOCKED_COMMAND_WRAPPER_NAME
@@ -1457,9 +1572,23 @@ def install_next_run_trace_tools(tasks: list[tuple[int, str, Path]]) -> None:
 
         instruction_path = task_dir / "instruction.md"
         instruction_text = instruction_path.read_text(encoding="utf-8")
-        if "# Locked DeepSeek Execution Contract" not in instruction_text:
-            instruction_text += locked_runner_instruction_appendix(material)
-            instruction_path.write_text(instruction_text, encoding="utf-8")
+        updated_instruction_text = upsert_locked_runner_instruction_appendix(
+            instruction_text,
+            material,
+        )
+        if updated_instruction_text != instruction_text:
+            instruction_path.write_text(updated_instruction_text, encoding="utf-8")
+
+        ensure_local_tests_dir(task_dir)
+        test_script_path = task_dir / "tests" / "test.sh"
+        if not test_script_path.is_file():
+            raise FileNotFoundError(f"expected Harbor verifier script does not exist: {test_script_path}")
+        test_script_text = test_script_path.read_text(encoding="utf-8")
+        test_script_path.write_text(
+            inject_locked_runner_verifier_hook(test_script_text),
+            encoding="utf-8",
+        )
+        test_script_path.chmod(0o755)
 
 
 def deepseek_harbor_args(cli: argparse.Namespace) -> argparse.Namespace:
@@ -1488,7 +1617,9 @@ def deepseek_harbor_args(cli: argparse.Namespace) -> argparse.Namespace:
             f"{self_debug_generator.DEFAULT_TRACE_AGENT_WRAPPER_ENV}="
             f"{trace_wrapper_path}",
             "--agent-timeout-multiplier",
-            "1.1",
+            f"{cli.recipe_agent_timeout_sec / TASK_AGENT_TIMEOUT_SEC:.6g}",
+            "--verifier-timeout-multiplier",
+            f"{cli.success_wave_timeout_sec / TASK_VERIFIER_TIMEOUT_SEC:.6g}",
             "--max-retries",
             "2",
             "--retry-include",
@@ -1553,6 +1684,8 @@ def main() -> None:
         raise SystemExit("--success-wave-timeout-sec must be at least 1")
     if cli.success_wave_kill_after_sec < 0:
         raise SystemExit("--success-wave-kill-after-sec cannot be negative")
+    if cli.recipe_agent_timeout_sec < 1:
+        raise SystemExit("--recipe-agent-timeout-sec must be at least 1")
 
     cli.dataset = cli.dataset.expanduser().resolve()
     cli.jobs_root = cli.jobs_root.expanduser().resolve()
