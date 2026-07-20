@@ -30,18 +30,97 @@ import generate_harbor_num_wann_order_command as harbor_generator
 import generate_harbor_deepseek_self_debug_context_command as controlled
 
 
+# MATERIALS = [
+#     "Al18Co4",
+#     "Al4Sc2",
+#     "Li4O6Si2",
+#     "Si6Y10",
+#     "Mg2O10Ti4",
+# ]
+
+
 MATERIALS = [
-    "Al18Co4",
-    "Al4Sc2",
-    "Li4O6Si2",
-    "Si6Y10",
-    "Mg2O10Ti4",
+    'Al18Co4',
+    'Al4Mn2O8',
+    'Al4O8Zn2',
+    'Al4Sc2',
+    'Al8Zr4',
+    'Au2Sc',
+    'B2Cr',
+    'B2Hf',
+    'Bi4Cl12',
+    'C2Cd2O6',
+    'C2Cu2O6',
+    'C4O12Sr4',
+    'Cl2V',
+    'Cl4Li4O16',
+    'Co4Sc8',
+    'Cr2F4',
+    'Cr6Si2',
+    'H8O16W4',
+    'Hf10Si6',
+    'Hg3O3',
+    'Mg2O10Ti4',
+    'N2Na2O6',
+    'NNb',
+    'Ni4Zr4',
+    'O2Pd2',
+    'Pd4S8',
+    'RuTi',
+    'AgMg',
+    'FNa',
+
+    #Candidate Materials below
+    'Al12Ni4',
+'Al4Y2',
+'Au2Y',
+'Ag2Sc',
+'Ag2Y',
+'B2Mn',
+'B2Ta',
+'B2Ti',
+'O2Sr',
+'Br2V',
+'Cl2Ti',
+'Mg4O12Se4',
+'Li4O6Si2',
+'F4Ni2',
+'Co2F4',
+'Cr6Ga2',
+'Mo6Si2',
+'Al2Mo6',
+'Ga2Mo6',
+'B8H16O16',
+'Hf6Si4',
+'Hf4Si2',
+'Si6Y10',
+'Co2O8W2',
+'CTi',
+'Hf4Ni4',
+'Pt4Y4',
+'O2Pb2',
+'Ru4S8',
+'Co4S8',
+'FeTi',
+'RuZr',
+'RhSc',
+'FLi',
+'BrNa',
+'AgSc',
 ]
 
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 MODEL = "openai/deepseek-v4-pro"
 DEFAULT_JOBS_ROOT = harbor_generator.ROOT / "jobsDeepseekProTerminus2Controlled"
+DEFAULT_COUNT_JOBS_ROOTS = [
+    harbor_generator.ROOT / "jobsDeepseekProTerminus2Controlled",
+    harbor_generator.ROOT / "jobsDeepseekProTerminus2Candidates",
+]
+
 DEFAULT_AUGMENTED_DATASET_PARENT = harbor_generator.ROOT / "harbor_datasets"
+POST_PRUNE_COMMANDS = [
+    ["docker", "tag", "wannier-qe-local:latest", "wannier-qe-gemini-base:0.46.0"],
+]
 
 LOCKED_RUNNER_NAME = controlled.LOCKED_RUNNER_NAME
 LOCKED_RUNNER_APP_PATH = controlled.LOCKED_RUNNER_APP_PATH
@@ -54,7 +133,7 @@ LOCKED_DENIED_COMMANDS = controlled.LOCKED_DENIED_COMMANDS
 LOCKED_RUNNER_VERIFIER_HOOK_MARKER = controlled.LOCKED_RUNNER_VERIFIER_HOOK_MARKER
 
 DEFAULT_RECIPE_AGENT_TIMEOUT_SEC = 1800
-DEFAULT_SUCCESS_WAVE_TIMEOUT_SEC = 5400
+DEFAULT_SUCCESS_WAVE_TIMEOUT_SEC = 7200
 LOCKED_FINAL_TIMEOUT_CLEANUP_BUFFER_SEC = 300
 CONTROLLED_ARTIFACTS = [
     "/app/workflow/recipe_request.json",
@@ -127,47 +206,65 @@ def parse_args() -> argparse.Namespace:
     )
     return parser.parse_args()
 
-
-def existing_run_counts(jobs_root: Path, valid_materials: set[str]) -> Counter[str]:
-    """Count existing completed Harbor runs, regardless of verifier status."""
+def existing_run_counts(
+    jobs_roots: list[Path],
+    valid_materials: set[str],
+) -> Counter[str]:
+    """Count existing completed Harbor runs across multiple jobs roots."""
     counts: Counter[str] = Counter()
+    seen_job_dirs: set[Path] = set()
 
-    if not jobs_root.is_dir():
-        return counts
+    for jobs_root in jobs_roots:
+        jobs_root = jobs_root.expanduser().resolve()
 
-    for job_dir in jobs_root.iterdir():
-        if not job_dir.is_dir():
+        if not jobs_root.is_dir():
             continue
 
-        material: str | None = None
-        for diagnostics_path in job_dir.rglob("diagnostics.json"):
-            if diagnostics_path.parent.name != "verifier":
-                continue
-            if "randprojections" in diagnostics_path.parts:
+        for job_dir in jobs_root.iterdir():
+            if not job_dir.is_dir():
                 continue
 
-            try:
-                data = json.loads(diagnostics_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+            # Prevent accidental double-counting if the same root is listed twice.
+            resolved_job_dir = job_dir.resolve()
+            if resolved_job_dir in seen_job_dirs:
                 continue
+            seen_job_dirs.add(resolved_job_dir)
 
-            if isinstance(data, dict):
-                candidate = data.get("material") or data.get("material_from_folder")
-                if candidate in valid_materials:
-                    material = candidate
-                    break
+            material: str | None = None
 
-        if material is None:
-            for candidate in valid_materials:
-                if (
-                    job_dir.name.endswith(f"__{candidate}")
-                    or f"__{candidate}__" in job_dir.name
-                ):
-                    material = candidate
-                    break
+            for diagnostics_path in job_dir.rglob("diagnostics.json"):
+                if diagnostics_path.parent.name != "verifier":
+                    continue
+                if "randprojections" in diagnostics_path.parts:
+                    continue
 
-        if material is not None:
-            counts[material] += 1
+                try:
+                    data = json.loads(
+                        diagnostics_path.read_text(encoding="utf-8")
+                    )
+                except (OSError, json.JSONDecodeError):
+                    continue
+
+                if isinstance(data, dict):
+                    candidate = (
+                        data.get("material")
+                        or data.get("material_from_folder")
+                    )
+                    if candidate in valid_materials:
+                        material = candidate
+                        break
+
+            if material is None:
+                for candidate in valid_materials:
+                    if (
+                        job_dir.name.endswith(f"__{candidate}")
+                        or f"__{candidate}__" in job_dir.name
+                    ):
+                        material = candidate
+                        break
+
+            if material is not None:
+                counts[material] += 1
 
     return counts
 
@@ -1571,6 +1668,7 @@ def deepseek_harbor_args(
         stop_on_error=cli.stop_on_error,
         docker_prune_after_batch=True,
         docker_prune_after_material=False,
+        post_prune_commands=POST_PRUNE_COMMANDS,
         delete_after_run=True,
         extra_arg=[
             "--agent-timeout-multiplier",
@@ -1655,7 +1753,7 @@ def main() -> None:
     repeats_by_material: dict[str, int] | None = None
     if cli.target_runs is not None:
         counts = existing_run_counts(
-            cli.jobs_root,
+            DEFAULT_COUNT_JOBS_ROOTS,
             valid_materials=requested,
         )
         repeats_by_material = {}
