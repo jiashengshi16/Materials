@@ -206,12 +206,20 @@ def has_attempt_file(attempt: Path, material: str, suffix: str) -> bool:
 def optional_attempt_evidence_files(attempt: Path, material: str) -> list[Path]:
     """Return optional text-like artifacts that can improve forensic reviews."""
     patterns = (
+        f"{material}.amn",
         f"{material}.eig",
+        f"{material}.mmn",
         f"{material}.nnkp",
         f"{material}_hr.dat",
+        f"{material}.pp.log",
         f"{material}.pw2wan",
+        f"{material}.wannier90.log",
+        "*.amn",
+        "*.mmn",
+        "*.pp.log",
         "*.pw2wan",
         "*pw2wan*.log",
+        "*.wannier90.log",
         "*.werr",
         "*.err",
     )
@@ -221,6 +229,33 @@ def optional_attempt_evidence_files(attempt: Path, material: str) -> list[Path]:
             if path.is_file():
                 files[path] = None
     return list(files)
+
+
+def optional_workflow_evidence_files(trial_dir: Path) -> list[tuple[Path, Path]]:
+    """Return workflow-contract and runner artifacts for forensic review staging."""
+    relative_paths = (
+        "artifacts/app/workflow/recipe_request.json",
+        "artifacts/app/workflow/compile_recipe_report.json",
+        "artifacts/app/workflow/locked_runner.log",
+        "artifacts/app/workflow/LOCKED_RECIPE.json",
+        "artifacts/app/workflow/DECISIONS.md",
+        "artifacts/app/workflow/locked_runner_state.json",
+        "artifacts/logs/artifacts/REPORT.md",
+        "artifacts/logs/artifacts/report.json",
+        "artifacts/manifest.json",
+        "config.json",
+        "exception.txt",
+        "result.json",
+        "trial.log",
+        "verifier/test-stdout.txt",
+        "verifier/test-stderr.txt",
+    )
+    files: list[tuple[Path, Path]] = []
+    for relative in relative_paths:
+        src = trial_dir / relative
+        if src.is_file():
+            files.append((src, Path(relative)))
+    return files
 
 
 def display_path(path: Path) -> str:
@@ -532,6 +567,7 @@ the current working directory, with the same paths named above:
 - `case_files/case_metadata.json` if present
 - `case_files/verifier/diagnostics.json` if present
 - `case_files/artifacts/attempt_1/...`
+- `case_files/workflow_contract/...`
 - `case_files/agent/...`
 - `case_files/original_task_instructions.md` if present
 
@@ -625,21 +661,13 @@ using the original task instructions and old run logs. Treat
 `case_files/original_task_instructions.md` as the task prompt that was available 
 to the old model during the original run.
 
-Evaluate the trajectory fairly. If the old run made scientifically reasonable 
-choices that led to  given the information available at the time, say so and do not force a 
+Evaluate the trajectory fairly. If the old run made scientifically reasonable
+choices given the information available at the time, say so and do not force a
 critique. Only identify avoidable mistakes when the task materials, trajectory, 
 logs, or final diagnostics provide evidence that a specific choice was not ideal/poor, 
-contradicted by later run output, or led to an avoidable failure or high RMSE. 
-For any such issue, explain what a scientifically better second try would have 
-changed, using only information that would have been available from the task 
-materials and old run logs. 
-
-Evidence availability varies by case. Do not assume that every listed file exists.
-If all listed files are present, use them all. If one or more files are missing, unreadable,
-empty, or invalid, do not treat that as a task failure and do not invent their contents.
-Continue the forensic review using every available file you can inspect, explicitly note
-which expected evidence was unavailable, and calibrate conclusions to the surviving evidence.
-A missing file by itself is not evidence that the old scientific decision was wrong.
+contradicted by later run output, or led to an avoidable failure or high RMSE.
+For any such issue, explain the evidence-backed diagnosis using only information
+that is present in the staged case files. 
 
 Read these files if present:
 
@@ -647,40 +675,52 @@ Read these files if present:
 - `case_files/verifier/diagnostics.json` if present
 - `case_files/artifacts/attempt_1/{material}.win` if present
 - `case_files/artifacts/attempt_1/{material}.wout` if present
+- `case_files/artifacts/attempt_1/{material}.amn` if present
 - `case_files/artifacts/attempt_1/{material}.eig` if present
+- `case_files/artifacts/attempt_1/{material}.mmn` if present
 - `case_files/artifacts/attempt_1/{material}.nnkp` if present
 - `case_files/artifacts/attempt_1/{material}_hr.dat` if present
+- `case_files/artifacts/attempt_1/{material}.pp.log` if present
+- `case_files/artifacts/attempt_1/{material}.wannier90.log` if present
 - `case_files/artifacts/attempt_1/*.pw2wan`, `*pw2wan*.log`, `*.werr`,
   or `*.err` if present
 - `case_files/artifacts/attempt_1/run_manifest.json` if present
+- `case_files/workflow_contract/artifacts/app/workflow/recipe_request.json` if present
+- `case_files/workflow_contract/artifacts/app/workflow/compile_recipe_report.json` if present
+- `case_files/workflow_contract/artifacts/app/workflow/locked_runner.log` if present
+- `case_files/workflow_contract/artifacts/app/workflow/LOCKED_RECIPE.json` if present
+- `case_files/workflow_contract/artifacts/app/workflow/DECISIONS.md` if present
+- `case_files/workflow_contract/artifacts/app/workflow/locked_runner_state.json` if present
+- `case_files/workflow_contract/artifacts/logs/artifacts/REPORT.md` if present
+- `case_files/workflow_contract/artifacts/logs/artifacts/report.json` if present
+- `case_files/workflow_contract/artifacts/manifest.json` if present
+- `case_files/workflow_contract/config.json` if present
+- `case_files/workflow_contract/exception.txt` if present
+- `case_files/workflow_contract/result.json` if present
+- `case_files/workflow_contract/trial.log` if present
+- `case_files/workflow_contract/verifier/test-stdout.txt` or `test-stderr.txt` if present
 - `case_files/agent/trajectory.json` if present
 - `case_files/agent/gemini-cli.trajectory.jsonl` if present
 - `case_files/agent/gemini-cli.txt` if present
 - `case_files/original_task_instructions.md` if present
 
-Do not read or rely on these aggregate/reference-analysis files (they are outdated):
-
-- `jobs/num_wann_ordered_diagnostics_summary.json`
-- `jobs/gemini_vs_reference_errors.xlsx`
-- `jobs/gemini_failure_modes/failure_modes.csv`
-
 The per-run verifier diagnostics are allowed only as scalar final outcome
 metrics for this specific run. They do not provide the hidden reference recipe
-or the DeepSeek/reference RMSE ratio. Do not recommend "copy the reference",
-SCDM, `use_ws_distance`, or any other reference-only
-setting unless the original task materials made that option available. If a
-reference setting is not available under the original instructions, say so
-explicitly and give a non-reference second-attempt change instead. Any proposed
-“better second try” must still obey 
-case_files/original_task_instructions.md. Do not propose changes that would 
-violate the original task prompt, including fixed num_bands, fixed target-band 
-requirements, required artifact/status rules, forbidden external lookups, or
-any other original instruction constraints.
+or the DeepSeek/reference RMSE ratio. Do not use the verifier diagnostics to
+infer hidden reference settings, reference-only methods, or a DeepSeek/reference
+RMSE ratio. The diagnosis must obey `case_files/original_task_instructions.md`
+when judging what the old model could know or control.
 
 Do not handwave from aggregate statistics. The core diagnosis must
-come from this material's `.win`, `.wout`, `.eig`, `.nnkp`, `_hr.dat`,
-pw2wannier/error logs, run manifest, trajectory, and per-run verifier
-diagnostics, if present.
+come from this material's `.win`, `.wout`, `.amn`, `.eig`, `.mmn`, `.nnkp`,
+`_hr.dat`, preprocessor/pw2wannier/wannier90/error logs, workflow-contract
+files, run manifest, trajectory, and per-run verifier diagnostics, if present.
+
+Use the workflow-contract files to distinguish what the old model could control
+from what the locked runner hard-coded. Do not recommend or criticize the old
+model for failing to set a field unless `recipe_request.json`, the original
+task instructions, or the runner logs show that field was actually available to
+the old model.
 
 Write exactly these two files:
 
@@ -689,10 +729,10 @@ Write exactly these two files:
 
 The Markdown report must be step-by-step and specific. For each substantive
 decision in the old trajectory, judge whether it was good, bad, mixed, or
-uncertain, and explain why using concrete evidence from `.win`, `.wout`,
-manifest notes, trajectory reasoning, and final error metrics. Cite the file
-paths you used, and include line numbers when you have them from grep, rg, nl,
-or similar inspection. Cover at least:
+uncertain, and explain why USING CONCRETE EVIDENCE from `.win`, `.wout`,
+manifest notes, workflow-contract files, trajectory reasoning, and final error
+metrics. Cite the file paths you used, and include line numbers when you have
+them from grep, rg, nl, or similar inspection. Cover at least:
 
 1. projection choice
 2. `num_wann` / target-band handling;
@@ -700,12 +740,17 @@ or similar inspection. Cover at least:
 4. disentanglement outer and frozen windows;
 5. response to Wannier90 warnings or iteration caps;
 6. localization quality from WF spreads and spread components;
-7. whether the old run accepted a result it should have rejected;
+7. whether the old run accepted a result it should have rejected, while
+   explicitly separating old-model responsibility from locked-runner behavior;
 
 If the run shows evidence of avoidable issues, also cover:
 
-8. the most likely specific failure chain;
-9. what should be done differently next time.
+8. the most likely specific failure chain.
+
+Do not produce next-run recommendations, future playbooks, anti-loop rules, or
+operational retry plans in this review unless you are very confident what to do. 
+Your job is mainly diagnosis: what failed, where it failed, why the evidence
+supports that diagnosis, and what remains uncertain.
 
 For every decision review, answer all of these forensic questions:
 
@@ -714,45 +759,13 @@ For every decision review, answer all of these forensic questions:
 - What later evidence in `.wout`, verifier diagnostics, or trajectory contradicts
   or weakens that decision?
 - Was the mistake avoidable without seeing the hidden reference recipe?
-- What CONCRETE second-attempt change should have been tried instead, staying
-  WITHIN the original task instructions? These better choices MUST BE CONCRETE and EXPLICIT. NOTHING VAGUE.
+- Which exact step failed, if any: recipe writing, compile/preflight,
+  `wannier90.x -pp`, `pw2wannier90.x`, final `wannier90.x` disentanglement,
+  final `wannier90.x` localization, artifact collection, verifier scoring, or
+  old-model interpretation?
+- What is the confidence level for any causal claim: `proven`,
+  `strongly_supported`, `plausible_but_unproven`, or `unsupported`?
 - What remains uncertain because the logs do not contain enough information?
-
-
-
-For recommendations, do not only describe the scientific idea. Produce an
-operational next-run playbook that a future model can follow without looping.
-
-The playbook must include:
-- exact next actions, in order;
-- the evidence each action should check;
-- the success condition for each action;
-- what to change if the action fails;
-- what NOT to change while debugging that failure;
-- a maximum retry count;
-- when to stop and report partial/failed instead of continuing.
-
-Every recommendation must be testable. Avoid recommendations like "improve
-projections" or "try better windows" unless you specify the exact validation
-step, e.g. "`wannier90.x -pp <seed>` must produce `.nnkp` and the projection
-count must equal `num_wann`."
-
-Include anti-loop rules. At minimum:
-- If the same command fails twice with the same error, stop retrying it.
-- If `wannier90.x -pp` fails, change only projection syntax/count or `.win`
-  syntax needed for `-pp`; do not change energy windows, `num_bands`, or run
-  `pw2wannier90.x`.
-- If `.nnkp` is produced successfully, do not discard it or restart unrelated
-  unit/cell/k-point experiments unless `pw2wannier90.x` gives a concrete
-  mismatch error.
-- Never recommend `bohr = .true.` for this Wannier90 build.
-- Never recommend long interactive heredocs for workflow scripts.
-- If the shell enters heredoc/input mode, send Ctrl-C once; if still stuck,
-  stop and report partial/failed.
-- Do not recommend random projections if the original task forbids random or
-  arbitrary fallback projections.
-- Do not mark success unless `<seed>_hr.dat` exists and is non-empty.
-
 
 Be especially suspicious of:
 
@@ -765,8 +778,25 @@ Be especially suspicious of:
   projections without evidence that the channels are linearly independent;
 - abandoning a physically motivated projection after a syntax, stale-file, or
   workflow error and falling back to `random`;
-- recommendations that only say "increase iterations" when the logs show a
-  projection, window, validation, or workflow-decision problem.
+- claiming a root cause merely because it is a common failure mode;
+- using a chemically plausible story as proof when the logs only show
+  correlation.
+
+For each diagnosis claim, cite the specific evidence that supports it. If the
+files only show a symptom (for example high RMSE, spread outliers, SVD warning,
+or nonconvergence) but do not identify the root cause, say "symptom observed;
+root cause not proven" rather than inventing one.
+
+Before calling a projection or window decision "bad", do the relevant arithmetic
+from the available files when possible:
+
+- projection count must equal `num_wann`;
+- outer window per-k-point count must be at least `num_wann`;
+- frozen window per-k-point count must be at most `num_wann`;
+- coordinate-center claims must distinguish `f=` fractional coordinates from
+  `c=` Cartesian coordinates;
+- any claim about allowed recipe controls must be checked against staged
+  workflow-contract files.
 
 Be explicit about uncertainty. Do not claim causal proof when the files only
 support diagnostic correlation. But make concrete judgments where evidence is
@@ -796,36 +826,34 @@ The JSON report must have this shape:
       "evidence": ["specific file-backed evidence"],
       "old_claim_or_decision": "what the old run said or did",
       "observed_failure_signal": "what later output showed",
-      "why": "specific explanation",
-      "better_choice": "CONCRETE second-attempt change if the decision was an avoidable issue, otherwise null"
+      "failed_step": "none | recipe_writing | compile_preflight | wannier90_pp | pw2wannier90 | final_disentanglement | final_localization | artifact_collection | verifier_scoring | old_model_interpretation | locked_runner_behavior | unknown",
+      "causal_confidence": "proven | strongly_supported | plausible_but_unproven | unsupported",
+      "why": "specific evidence-backed explanation",
+      "old_model_responsibility": "avoidable | not_avoidable | mixed | unknown",
+      "uncertainty": "what remains uncertain, or null"
     }}
   ],
-  "failure_chain": ["ordered specific causes, or empty if no avoidable failure chain is supported"],
-"recommended_next_run_changes": ["SPECIFIC CHANGES, or empty if the trajectory was reasonable and no supported changes are warranted"],
-"next_run_playbook": [
-  {{
-    "step": "exact action for the future run",
-    "purpose": "why this action is needed",
-    "evidence_to_check": ["files, command output, or metrics to inspect"],
-    "success_condition": "concrete pass condition",
-    "if_fails": "specific next change",
-    "do_not_change_yet": ["parameters or workflow parts that should stay fixed while debugging this step"],
-    "max_retries": 1
-  }}
-],
-"stop_conditions": ["conditions where the future run should stop and report partial/failed"],
-"forbidden_next_run_actions": ["actions the future run should not take"],
-"must_verify_before_success": ["checks required before status=success"],
-"uncertain_recommendations_to_verify": ["recommendations that are plausible but must be verified before use"]
-
+  "failure_chain": [
+    {{
+      "step": "specific failed step",
+      "claim": "specific causal claim",
+      "causal_confidence": "proven | strongly_supported | plausible_but_unproven | unsupported",
+      "evidence": ["specific file-backed evidence"]
+    }}
+  ],
+  "symptoms_observed": ["directly observed symptoms, not inferred causes"],
+  "root_causes_supported": ["root causes with proven or strongly_supported evidence"],
+  "plausible_but_unproven_causes": ["possible causes that should not be treated as facts"],
+  "unsupported_or_overreaching_claims_to_avoid": ["claims not supported by staged files"],
+  "workflow_constraints_relevant_to_diagnosis": ["constraints found in original task or workflow-contract files"],
+  "evidence_gaps": ["missing files or missing diagnostics that limit the diagnosis"]
 }}
 ```
 
-If you cannot provide a safe exact projection/window recipe from the evidence,
-say so explicitly. In that case, recommend the validation procedure rather than
-pretending the recipe is known.
+If you cannot prove the exact root cause from the evidence, say so explicitly.
+Do not fill the gap with a recommended recipe or future playbook.
 
-Your final response should be a concise JSON object pointing to
+Your final response should be a JSON object pointing to
 `self_debug_report.md` and `self_debug_report.json`.
 """
 
@@ -868,6 +896,18 @@ def build_case(case: TrialCase) -> Path:
             }
         )
 
+    staged_workflow_contract_artifacts: list[dict[str, str]] = []
+    for src, relative_dst in optional_workflow_evidence_files(case.trial_dir):
+        dst = case_files / "workflow_contract" / relative_dst
+        if not copy_file_if_present(src, dst):
+            continue
+        staged_workflow_contract_artifacts.append(
+            {
+                "source": display_path(src),
+                "staged": display_path(dst),
+            }
+        )
+
     trajectory_copied = copy_file_if_present(
         case.trial_dir / "agent" / "trajectory.json",
         case_files / "agent" / "trajectory.json",
@@ -904,6 +944,7 @@ def build_case(case: TrialCase) -> Path:
         "run_manifest_copied": manifest_copied,
         "trajectory_copied": trajectory_copied,
         "staged_optional_artifacts": staged_optional_artifacts,
+        "staged_workflow_contract_artifacts": staged_workflow_contract_artifacts,
         "verifier_diagnostics_copied": diagnostics_copied,
         "verifier_diagnostics_source": display_path(diagnostics_src) if diagnostics_copied else None,
         "aggregate_inputs_intentionally_not_copied": [
@@ -947,7 +988,9 @@ def report_is_nonempty(case_dir: Path) -> bool:
         return False
     if not isinstance(data.get("failure_chain"), list):
         return False
-    if not isinstance(data.get("recommended_next_run_changes"), list):
+    if not isinstance(data.get("symptoms_observed"), list):
+        return False
+    if not isinstance(data.get("evidence_gaps"), list):
         return False
 
     return True
