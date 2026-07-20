@@ -34,7 +34,14 @@ MATERIALS = [
 'Al4Sc2',
 'Li4O6Si2',
 'Si6Y10',
-'Mg2O10Ti4'
+'Mg2O10Ti4',
+"Al4Mn2O8",
+"C4O12Sr4",
+'B2Ta',
+'RuTi',
+'Ag2Y',
+'NNb',
+'C2Cu2O6'
 ]
 
 # MATERIALS = [
@@ -113,7 +120,7 @@ HARBOR_REVIEW_IMAGE = os.environ.get(
 MAX_CONCURRENT_DEEPSEEK = 12
 OUTPUT_ROOT = ROOT / "jobsDeepseekProTerminus2InstructionTest" / "deepseek_pro_debug_reviews"
 RUN_ROOTS = [
-    ROOT / "jobsDeepseekProTerminus2InstructionTest",
+    ROOT / "jobsDeepseekProTerminus2Controlled",
 ]
 NUM_WANN_JOB_RE = re.compile(
     r"^num_wann_ordered__(?P<timestamp>.+?)__pid(?P<pid>\d+)__"
