@@ -45,11 +45,10 @@ from compare_wannier_choices import (
     parse_win,
 )
 
-JOBS_ROOT = ROOT / "jobs"
-RERUNS_ROOT = ROOT / "reruns"
-REVIEWS_ROOT = JOBS_ROOT / "gemini_self_debug_self"
-SUMMARY_PATH = JOBS_ROOT / "num_wann_ordered_diagnostics_summary.json"
-ORIGINAL_BEST_CSV = JOBS_ROOT / "successful_run_errors.csv"
+JOBS_ROOT = ROOT / "jobsDeepseekProTerminus2Controlled"
+#RERUNS_ROOT = ROOT / "reruns"
+REVIEWS_ROOT = ROOT / "jobsGeminiReviewsDeepseek/ChemSimReruns"
+REFERENCE_ERROR_CSV = ROOT / "jobs" / "successful_run_errors.csv"
 DATASET_ROOT = ROOT / "harbor_datasets" / "wannier_200"
 OUTPUT_CSV = REVIEWS_ROOT / "projection_mode_comparison.csv"
 OUTPUT_JSON = REVIEWS_ROOT / "projection_mode_comparison_summary.json"
@@ -61,7 +60,7 @@ PROJECTION_SIMILARITY_CMAP = LinearSegmentedColormap.from_list(
     "projection_similarity_orange_to_green",
     ["#D95F02", "#2E8B57"],  # orange -> green
 )
-
+MISSING_RMSE_ERROR_RATIO = 10_000.0
 ERROR_CMAP = LinearSegmentedColormap.from_list(
     "error_pink_to_purple",
     ["#F7B6D2", "#6A00A8"],
@@ -176,74 +175,64 @@ def job_folders_by_material(root: Path) -> dict[str, list[Path]]:
             by_material[material_from_job_folder(path)].append(path)
     return dict(by_material)
 
-
 def load_original_rows() -> list[dict[str, object]]:
-    df = pd.read_csv(ORIGINAL_BEST_CSV)
-    df["num_wann"] = pd.to_numeric(df["num_wann"], errors="coerce")
-    df["gemini_to_reference_ratio"] = pd.to_numeric(df["gemini_to_reference_ratio"], errors="coerce")
-    df["gemini_error_eV"] = pd.to_numeric(df["gemini_error_eV"], errors="coerce")
-    df["reference_error_eV"] = pd.to_numeric(df["reference_error_eV"], errors="coerce")
-    df = df.dropna(subset=["material", "num_wann", "gemini_to_reference_ratio"])
+    reference_df = pd.read_csv(REFERENCE_ERROR_CSV)
+
+    reference_df["num_wann"] = pd.to_numeric(
+        reference_df["num_wann"], errors="coerce"
+    )
+    reference_df["reference_error_eV"] = pd.to_numeric(
+        reference_df["reference_error_eV"], errors="coerce"
+    )
+    reference_df = reference_df.dropna(
+        subset=[
+            "material",
+            "num_wann",
+            "reference_error_eV",
+        ]
+    )
+
     reference_by_key = {
         (str(row["material"]), int(row["num_wann"])): float(row["reference_error_eV"])
-        for _, row in df.dropna(subset=["reference_error_eV"]).iterrows()
+        for _, row in reference_df.iterrows()
     }
-    reference_by_material = load_reference_rmse_by_material()
 
-    rows_by_run_id: dict[str, dict[str, object]] = {}
-    for row in df.to_dict("records"):
-        run_id = str(row.get("run_id") or "")
-        if not run_id:
+    rows: list[dict[str, object]] = []
+    for job_folder in sorted(JOBS_ROOT.iterdir()):
+        if not job_folder.is_dir() or not job_folder.name.startswith("num_wann_ordered__"):
             continue
-        material = str(row["material"])
-        num_wann = int(row["num_wann"])
-        row["material"] = material
-        row["num_wann"] = num_wann
-        row["run_id"] = run_id
-        row["original_source"] = "successful_run_errors.csv"
-        rows_by_run_id[run_id] = row
 
-    for material_dir in sorted(REVIEWS_ROOT.iterdir()):
-        if not material_dir.is_dir() or material_dir.name.startswith("num_wann_ordered__"):
+        material = job_folder.name.rsplit("__", 1)[-1]
+        num_wann = num_wann_from_job_folder(job_folder)
+        if num_wann is None:
             continue
-        for case_dir in sorted(material_dir.iterdir()):
-            if not case_dir.is_dir():
-                continue
-            metadata_path = case_dir / "case_files" / "case_metadata.json"
-            diagnostics_path = case_dir / "case_files" / "verifier" / "diagnostics.json"
-            if not metadata_path.is_file() or not diagnostics_path.is_file():
-                continue
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
-            material = metadata.get("material") or diagnostics.get("material") or material_dir.name
-            num_wann = metadata.get("job_metadata", {}).get("num_wann_from_folder")
-            if num_wann is None:
-                num_wann = metadata.get("manifest_summary", {}).get("num_wann")
-            rmse = finite(diagnostics.get("rmse_eV"))
-            if not isinstance(material, str) or num_wann is None or rmse is None:
-                continue
-            num_wann = int(num_wann)
-            reference_rmse = reference_by_key.get((material, num_wann), reference_by_material.get(material))
-            ratio = rmse / reference_rmse if reference_rmse and reference_rmse > 0 else None
-            if ratio is None:
-                continue
-            run_id = str(metadata.get("source_trial_path") or relative(case_dir))
-            if run_id in rows_by_run_id:
-                continue
-            rows_by_run_id[run_id] = {
+
+        reference_rmse = reference_by_key.get((material, num_wann))
+        if reference_rmse is None or reference_rmse <= 0:
+            continue
+
+        metrics = load_result_metrics(job_folder)
+        rmse = finite(metrics.get("rmse_eV"))
+        ratio = (
+            rmse / reference_rmse
+            if rmse is not None
+            else MISSING_RMSE_ERROR_RATIO
+        )
+
+        rows.append(
+            {
                 "material": material,
-                "run_id": run_id,
+                "run_id": relative(job_folder),
                 "num_wann": num_wann,
-                "reward": diagnostics.get("reward"),
+                "reward": metrics.get("reward"),
                 "gemini_error_eV": rmse,
                 "reference_error_eV": reference_rmse,
                 "gemini_to_reference_ratio": ratio,
-                "original_source": "gemini_self_debug_self review case",
-                "review_case_path": relative(case_dir),
+                "original_source": str(JOBS_ROOT.relative_to(ROOT)),
             }
+        )
 
-    return list(rows_by_run_id.values())
-
+    return rows
 
 def load_original_best_rows() -> dict[tuple[str, int], dict[str, object]]:
     rows = load_original_rows()
@@ -365,20 +354,6 @@ def finite(value: object) -> float | None:
         return result if math.isfinite(result) else None
     return None
 
-
-def load_reference_rmse_by_material() -> dict[str, float]:
-    data = json.loads(SUMMARY_PATH.read_text(encoding="utf-8"))
-    result: dict[str, float] = {}
-    for item in data.get("results", []):
-        if not isinstance(item, dict):
-            continue
-        material = item.get("material") or item.get("material_from_folder")
-        reference_rmse = finite(item.get("reference_offmesh_rmse_eV"))
-        if isinstance(material, str) and reference_rmse is not None:
-            result[material] = reference_rmse
-    return result
-
-
 def load_result_metrics(job_folder: Path) -> dict[str, float]:
     result_path = job_folder / "result.json"
     if not result_path.is_file():
@@ -396,11 +371,20 @@ def load_result_metrics(job_folder: Path) -> dict[str, float]:
     return {}
 
 
-def error_ratio(job_folder: Path, reference_rmse: float | None) -> tuple[float | None, float | None]:
+def error_ratio(
+    job_folder: Path,
+    reference_rmse: float | None,
+) -> tuple[float | None, float | None]:
     metrics = load_result_metrics(job_folder)
     rmse = finite(metrics.get("rmse_eV"))
-    ratio = rmse / reference_rmse if rmse is not None and reference_rmse and reference_rmse > 0 else None
-    return rmse, ratio
+
+    if reference_rmse is None or reference_rmse <= 0:
+        return rmse, None
+
+    if rmse is None:
+        return None, MISSING_RMSE_ERROR_RATIO
+
+    return rmse, rmse / reference_rmse
 
 
 def process_feature_row(wout_path: Path | None, reference_wout: Path) -> dict[str, float | None]:
@@ -491,11 +475,15 @@ def error_ratio_color_values(values: pd.DataFrame) -> np.ndarray:
     log_values = np.log10(numeric.clip(lower=1e-12))
     finite_values = log_values.to_numpy(dtype=float)
     finite_values = finite_values[np.isfinite(finite_values)]
+
+    vmin = float(np.quantile(finite_values, 0.05))
+
     norm = Normalize(
-        vmin=float(np.quantile(finite_values, 0.05)),
-        vmax=float(np.quantile(finite_values, 0.95)),
+        vmin=min(vmin, math.log10(MISSING_RMSE_ERROR_RATIO) - 1e-9),
+        vmax=math.log10(MISSING_RMSE_ERROR_RATIO),
         clip=True,
     )
+
     rgba = np.ones((*numeric.shape, 4))
     for row_index in range(numeric.shape[0]):
         for col_index in range(numeric.shape[1]):
@@ -727,7 +715,7 @@ def main() -> None:
                     {
                         "material": material,
                         "num_wann": str(num_wann),
-                        "reason": "original CSV row has no finite reference_error_eV",
+                        "reason": "original DeepSeek row has no finite reference_error_eV",
                     }
                 )
                 continue
@@ -756,7 +744,7 @@ def main() -> None:
                     {
                         "material": material,
                         "num_wann": str(num_wann),
-                        "reason": "original CSV row has no finite gemini_to_reference_ratio",
+                        "reason": "original DeepSeek row has no finite gemini_to_reference_ratio",
                     }
                 )
                 continue
@@ -889,7 +877,8 @@ def main() -> None:
     summary = {
         "paths": {
             "new_runs_root": str(REVIEWS_ROOT.relative_to(ROOT)),
-            "original_best_csv": str(ORIGINAL_BEST_CSV.relative_to(ROOT)),
+            "original_runs_root": str(JOBS_ROOT.relative_to(ROOT)),
+            "reference_error_csv": str(REFERENCE_ERROR_CSV.relative_to(ROOT)),
             "csv": str(OUTPUT_CSV.relative_to(ROOT)),
             "error_ratio_csv": str(OUTPUT_ERROR_CSV.relative_to(ROOT)),
             "error_ratio_json": str(OUTPUT_ERROR_JSON.relative_to(ROOT)),
@@ -898,11 +887,11 @@ def main() -> None:
             "heatmap_pdf": str(OUTPUT_HEATMAP.with_suffix(".pdf").relative_to(ROOT)),
         },
         "selection": (
-            "Original best is the lowest gemini_to_reference_ratio per material,num_wann "
-            "from successful_run_errors.csv plus copied review cases under "
-            "jobs/gemini_self_debug_self/<material>, deduplicated by source trial path. "
+            "Original best is the lowest rmse_eV/reference_error_eV per material,num_wann "
+            f"from top-level {JOBS_ROOT.relative_to(ROOT)}/num_wann_ordered runs, "
+            f"using reference_error_eV from {REFERENCE_ERROR_CSV.relative_to(ROOT)}. "
             "New best is the lowest rmse_eV/reference_error_eV among top-level "
-            "gemini_self_debug_self/num_wann_ordered runs with "
+            f"{REVIEWS_ROOT.relative_to(ROOT)}/num_wann_ordered runs with "
             "the same material and num_wann."
         ),
         "win_choice_comparison": (
