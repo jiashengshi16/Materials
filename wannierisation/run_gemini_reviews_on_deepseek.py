@@ -7,7 +7,7 @@ No argparse. Edit MATERIALS and GEMINI_BIN below, then run:
 """
 
 from __future__ import annotations
-
+import csv
 import json
 import re
 import shutil
@@ -19,10 +19,10 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 HARBOR_DATASET_ROOT = ROOT / "harbor_datasets" / "wannier_200"
-
+CANDIDATE_RUN_ERROR_TABLE = ROOT / "include_only_candidates.csv"
 # Hardcoded experiment controls.
 # Choose either "chemically similar" or "list".
-MATERIAL_SELECTION_MODE = "list"
+MATERIAL_SELECTION_MODE = "chemically similar"
 
 MATERIALS = [
 
@@ -94,7 +94,7 @@ MATERIALS = [
 MODEL = "gemini-3.5-flash"
 GEMINI_BIN = "gemini"
 MAX_CONCURRENT_GEMINI = 12
-OUTPUT_ROOT = ROOT / "jobsDeepseekProTerminus2InstructionTest" / "gemini_self_debug_reviews"
+OUTPUT_ROOT = ROOT / "jobsGeminiReviewsDeepseek" / "gemini_self_debug_reviews"
 RUN_ROOTS = [
     ROOT / "jobsDeepseekProTerminus2Controlled",
 ]
@@ -647,13 +647,11 @@ If the run shows evidence of avoidable issues, also cover:
 
 8. the most likely specific failure chain.
 
-Do not produce next-run recommendations, future playbooks, anti-loop rules, or
-operational retry plans in this review unless you are very confident what to do. 
-Your job is mainly diagnosis: what failed, where it failed, why the evidence
+Do NOT produce next-run recommendations, future playbooks, anti-loop rules, or
+operational retry plans in this review.
+Your job is diagnosis: what failed, where it failed, why the evidence
 supports that diagnosis, and what remains uncertain.
 
-Because these reports may be fed into future recipe-generation runs, include
-only next-step advice that is valid under the locked Gemini recipe contract.
 Do not recommend changing fields that the old model could not set in
 recipe_request.json. So do not recommend increasing num_iter,
 dis_num_iter, conv_tol, dis_conv_tol, changing runner behavior, rerunning DFT,
@@ -1021,6 +1019,54 @@ def run_case(case: TrialCase) -> Path:
     run_gemini(case_dir)
     return case_dir
 
+def candidate_materials_from_include_only_csv(
+    path: Path,
+) -> dict[str, list[str]]:
+    """Read target_material,candidate_material rows using the downstream contract."""
+    if not path.is_file():
+        raise SystemExit(
+            f"candidate include-only CSV does not exist: {path}"
+        )
+
+    candidates_by_target: dict[str, list[str]] = {}
+
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+
+        if (
+            reader.fieldnames is None
+            or "candidate_material" not in reader.fieldnames
+        ):
+            raise SystemExit(
+                f"{path} must contain a candidate_material column"
+            )
+
+        target_column = (
+            "target_material"
+            if "target_material" in reader.fieldnames
+            else "material"
+            if "material" in reader.fieldnames
+            else None
+        )
+
+        if target_column is None:
+            raise SystemExit(
+                f"{path} must contain target_material or material column"
+            )
+
+        for row in reader:
+            target = (row.get(target_column) or "").strip()
+            candidate = (row.get("candidate_material") or "").strip()
+
+            # Ignore blank/spacer/incomplete rows.
+            if not target or not candidate:
+                continue
+
+            candidates = candidates_by_target.setdefault(target, [])
+            if candidate not in candidates:
+                candidates.append(candidate)
+
+    return candidates_by_target
 
 def selected_materials() -> list[str]:
     mode = MATERIAL_SELECTION_MODE.strip().lower()
@@ -1037,23 +1083,33 @@ def selected_materials() -> list[str]:
         return materials
 
     if mode == "chemically similar":
-        materials: set[str] = set()
-        for run_root in RUN_ROOTS:
-            if not run_root.is_dir():
-                continue
-            for job_dir in run_root.glob("num_wann_ordered*"):
-                if not job_dir.is_dir():
-                    continue
-                material = parse_job_name(job_dir).get("material_from_folder")
-                if isinstance(material, str) and material.strip():
-                    materials.add(material.strip())
+        candidates_by_target = candidate_materials_from_include_only_csv(
+            CANDIDATE_RUN_ERROR_TABLE
+        )
+
+        # Diagnose every unique candidate material exactly once.
+        materials = sorted(
+            {
+                candidate
+                for candidates in candidates_by_target.values()
+                for candidate in candidates
+                if candidate.strip()
+            }
+        )
 
         if not materials:
             raise SystemExit(
-                "No chemically similar candidate materials were found under "
-                + ", ".join(display_path(root) for root in RUN_ROOTS)
+                "No candidate materials were found in "
+                f"{display_path(CANDIDATE_RUN_ERROR_TABLE)}."
             )
-        return sorted(materials)
+
+        print(
+            f"Loaded {len(candidates_by_target)} target material(s) and "
+            f"{len(materials)} unique candidate material(s) from "
+            f"{display_path(CANDIDATE_RUN_ERROR_TABLE)}."
+        )
+
+        return materials
 
     raise SystemExit(
         'MATERIAL_SELECTION_MODE must be either "chemically similar" or "list".'
