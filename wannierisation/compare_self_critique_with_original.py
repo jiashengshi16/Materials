@@ -56,6 +56,7 @@ OUTPUT_ERROR_CSV = REVIEWS_ROOT / "projection_error_ratio_comparison.csv"
 OUTPUT_ERROR_JSON = REVIEWS_ROOT / "projection_error_ratio_comparison.json"
 OUTPUT_ALL_RATIOS_CSV = REVIEWS_ROOT / "all_error_ratios_by_material.csv"
 OUTPUT_HEATMAP = REVIEWS_ROOT / "projection_mode_delta_heatmap"
+OUTPUT_AVERAGE_HEATMAP = REVIEWS_ROOT / "projection_mode_pairwise_average_delta_heatmap"
 PROJECTION_SIMILARITY_CMAP = LinearSegmentedColormap.from_list(
     "projection_similarity_orange_to_green",
     ["#D95F02", "#2E8B57"],  # orange -> green
@@ -492,7 +493,21 @@ def error_ratio_color_values(values: pd.DataFrame) -> np.ndarray:
                 rgba[row_index, col_index] = ERROR_CMAP(norm(float(value)))
     return rgba
 
-def choice_color_values(values: pd.DataFrame) -> np.ndarray:
+def numeric_metric(value: object) -> float | None:
+    if isinstance(value, bool):
+        return float(value)
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def mean_or_none(values: list[float]) -> float | None:
+    return float(np.mean(values)) if values else None
+
+
+def choice_color_values(values: pd.DataFrame, *, all_numeric: bool = False) -> np.ndarray:
     colors = {
         True: "#2E8B57",
         False: "#D95F02",
@@ -501,11 +516,9 @@ def choice_color_values(values: pd.DataFrame) -> np.ndarray:
     for row_index in range(values.shape[0]):
         for col_index in range(values.shape[1]):
             value = values.iat[row_index, col_index]
-            if col_index in {0, 2}:
+            if all_numeric or col_index in {0, 2}:
                 numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iat[0]
                 if pd.notna(numeric):
-                    # projection similarity is in [0, 1]:
-                    # 0 = orange (dissimilar), 1 = green (similar)
                     rgba[row_index, col_index] = PROJECTION_SIMILARITY_CMAP(
                         float(np.clip(numeric, 0.0, 1.0))
                     )
@@ -517,8 +530,9 @@ def choice_color_values(values: pd.DataFrame) -> np.ndarray:
                 rgba[row_index, col_index] = to_rgba(MISSING_COLOR)
     return rgba
 
-def choice_label(value: object, col_index: int) -> str:
-    if col_index in {0, 2}:
+
+def choice_label(value: object, col_index: int, *, all_numeric: bool = False) -> str:
+    if all_numeric or col_index in {0, 2}:
         numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iat[0]
         return f"{float(numeric):.2f}" if pd.notna(numeric) else ""
     if value is True:
@@ -528,36 +542,146 @@ def choice_label(value: object, col_index: int) -> str:
     return ""
 
 
-def make_delta_heatmap(rows: list[dict[str, object]]) -> None:
+def build_pairwise_average_row(
+    material: str,
+    num_wann: int,
+    original_rows: list[dict[str, object]],
+    new_folders: list[Path],
+    reference_rmse: float,
+    averages: dict[str, float | None],
+) -> dict[str, object] | None:
+    reference_wout = DATASET_ROOT / material / "tests/reference/wannier/output/wannier90/aiida.wout"
+
+    original_runs: list[dict[str, object]] = []
+    for original_row in original_rows:
+        original_ratio = finite(original_row.get("gemini_to_reference_ratio"))
+        if original_ratio is None:
+            continue
+        original_folder = job_folder_from_run_id(original_row.get("run_id"))
+        original_wout = find_submitted_wout(original_folder, material) if original_folder else None
+        original_runs.append(
+            {
+                "ratio": original_ratio,
+                "win": find_submitted_win(original_folder, material) if original_folder else None,
+                "features": process_feature_row(original_wout, reference_wout),
+            }
+        )
+
+    new_runs: list[dict[str, object]] = []
+    for new_folder in new_folders:
+        _new_rmse, new_ratio = error_ratio(new_folder, reference_rmse)
+        if new_ratio is None:
+            continue
+        new_wout = find_submitted_wout(new_folder, material)
+        new_runs.append(
+            {
+                "ratio": new_ratio,
+                "win": find_submitted_win(new_folder, material),
+                "features": process_feature_row(new_wout, reference_wout),
+            }
+        )
+
+    if not original_runs or not new_runs:
+        return None
+
+    choice_values: dict[str, list[float]] = {
+        "projection_similarity": [],
+        "window_strict_equal": [],
+        "window_similarity": [],
+    }
+    delta_values: dict[str, list[float]] = {
+        f"delta_{feature}": [] for feature in PROCESS_FEATURES
+    }
+    interpolation_badness_values: list[float] = []
+
+    for original_run in original_runs:
+        original_ratio = float(original_run["ratio"])
+        original_features = original_run["features"]
+
+        for new_run in new_runs:
+            new_ratio = float(new_run["ratio"])
+            new_features = new_run["features"]
+
+            comparison = compare_win_choices_for_pair(
+                original_run["win"],
+                new_run["win"],
+                material,
+            )
+            for key in choice_values:
+                value = numeric_metric(comparison.get(key))
+                if value is not None:
+                    choice_values[key].append(value)
+
+            for feature in PROCESS_FEATURES:
+                original_value = oriented_feature_value(feature, original_features.get(feature))
+                new_value = oriented_feature_value(feature, new_features.get(feature))
+                if original_value is not None and new_value is not None:
+                    delta_values[f"delta_{feature}"].append(new_value - original_value)
+
+            if original_ratio > 0 and new_ratio > 0:
+                interpolation_badness_values.append(
+                    math.log10(new_ratio) - math.log10(original_ratio)
+                )
+
+    row: dict[str, object] = {
+        "material": material,
+        "num_wann": num_wann,
+        "avg_original_run_error_ratio": averages.get("avg_original_run_error_ratio"),
+        "avg_new_run_error_ratio": averages.get("avg_new_run_error_ratio"),
+        "projection_similarity": mean_or_none(choice_values["projection_similarity"]),
+        "window_strict_equal": mean_or_none(choice_values["window_strict_equal"]),
+        "window_similarity": mean_or_none(choice_values["window_similarity"]),
+        "delta_log_error_ratio": mean_or_none(interpolation_badness_values),
+        "pairwise_comparison_count": len(original_runs) * len(new_runs),
+        "original_run_count": len(original_runs),
+        "new_run_count": len(new_runs),
+    }
+    for key, values in delta_values.items():
+        row[key] = mean_or_none(values)
+    return row
+
+
+def make_delta_heatmap(
+    rows: list[dict[str, object]],
+    *,
+    output_path: Path,
+    average_mode: bool,
+) -> None:
     if not rows:
         return
 
     df = pd.DataFrame(rows)
     feature_columns = [f"delta_{feature}" for feature in PROCESS_FEATURES]
     labels = {f"delta_{key}": label for key, label in PROCESS_FEATURES.items()}
-    df["delta_log_error_ratio"] = np.log10(pd.to_numeric(df["new_error_ratio"], errors="coerce")) - np.log10(
-        pd.to_numeric(df["original_error_ratio"], errors="coerce")
-    )
+
+    if "delta_log_error_ratio" not in df.columns:
+        df["delta_log_error_ratio"] = (
+            np.log10(pd.to_numeric(df["new_error_ratio"], errors="coerce"))
+            - np.log10(pd.to_numeric(df["original_error_ratio"], errors="coerce"))
+        )
+
     feature_columns.append("delta_log_error_ratio")
     labels["delta_log_error_ratio"] = "interpolation error badness"
 
     df = df.sort_values(["delta_log_error_ratio", "material"], na_position="last").reset_index(drop=True)
     heatmap_df = df[feature_columns].apply(pd.to_numeric, errors="coerce").rename(columns=labels)
-    ratio_df = df[
-        [
-            "original_error_ratio",
-            "new_error_ratio",
+
+    if average_mode:
+        ratio_source_columns = [
             "avg_original_run_error_ratio",
             "avg_new_run_error_ratio",
         ]
-    ].rename(
-        columns={
-            "original_error_ratio": ERROR_RATIO_COLUMNS[0],
-            "new_error_ratio": ERROR_RATIO_COLUMNS[1],
-            "avg_original_run_error_ratio": ERROR_RATIO_COLUMNS[2],
-            "avg_new_run_error_ratio": ERROR_RATIO_COLUMNS[3],
-        }
-    )
+        ratio_display_columns = ERROR_RATIO_COLUMNS[2:]
+    else:
+        ratio_source_columns = [
+            "original_error_ratio",
+            "new_error_ratio",
+        ]
+        ratio_display_columns = ERROR_RATIO_COLUMNS[:2]
+
+    ratio_df = df[ratio_source_columns].copy()
+    ratio_df.columns = ratio_display_columns
+
     choice_df = df[["projection_similarity", "window_strict_equal", "window_similarity"]].rename(
         columns={
             "projection_similarity": CHOICE_COLUMNS[0],
@@ -580,11 +704,11 @@ def make_delta_heatmap(rows: list[dict[str, object]]) -> None:
         }
     )
     height = max(8.5, 0.25 * len(df) + 2.0)
-    fig = plt.figure(figsize=(17.0, height))
+    fig = plt.figure(figsize=(16.0, height))
     gs = fig.add_gridspec(
         1,
         4,
-        width_ratios=[1.9, 1.45, 7.0, 0.35],
+        width_ratios=[1.25, 1.45, 7.0, 0.35],
         left=0.08,
         right=0.92,
         top=0.90,
@@ -606,7 +730,7 @@ def make_delta_heatmap(rows: list[dict[str, object]]) -> None:
     )
 
     choice_ax.imshow(
-        choice_color_values(choice_df),
+        choice_color_values(choice_df, all_numeric=average_mode),
         aspect="auto",
         interpolation="nearest",
         extent=(0, len(choice_df.columns), nrows, 0),
@@ -617,7 +741,7 @@ def make_delta_heatmap(rows: list[dict[str, object]]) -> None:
             choice_ax.text(
                 col_index + 0.5,
                 row_index + 0.5,
-                choice_label(value, col_index),
+                choice_label(value, col_index, all_numeric=average_mode),
                 ha="center",
                 va="center",
                 fontsize=6,
@@ -646,7 +770,7 @@ def make_delta_heatmap(rows: list[dict[str, object]]) -> None:
         ha="right",
     )
 
-    for ax, columns in ((ratio_ax, ERROR_RATIO_COLUMNS), (choice_ax, CHOICE_COLUMNS)):
+    for ax, columns in ((ratio_ax, ratio_display_columns), (choice_ax, CHOICE_COLUMNS)):
         ax.set_xticks(np.arange(len(columns)) + 0.5)
         ax.set_xticklabels(columns, rotation=35, ha="right")
         ax.set_yticks(np.arange(len(df)) + 0.5)
@@ -654,40 +778,50 @@ def make_delta_heatmap(rows: list[dict[str, object]]) -> None:
         for spine in ax.spines.values():
             spine.set_visible(False)
 
-    # Separate the two BEST-run columns from the two average columns.
-    ratio_ax.axvline(2, color="black", linewidth=2.5)
-
     ratio_ax.set_yticklabels(df["material"].tolist(), fontsize=7)
     choice_ax.tick_params(labelleft=False)
     heatmap_ax.set_yticks(np.arange(len(df)) + 0.5)
     heatmap_ax.tick_params(axis="y", labelleft=False, labelright=True, right=False, length=0)
     heatmap_ax.set_yticklabels(df["material"].tolist(), rotation=0, fontsize=7)
-    heatmap_ax.set_xlabel("Process diagnostic delta, new best vs original best")
     heatmap_ax.set_ylabel("Material")
     heatmap_ax.set_xticklabels(heatmap_ax.get_xticklabels(), rotation=35, ha="right")
     ratio_ax.set_ylabel("Material")
 
+    if average_mode:
+        heatmap_ax.set_xlabel("Mean process diagnostic delta across every original × new run pair")
+        title = "All-pairs average deltas: every original run against every new run"
+        choice_legend_label = "Higher average similarity / equality"
+    else:
+        heatmap_ax.set_xlabel("Process diagnostic delta, new best vs original best")
+        title = "New self-debug best deltas against original best runs"
+        choice_legend_label = "Higher choice similarity"
+
     legend = [
-        Patch(facecolor="#2E8B57", label="Window equal"),
-        Patch(facecolor="#D95F02", label="Window different"),
-        Patch(facecolor=DELTA_CMAP(1.0), label="Higher projection similarity"),
-        Patch(facecolor=MISSING_COLOR, label="Missing .win choice"),
+        Patch(facecolor=PROJECTION_SIMILARITY_CMAP(1.0), label=choice_legend_label),
+        Patch(facecolor=PROJECTION_SIMILARITY_CMAP(0.0), label="Lower choice similarity"),
+        Patch(facecolor=MISSING_COLOR, label="Missing comparison"),
         Patch(facecolor=ERROR_CMAP(0.15), label="Lower error ratio"),
         Patch(facecolor=ERROR_CMAP(0.95), label="Higher error ratio"),
     ]
-    fig.legend(handles=legend, loc="upper center", ncol=6, frameon=False, bbox_to_anchor=(0.52, 0.985))
-    fig.suptitle("New self-debug best deltas against original best runs", y=0.995)
-    fig.savefig(OUTPUT_HEATMAP.with_suffix(".png"), dpi=220, bbox_inches="tight")
-    fig.savefig(OUTPUT_HEATMAP.with_suffix(".pdf"), bbox_inches="tight")
+    fig.legend(handles=legend, loc="upper center", ncol=5, frameon=False, bbox_to_anchor=(0.52, 0.985))
+    fig.suptitle(title, y=0.995)
+    fig.savefig(output_path.with_suffix(".png"), dpi=220, bbox_inches="tight")
+    fig.savefig(output_path.with_suffix(".pdf"), bbox_inches="tight")
     plt.close(fig)
 
 
 def main() -> None:
     original_best_by_key = load_original_best_rows()
+    original_rows_by_key: dict[tuple[str, int], list[dict[str, object]]] = defaultdict(list)
+    for original_run_row in load_original_rows():
+        original_rows_by_key[(str(original_run_row["material"]), int(original_run_row["num_wann"]))].append(
+            original_run_row
+        )
     new_by_material = job_folders_by_material(REVIEWS_ROOT)
     all_ratio_row_count, average_error_ratios_by_key = write_all_error_ratios_csv(new_by_material)
 
     rows: list[dict[str, object]] = []
+    average_rows: list[dict[str, object]] = []
     skipped: list[dict[str, str]] = []
 
     for material, new_folders in sorted(new_by_material.items()):
@@ -719,6 +853,18 @@ def main() -> None:
                     }
                 )
                 continue
+
+            averages = average_error_ratios_by_key.get((material, num_wann), {})
+            average_row = build_pairwise_average_row(
+                material,
+                num_wann,
+                original_rows_by_key.get((material, num_wann), []),
+                candidate_folders,
+                reference_rmse,
+                averages,
+            )
+            if average_row is not None:
+                average_rows.append(average_row)
 
             new_candidates: list[tuple[float, float | None, Path]] = []
             for folder in candidate_folders:
@@ -774,8 +920,6 @@ def main() -> None:
                     if new_value is not None and original_value is not None
                     else None
                 )
-
-            averages = average_error_ratios_by_key.get((material, num_wann), {})
 
             row: dict[str, object] = {
                 "material": material,
@@ -872,7 +1016,8 @@ def main() -> None:
         + "\n",
         encoding="utf-8",
     )
-    make_delta_heatmap(rows)
+    make_delta_heatmap(rows, output_path=OUTPUT_HEATMAP, average_mode=False)
+    make_delta_heatmap(average_rows, output_path=OUTPUT_AVERAGE_HEATMAP, average_mode=True)
 
     summary = {
         "paths": {
@@ -885,6 +1030,8 @@ def main() -> None:
             "all_error_ratios_csv": str(OUTPUT_ALL_RATIOS_CSV.relative_to(ROOT)),
             "heatmap_png": str(OUTPUT_HEATMAP.with_suffix(".png").relative_to(ROOT)),
             "heatmap_pdf": str(OUTPUT_HEATMAP.with_suffix(".pdf").relative_to(ROOT)),
+            "average_heatmap_png": str(OUTPUT_AVERAGE_HEATMAP.with_suffix(".png").relative_to(ROOT)),
+            "average_heatmap_pdf": str(OUTPUT_AVERAGE_HEATMAP.with_suffix(".pdf").relative_to(ROOT)),
         },
         "selection": (
             "Original best is the lowest rmse_eV/reference_error_eV per material,num_wann "
@@ -899,7 +1046,13 @@ def main() -> None:
             "window_strict_equal checks exact window parameter equality. window_similarity is the combined "
             "0-1 Jaccard similarity of actual outer and frozen window band masks computed from paired .eig files."
         ),
+        "pairwise_average": (
+            "Average heatmap metrics are means over every original-run × new-run pair for each "
+            "material,num_wann. Similarity/equality metrics, process deltas, and log10 interpolation "
+            "error badness are averaged over the valid pairwise values for that metric."
+        ),
         "compared_materials": len(rows),
+        "pairwise_average_materials": len(average_rows),
         "all_error_ratios_rows": all_ratio_row_count,
         "skipped_materials": skipped,
     }
@@ -914,6 +1067,8 @@ def main() -> None:
     print(f"Wrote {OUTPUT_JSON.relative_to(ROOT)}")
     print(f"Wrote {OUTPUT_HEATMAP.with_suffix('.png').relative_to(ROOT)}")
     print(f"Wrote {OUTPUT_HEATMAP.with_suffix('.pdf').relative_to(ROOT)}")
+    print(f"Wrote {OUTPUT_AVERAGE_HEATMAP.with_suffix('.png').relative_to(ROOT)}")
+    print(f"Wrote {OUTPUT_AVERAGE_HEATMAP.with_suffix('.pdf').relative_to(ROOT)}")
 
 
 if __name__ == "__main__":
