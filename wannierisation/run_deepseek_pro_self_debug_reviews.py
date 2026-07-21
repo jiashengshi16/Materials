@@ -752,6 +752,18 @@ operational retry plans in this review unless you are very confident what to do.
 Your job is mainly diagnosis: what failed, where it failed, why the evidence
 supports that diagnosis, and what remains uncertain.
 
+Because these reports may be fed into future recipe-generation runs, include
+only next-step advice that is valid under the locked DeepSeek recipe contract.
+Do not recommend changing fields that the old model could not set in
+recipe_request.json. So do not recommend increasing num_iter,
+dis_num_iter, conv_tol, dis_conv_tol, changing runner behavior, rerunning DFT,
+or inspecting final .wout during the old model phase unless the original task
+instructions explicitly allowed that action.
+
+If a potentially useful action is outside the recipe_request.json schema, label
+it as "outside_locked_recipe_contract" and do not present it as actionable advice
+for the next recipe proposer.
+
 For every decision review, answer all of these forensic questions:
 
 - What exactly did the old run decide or claim?
@@ -766,6 +778,24 @@ For every decision review, answer all of these forensic questions:
 - What is the confidence level for any causal claim: `proven`,
   `strongly_supported`, `plausible_but_unproven`, or `unsupported`?
 - What remains uncertain because the logs do not contain enough information?
+
+IMPORTANT: This report will be reused as context for chemically similar future
+runs. Therefore, prioritize advice safety over sounding decisive.
+
+Classify every finding into one of these categories:
+- CONTRACT FACT: directly follows from original_task_instructions.md,
+  recipe_request.json schema, compile_recipe_report.json, locked_runner.log,
+  or runner behavior.
+- DIRECT OBSERVATION: directly observed in .win, .wout, .eig, .nnkp,
+  diagnostics.json, trajectory.json, or logs.
+- PLAUSIBLE INTERPRETATION: chemically or numerically plausible, but not proven
+  by a controlled comparison.
+- DO NOT GENERALIZE: a tempting explanation or next step that future runs should
+  not treat as reliable.
+
+Never present a PLAUSIBLE INTERPRETATION as a root cause. If a future run could
+be harmed by treating it as a fact, put it in plausible_but_unproven_causes or
+unsupported_or_overreaching_claims_to_avoid, not root_causes_supported.
 
 Be especially suspicious of:
 
