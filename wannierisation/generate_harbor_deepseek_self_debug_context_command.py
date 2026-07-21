@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Print Harbor commands for DeepSeek runs with prior self-debug context.
 
-By default this uses every material with report pairs under
-jobsDeepseekProTerminus2/deepseek_pro_debug_reviews. To restrict the run, edit
-MATERIALS or pass one or more --material values.
+The self-debug / next-run context input surface is preserved, while recipe
+compilation, locked execution, timeout budgeting, and verifier-side execution
+follow the same controlled path as generate_harbor_deepseek.py.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import re
 import shutil
 import shlex
 import sys
+import tomllib
 
 import generate_harbor_num_wann_order_command as harbor_generator
 import generate_harbor_self_debug_context_command as self_debug_generator
@@ -28,55 +29,59 @@ MODEL = "openai/deepseek-v4-pro"
 # - "chemically similar": existing workflow; candidate-material self-debug reports
 #   from include_only_candidates.csv are copied as context.
 # - "codex_self_review": only Codex next-run recommendations are copied as context.
-WORKFLOW = "codex_self_review"
+WORKFLOW = "chemically similar"
 SUPPORTED_WORKFLOWS = {"chemically similar", "codex_self_review"}
 
 DEEPSEEK_SELF_DEBUG_REVIEWS_ROOT = (
     self_debug_generator.ROOT
-    / "jobsDeepseekProTerminus2"
-    / "deepseek_pro_debug_reviews"
+    / "jobsGeminiReviewsDeepseek"
+    / "gemini_self_debug_reviews"
 )
 DEFAULT_CODEX_NEXT_RUN_DIAGNOSES = (
     self_debug_generator.ROOT
-    / "jobsDeepseekProTerminus2InstructionTest"
+    / "jobsGeminiReviewsDeepseek"
     / "codex_next_run_diagnoses.md"
 )
 DEFAULT_CANDIDATE_RUN_ERROR_TABLE = (
     self_debug_generator.ROOT
-    / "jobsDeepseekProTerminus2Candidates"
     / "include_only_candidates.csv"
 )
 DEFAULT_JOBS_ROOT = (
-    self_debug_generator.ROOT / "jobsDeepseekProTerminus2ControlledSelfDebugContext"
+    self_debug_generator.ROOT / "jobsGeminiReviewsDeepseek" / "jobsDeepseekProTerminus2ControlledSelfDebugContext"
     if WORKFLOW == "codex_self_review"
-    else self_debug_generator.ROOT / "jobsDeepseekProTerminus2SelfDebugContext"
+    else self_debug_generator.ROOT / "jobsGeminiReviewsDeepseek"/ "ChemSimReruns"
 )
 DEFAULT_SELF_DEBUG_REVIEWS_ROOT = (
     DEEPSEEK_SELF_DEBUG_REVIEWS_ROOT
 )
 
 # Leave empty to use all materials that have DeepSeek self-debug reports.
-MATERIALS: list[str] = [
-    "Al4Sc2",
-    "Al18Co4",
-    "Li4O6Si2",
-    "Mg2O10Ti4",
-    "Si6Y10",
-]
+# MATERIALS: list[str] = [
+#     "Al4Sc2",
+#     "Al18Co4",
+#     "Li4O6Si2",
+#     "Mg2O10Ti4",
+#     "Si6Y10",
+# ]
 
 NEXT_RUN_TRACE_WRAPPER_NAME = "trace_next_run_file_access.sh"
 NEXT_RUN_TRACE_VERIFIER_NAME = "verify_next_run_context_access.py"
 NEXT_RUN_TRACE_WRAPPER_APP_PATH = "/app/trace_next_run_file_access.sh"
 LOCKED_RUNNER_NAME = "locked_wannier_runner.py"
 LOCKED_RUNNER_APP_PATH = "/app/locked_wannier_runner.py"
+COMPILE_RECIPE_NAME = "compile_recipe.py"
+COMPILE_RECIPE_APP_PATH = f"/app/{COMPILE_RECIPE_NAME}"
 LOCKED_COMMAND_WRAPPER_NAME = "locked_command_wrapper.sh"
 LOCKED_COMMAND_WRAPPER_APP_PATH = "/app/locked_command_wrapper.sh"
 LOCKED_BIN_APP_DIR = "/app/locked_bin"
 LOCKED_RUNNER_VERIFIER_HOOK_MARKER = "# Harbor deterministic locked runner pre-verifier hook"
-DEFAULT_RECIPE_AGENT_TIMEOUT_SEC = 600
-DEFAULT_SUCCESS_WAVE_TIMEOUT_SEC = 4800
-TASK_AGENT_TIMEOUT_SEC = 7200
-TASK_VERIFIER_TIMEOUT_SEC = 900
+
+DEFAULT_RECIPE_AGENT_TIMEOUT_SEC = 1800
+DEFAULT_SUCCESS_WAVE_TIMEOUT_SEC = 7200
+LOCKED_FINAL_TIMEOUT_CLEANUP_BUFFER_SEC = 300
+POST_PRUNE_COMMANDS = [
+    ["docker", "tag", "wannier-qe-local:latest", "wannier-qe-gemini-base:0.46.0"],
+]
 LOCKED_DENIED_COMMANDS = [
     "wannier90.x",
     "pw2wannier90.x",
@@ -86,12 +91,17 @@ LOCKED_DENIED_COMMANDS = [
     "pkill",
     "killall",
 ]
+CONTROLLED_ARTIFACTS = [
+    "/app/workflow/recipe_request.json",
+    "/app/workflow/compile_recipe_report.json",
+    "/app/workflow/LOCKED_RECIPE.json",
+    "/app/workflow/DECISIONS.md",
+    "/app/workflow/locked_runner.log",
+    "/app/workflow/locked_runner_state.json",
+]
 NEXT_RUN_TRACE_ARTIFACTS = [
     "/app/workflow/next_run_file_trace.log",
     "/app/workflow/NEXT_RUN_CONTEXT_SUMMARY.json",
-    "/app/workflow/recipe_request.json",
-    "/app/workflow/LOCKED_RECIPE.json",
-    "/app/workflow/locked_runner.log",
 ]
 
 
@@ -323,8 +333,12 @@ exit 126
 """
 
 
-def locked_runner_script() -> str:
-    return """#!/usr/bin/env python3
+def locked_final_timeout_sec(success_wave_timeout_sec: int) -> int:
+    return max(1, success_wave_timeout_sec - LOCKED_FINAL_TIMEOUT_CLEANUP_BUFFER_SEC)
+
+def generic_locked_runner_script(success_wave_timeout_sec: int) -> str:
+    final_timeout_sec = locked_final_timeout_sec(success_wave_timeout_sec)
+    script = r"""#!/usr/bin/env python3
 from __future__ import annotations
 
 import json
@@ -344,92 +358,44 @@ APP = Path("/app")
 MATERIAL_DIR = APP / "material"
 WORKFLOW_DIR = APP / "workflow"
 ARTIFACTS_DIR = APP / "artifacts"
+INSTRUCTION_PATH = APP / "instruction.md"
 RECIPE_REQUEST_PATH = WORKFLOW_DIR / "recipe_request.json"
 LOCKED_RECIPE_PATH = WORKFLOW_DIR / "LOCKED_RECIPE.json"
-NEXT_SUMMARY_PATH = WORKFLOW_DIR / "NEXT_RUN_CONTEXT_SUMMARY.json"
 LOG_PATH = WORKFLOW_DIR / "locked_runner.log"
 RUNNER_STATE_PATH = WORKFLOW_DIR / "locked_runner_state.json"
 RUNNER_EXECUTOR_ENV = "HARBOR_LOCKED_RUNNER_EXECUTOR"
 RUNNER_EXECUTOR_VALUE = "harbor_verifier"
 
 
-RECIPE_TABLE: dict[str, dict[str, Any]] = {
-    "Al4Sc2": {
-        "num_wann": 36,
-        "num_bands": 51,
-        "target_end": 36,
-        "default_windows": [-50.0, 30.0, -50.0, 17.25],
-        "window_bounds": {"dis_win_min": [-60.0, -35.0], "dis_win_max": [20.0, 40.0], "dis_froz_min": [-60.0, -35.0], "dis_froz_max": [15.0, 18.0]},
-        "projection_variants": {
-            "reference": ["Al:l=0;l=2", "Sc:l=0;l=2"],
-            "fallback_1": ["Al:s;p", "Sc:s;p;d", "Sc:s:r=2"],
-        },
-        "allowed_modes": ["reference", "explicit"],
-    },
-    "Li4O6Si2": {
-        "num_wann": 52,
-        "num_bands": 84,
-        "target_end": 52,
-        "default_windows": [-42.0, 38.0, -40.0, 20.2],
-        "window_bounds": {"dis_win_min": [-50.0, -30.0], "dis_win_max": [30.0, 45.0], "dis_froz_min": [-50.0, -30.0], "dis_froz_max": [18.0, 21.0]},
-        "projection_variants": {
-            "reference": ["Li:s;p", "Li:s", "O:s;p", "Si:s;p"],
-            "fallback_1": ["Li:s;p", "O:s;p", "Si:s;p"],
-        },
-        "allowed_modes": ["reference", "explicit"],
-    },
-    "Mg2O10Ti4": {
-        "num_wann": 88,
-        "num_bands": 168,
-        "target_end": 88,
-        "default_windows": [-52.0, 45.0, -52.0, 19.5],
-        "window_bounds": {"dis_win_min": [-60.0, -40.0], "dis_win_max": [35.0, 55.0], "dis_froz_min": [-60.0, -40.0], "dis_froz_max": [18.0, 20.0]},
-        "projection_variants": {
-            "reference": ["Mg:s;p", "O:s;p", "Ti:s;p;d", "Ti:s:r=2"],
-            "fallback_1": ["Mg:s;p", "O:s;p", "Ti:s;p;d", "Ti:s:r=2"],
-        },
-        "allowed_modes": ["reference", "explicit"],
-        "default_mode": "explicit",
-    },
-    "Al18Co4": {
-        "num_wann": 124,
-        "num_bands": 183,
-        "target_end": 124,
-        "default_windows": [-86.0, 35.0, -86.0, 20.6],
-        "window_bounds": {"dis_win_min": [-95.0, -70.0], "dis_win_max": [25.0, 45.0], "dis_froz_min": [-95.0, -70.0], "dis_froz_max": [18.0, 22.0]},
-        "projection_variants": {
-            "reference": ["Al:s;p", "Co:s;p;d", "Co:s;p:r=2"],
-            "fallback_1": ["Al:s;p", "Co:s;p;d"],
-        },
-        "allowed_modes": ["reference", "explicit"],
-    },
-    "Si6Y10": {
-        "num_wann": 154,
-        "num_bands": 201,
-        "target_end": 154,
-        "default_windows": [-35.0, 30.0, -35.0, 22.242],
-        "window_bounds": {"dis_win_min": [-45.0, -25.0], "dis_win_max": [25.0, 40.0], "dis_froz_min": [-45.0, -25.0], "dis_froz_max": [20.0, 23.0]},
-        "projection_variants": {
-            "reference": ["Si:s;p", "Y:s;p;d", "Y:s;p"],
-            "fallback_1": ["Si:s;p", "Y:s;p;d"],
-        },
-        "allowed_modes": ["reference", "explicit"],
-    },
-}
-
-
 def log(message: str) -> None:
     WORKFLOW_DIR.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     with LOG_PATH.open("a", encoding="utf-8") as handle:
-        handle.write(f"{stamp} {message}\\n")
+        handle.write(f"{stamp} {message}\n")
     print(message, flush=True)
 
 
 def configure_interrupt_policy() -> None:
-    # DeepSeek was repeatedly sending Ctrl-C and rerunning the allowed runner.
-    # Ignore terminal SIGINT so the runner and its Wannier/QE children keep ownership.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} must contain a JSON object")
+    return data
+
+
+def write_runner_state(status: str, **extra: Any) -> None:
+    state = {
+        "status": status,
+        "pid": os.getpid(),
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        **extra,
+    }
+    tmp_path = RUNNER_STATE_PATH.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp_path.replace(RUNNER_STATE_PATH)
 
 
 def read_runner_state() -> dict[str, Any] | None:
@@ -440,19 +406,6 @@ def read_runner_state() -> dict[str, Any] | None:
     except Exception:
         return {"status": "unknown", "reason": "unreadable runner state"}
     return data if isinstance(data, dict) else {"status": "unknown", "reason": "invalid runner state"}
-
-
-def write_runner_state(status: str, **extra: Any) -> None:
-    WORKFLOW_DIR.mkdir(parents=True, exist_ok=True)
-    state = {
-        "status": status,
-        "pid": os.getpid(),
-        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        **extra,
-    }
-    tmp_path = RUNNER_STATE_PATH.with_suffix(".json.tmp")
-    tmp_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\\n", encoding="utf-8")
-    tmp_path.replace(RUNNER_STATE_PATH)
 
 
 def runner_state_process_alive(state: dict[str, Any]) -> bool:
@@ -479,29 +432,8 @@ def refuse_runner_rerun(state: dict[str, Any]) -> int:
         "reruns wipe workflow/run_dir and cause thrashing"
     )
     log(f"REFUSE_RERUN previous_status={status} active={active}")
-    if not active and status != "success" and not (APP / "report.json").is_file():
-        try:
-            material = material_id()
-        except Exception:
-            material = "unknown"
-        fail(material, message)
     print(f"LOCKED_WORKFLOW_POLICY_DENIED: {message}", file=sys.stderr)
     return 0 if status == "success" else 1
-
-
-def read_json(path: Path) -> dict[str, Any]:
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        raise ValueError(f"{path} must contain a JSON object")
-    return data
-
-
-def write_locked_recipe(recipe: dict[str, Any]) -> None:
-    # Persist the current effective recipe after every accepted mutation.
-    LOCKED_RECIPE_PATH.write_text(
-        json.dumps(recipe, indent=2, sort_keys=True) + "\\n",
-        encoding="utf-8",
-    )
 
 
 def material_id() -> str:
@@ -512,104 +444,39 @@ def material_id() -> str:
     return value
 
 
-def validate_context(material: str) -> None:
-    summary = read_json(NEXT_SUMMARY_PATH)
-    if summary.get("target_material") != material:
-        raise ValueError("NEXT_RUN_CONTEXT_SUMMARY.json target_material mismatch")
-    if summary.get("bundle_path") != "/app/next_run_context/ALL_NEXT_RUN_RECOMMENDATIONS.md":
-        raise ValueError("NEXT_RUN_CONTEXT_SUMMARY.json bundle_path mismatch")
-    if summary.get("index_path") != "/app/next_run_context/index.json":
-        raise ValueError("NEXT_RUN_CONTEXT_SUMMARY.json index_path mismatch")
-    if summary.get("read_complete_bundle") is not True:
-        raise ValueError("NEXT_RUN_CONTEXT_SUMMARY.json did not confirm complete bundle read")
+def instruction_text() -> str:
+    if not INSTRUCTION_PATH.is_file():
+        return ""
+    return INSTRUCTION_PATH.read_text(encoding="utf-8", errors="replace")
 
 
-def finite_float(value: Any, name: str) -> float:
-    try:
-        result = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{name} must be numeric") from exc
-    if not math.isfinite(result):
-        raise ValueError(f"{name} must be finite")
-    return result
-
-
-def normalize_recipe(material: str, request: dict[str, Any], table: dict[str, Any]) -> dict[str, Any]:
-    if request.get("material_id") not in {None, material}:
-        raise ValueError("recipe_request material_id does not match task material")
-    if request.get("rerun_dft", False) is not False:
-        raise ValueError("rerun_dft is not allowed in the locked workflow")
-    if request.get("use_exclude_bands", False) is not False:
-        raise ValueError("exclude_bands is not allowed in the locked workflow")
-
-    num_wann = int(request.get("num_wann", table["num_wann"]))
-    num_bands = int(request.get("num_bands", table["num_bands"]))
-    target_end = int(request.get("target_dft_band_end", table["target_end"]))
-    if num_wann != table["num_wann"] or num_bands != table["num_bands"] or target_end != table["target_end"]:
-        raise ValueError("num_wann, num_bands, and target band end are fixed by the task")
-
-    mode = str(request.get("projection_mode") or table.get("default_mode") or "reference")
-    if mode == "reference":
-        variant = "reference"
-    elif mode == "explicit":
-        variant = str(request.get("projection_variant") or "reference")
-    else:
-        raise ValueError(f"unsupported projection_mode {mode!r}")
-    if mode not in table["allowed_modes"]:
-        raise ValueError(f"projection_mode {mode!r} is not allowed for {material}")
-    if variant not in table["projection_variants"]:
-        raise ValueError(f"projection_variant {variant!r} is not allowed for {material}")
-    projections = list(table["projection_variants"][variant])
-    if not projections:
-        raise ValueError(
-            f"projection_variant {variant!r} has no projections"
-        )
-
-    requested_windows = request.get("windows", {})
-    if requested_windows is None:
-        requested_windows = {}
-    if not isinstance(requested_windows, dict):
-        raise ValueError("windows must be a JSON object")
-    dmin, dmax, fmin, fmax = table["default_windows"]
-    windows = {
-        "dis_win_min": finite_float(requested_windows.get("dis_win_min", dmin), "dis_win_min"),
-        "dis_win_max": finite_float(requested_windows.get("dis_win_max", dmax), "dis_win_max"),
-        "dis_froz_min": finite_float(requested_windows.get("dis_froz_min", fmin), "dis_froz_min"),
-        "dis_froz_max": finite_float(requested_windows.get("dis_froz_max", fmax), "dis_froz_max"),
-    }
-    for key, value in windows.items():
-        lo, hi = table["window_bounds"][key]
-        if value < lo or value > hi:
-            raise ValueError(f"{key}={value} is outside locked bounds [{lo}, {hi}]")
-    if not (windows["dis_win_min"] <= windows["dis_froz_min"] <= windows["dis_froz_max"] <= windows["dis_win_max"]):
-        raise ValueError("energy windows must satisfy dis_win_min <= dis_froz_min <= dis_froz_max <= dis_win_max")
-
-    return {
-        "material_id": material,
-        "seedname": material,
-        "num_wann": num_wann,
-        "num_bands": num_bands,
-        "target_dft_band_start": 1,
-        "target_dft_band_end": target_end,
-        "projection_mode": mode,
-        "projection_variant": variant,
-        "projections": projections,
-        "windows": windows,
-        "rerun_dft": False,
-        "use_exclude_bands": False,
-        "allowed_repairs": [
-            "projection_count_fallback_variant_after_wannier90_pp_failure",
-            "outer_window_expand_from_eig_for_fewer_states",
-            "frozen_window_lower_from_eig_when_target_plus_one_is_frozen",
-            "one_disentanglement_tolerance_relaxation_after_nonconvergence",
-        ],
-    }
+def expected_from_instruction() -> dict[str, int | None]:
+    text = instruction_text()
+    num_wann = None
+    num_bands = None
+    target_end = None
+    match = re.search(r"\bnum_wann\s*=\s*(\d+)\b", text)
+    if match:
+        num_wann = int(match.group(1))
+    match = re.search(r"\bnum_bands\s*=\s*(\d+)\b", text)
+    if match:
+        num_bands = int(match.group(1))
+    match = re.search(r"Target DFT bands\s*`?1\s*-\s*(\d+)`?", text, flags=re.IGNORECASE)
+    if match:
+        target_end = int(match.group(1))
+    if target_end is None:
+        match = re.search(r"target(?:ed)?(?:\s+DFT)?\s+bands?\s+1\s*[-:]\s*(\d+)", text, flags=re.IGNORECASE)
+        if match:
+            target_end = int(match.group(1))
+    if target_end is None:
+        target_end = num_wann
+    return {"num_wann": num_wann, "num_bands": num_bands, "target_end": target_end}
 
 
 def parse_nscf_input(path: Path) -> dict[str, Any]:
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    text = "\\n".join(lines)
-    nbnd_match = re.search(r"\\bnbnd\\s*=\\s*(\\d+)", text, flags=re.IGNORECASE)
+    text = "\n".join(lines)
+    nbnd_match = re.search(r"\bnbnd\s*=\s*(\d+)", text, flags=re.IGNORECASE)
     if not nbnd_match:
         raise ValueError("could not parse nbnd from nscf.in")
 
@@ -664,35 +531,135 @@ def infer_mp_grid(kpoints: list[list[float]]) -> list[int]:
     return grid
 
 
-def write_win(path: Path, recipe: dict[str, Any], nscf: dict[str, Any], *, dis_conv_tol: str = "1.0d-8", conv_tol: str = "1.0d-8") -> None:
+def finite_float(value: Any, name: str) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be numeric") from exc
+    if not math.isfinite(result):
+        raise ValueError(f"{name} must be finite")
+    return result
+
+
+def normalize_recipe(material: str, request: dict[str, Any], expected: dict[str, int | None], nscf: dict[str, Any]) -> dict[str, Any]:
+    if request.get("material_id") not in {None, material}:
+        raise ValueError("recipe_request material_id does not match task material")
+    if request.get("rerun_dft", False) is not False:
+        raise ValueError("rerun_dft is not allowed in the locked workflow")
+    if request.get("use_exclude_bands", False) is not False:
+        raise ValueError("exclude_bands is not allowed in the locked workflow")
+
+    num_wann = int(request.get("num_wann"))
+    num_bands = int(request.get("num_bands"))
+    target_end = int(request.get("target_dft_band_end"))
+    if expected["num_wann"] is not None and num_wann != expected["num_wann"]:
+        raise ValueError(f"num_wann={num_wann} does not match task num_wann={expected['num_wann']}")
+    if expected["num_bands"] is not None and num_bands != expected["num_bands"]:
+        raise ValueError(f"num_bands={num_bands} does not match task num_bands={expected['num_bands']}")
+    if expected["target_end"] is not None and target_end != expected["target_end"]:
+        raise ValueError(f"target_dft_band_end={target_end} does not match task target_end={expected['target_end']}")
+    if num_bands != nscf["nbnd"]:
+        raise ValueError(f"num_bands={num_bands} does not match nscf.in nbnd={nscf['nbnd']}")
+    if num_wann < 1 or num_wann > num_bands:
+        raise ValueError("num_wann must be between 1 and num_bands")
+    if target_end < 1 or target_end > num_bands:
+        raise ValueError("target_dft_band_end must be between 1 and num_bands")
+
+    projections = request.get("projections")
+    if not isinstance(projections, list) or not projections:
+        raise ValueError("projections must be a non-empty JSON list")
+    normalized_projections: list[str] = []
+    for item in projections:
+        if not isinstance(item, str):
+            raise ValueError("every projection must be a string")
+        projection = item.strip()
+        if not projection:
+            raise ValueError("projection strings cannot be empty")
+        if len(projection) > 160:
+            raise ValueError(f"projection line is too long: {projection[:80]!r}")
+        if re.search(r"random|placeholder|dummy", projection, flags=re.IGNORECASE):
+            raise ValueError(f"projection line looks non-deterministic or placeholder-like: {projection!r}")
+        normalized_projections.append(projection)
+
+    requested_windows = request.get("windows")
+    if not isinstance(requested_windows, dict):
+        raise ValueError("windows must be a JSON object")
+    windows = {
+        "dis_win_min": finite_float(requested_windows.get("dis_win_min"), "dis_win_min"),
+        "dis_win_max": finite_float(requested_windows.get("dis_win_max"), "dis_win_max"),
+        "dis_froz_min": finite_float(requested_windows.get("dis_froz_min"), "dis_froz_min"),
+        "dis_froz_max": finite_float(requested_windows.get("dis_froz_max"), "dis_froz_max"),
+    }
+    for key, value in windows.items():
+        if value < -250.0 or value > 250.0:
+            raise ValueError(f"{key}={value} is outside broad sanity bounds [-250, 250] eV")
+    if not (windows["dis_win_min"] <= windows["dis_froz_min"] <= windows["dis_froz_max"] <= windows["dis_win_max"]):
+        raise ValueError("energy windows must satisfy dis_win_min <= dis_froz_min <= dis_froz_max <= dis_win_max")
+
+    seed = str(request.get("seedname") or material)
+    if not re.fullmatch(r"[A-Za-z0-9_.+-]+", seed):
+        raise ValueError(f"unsafe seedname: {seed!r}")
+
+    return {
+        "material_id": material,
+        "seedname": seed,
+        "num_wann": num_wann,
+        "num_bands": num_bands,
+        "target_dft_band_start": 1,
+        "target_dft_band_end": target_end,
+        "projections": normalized_projections,
+        "windows": windows,
+        "rerun_dft": False,
+        "use_exclude_bands": False,
+        "rationale": request.get("rationale") if isinstance(request.get("rationale"), list) else [],
+    }
+
+
+def write_locked_recipe(recipe: dict[str, Any]) -> None:
+    LOCKED_RECIPE_PATH.write_text(json.dumps(recipe, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def write_win(path: Path, recipe: dict[str, Any], nscf: dict[str, Any]) -> None:
     windows = recipe["windows"]
     mp_grid = infer_mp_grid(nscf["kpoints"])
     lines: list[str] = [
         f"num_wann = {recipe['num_wann']}",
         f"num_bands = {recipe['num_bands']}",
-        "num_iter = 1000",
-        "dis_num_iter = 1000",
-        f"conv_tol = {conv_tol}",
-        f"dis_conv_tol = {dis_conv_tol}",
+        "num_iter = 500",
+        "dis_num_iter = 500",
+        "conv_tol = 1.0d-8",
+        "dis_conv_tol = 1.0d-8",
         "write_hr = .true.",
-        "guiding_centres = .true.",
         f"mp_grid = {mp_grid[0]} {mp_grid[1]} {mp_grid[2]}",
         f"dis_win_min = {windows['dis_win_min']:.8f}",
         f"dis_win_max = {windows['dis_win_max']:.8f}",
         f"dis_froz_min = {windows['dis_froz_min']:.8f}",
         f"dis_froz_max = {windows['dis_froz_max']:.8f}",
+        "begin projections",
     ]
-    lines.append("begin projections")
     lines.extend(f"  {projection}" for projection in recipe["projections"])
-    lines.append("end projections")
-    lines.extend(["begin unit_cell_cart", "Ang"])
+    lines.extend(["end projections", "begin unit_cell_cart", "Ang"])
     lines.extend(f"  {row[0]: .12f} {row[1]: .12f} {row[2]: .12f}" for row in nscf["cell"])
     lines.extend(["end unit_cell_cart", "begin atoms_cart", "Ang"])
     lines.extend(f"  {atom[0]} {atom[1]: .12f} {atom[2]: .12f} {atom[3]: .12f}" for atom in nscf["atoms"])
     lines.extend(["end atoms_cart", "begin kpoints"])
     lines.extend(f"  {point[0]: .12f} {point[1]: .12f} {point[2]: .12f}" for point in nscf["kpoints"])
     lines.append("end kpoints")
-    path.write_text("\\n".join(lines) + "\\n", encoding="utf-8")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_pw2wan(path: Path, seed: str) -> None:
+    path.write_text(
+        "&inputpp\n"
+        "  outdir = './out'\n"
+        "  prefix = 'aiida'\n"
+        f"  seedname = '{seed}'\n"
+        "  write_mmn = .true.\n"
+        "  write_amn = .true.\n"
+        "  write_eig = .true.\n"
+        "/\n",
+        encoding="utf-8",
+    )
 
 
 def install_qe_save(run_dir: Path) -> None:
@@ -738,7 +705,7 @@ def run_command(argv: list[str], cwd: Path, log_name: str, timeout_sec: int) -> 
             return_code = process.wait(timeout=timeout_sec)
         except subprocess.TimeoutExpired:
             process.kill()
-            return_code = process.wait()
+            process.wait()
             raise TimeoutError(f"{' '.join(argv)} timed out after {timeout_sec} seconds")
     log(f"EXIT {return_code} {' '.join(argv)}")
     return subprocess.CompletedProcess(argv, return_code, "", output_path.read_text(encoding="utf-8", errors="replace"))
@@ -790,66 +757,7 @@ def run_wannier_final(seed: str, run_dir: Path, timeout_sec: int = 7200) -> int:
             time.sleep(30)
 
 
-def write_pw2wan(path: Path, seed: str) -> None:
-    path.write_text(
-        "&inputpp\\n"
-        "  outdir = './out'\\n"
-        "  prefix = 'aiida'\\n"
-        f"  seedname = '{seed}'\\n"
-        "  write_mmn = .true.\\n"
-        "  write_amn = .true.\\n"
-        "  write_eig = .true.\\n"
-        "/\\n",
-        encoding="utf-8",
-    )
-
-
-def eig_by_k(path: Path) -> dict[int, dict[int, float]]:
-    values: dict[int, dict[int, float]] = {}
-    if not path.is_file():
-        return values
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        parts = line.split()
-        if len(parts) < 3:
-            continue
-        try:
-            band = int(parts[0])
-            kpt = int(parts[1])
-            energy = float(parts[2])
-        except ValueError:
-            continue
-        values.setdefault(kpt, {})[band] = energy
-    return values
-
-
-def apply_eig_repairs(recipe: dict[str, Any], table: dict[str, Any], eig_path: Path) -> list[str]:
-    repairs: list[str] = []
-    values = eig_by_k(eig_path)
-    if not values:
-        return repairs
-    target = recipe["target_dft_band_end"]
-    target_energies = [bands[target] for bands in values.values() if target in bands]
-    next_energies = [bands[target + 1] for bands in values.values() if target + 1 in bands]
-    bounds = table["window_bounds"]
-    windows = recipe["windows"]
-    if target_energies:
-        needed_outer = max(target_energies) + 1.0
-        if needed_outer > windows["dis_win_max"]:
-            new_value = min(bounds["dis_win_max"][1], needed_outer)
-            if new_value > windows["dis_win_max"]:
-                windows["dis_win_max"] = new_value
-                repairs.append("expanded dis_win_max from eig target-band energy")
-    if next_energies:
-        safe_frozen = min(next_energies) - 0.03
-        if safe_frozen < windows["dis_froz_max"]:
-            new_value = max(bounds["dis_froz_max"][0], safe_frozen)
-            if new_value < windows["dis_froz_max"]:
-                windows["dis_froz_max"] = new_value
-                repairs.append("lowered dis_froz_max below target+1 eig energy")
-    return repairs
-
-
-def collect_artifacts(seed: str, run_dir: Path, recipe: dict[str, Any], status: str, notes: list[str]) -> dict[str, Any]:
+def collect_artifacts(seed: str, run_dir: Path, recipe: dict[str, Any], status: str, notes: list[str]) -> None:
     attempt_dir = ARTIFACTS_DIR / "attempt_1"
     attempt_dir.mkdir(parents=True, exist_ok=True)
     files = {
@@ -864,7 +772,7 @@ def collect_artifacts(seed: str, run_dir: Path, recipe: dict[str, Any], status: 
         source = run_dir / filename
         if source.is_file():
             shutil.copy2(source, attempt_dir / filename)
-    for extra in [f"{seed}.amn", f"{seed}.mmn", f"{seed}.pw2wan"]:
+    for extra in [f"{seed}.amn", f"{seed}.mmn", f"{seed}.pw2wan", f"{seed}.pp.log", f"{seed}.pw2wannier90.log", f"{seed}.wannier90.log"]:
         source = run_dir / extra
         if source.is_file():
             shutil.copy2(source, attempt_dir / extra)
@@ -900,7 +808,7 @@ def collect_artifacts(seed: str, run_dir: Path, recipe: dict[str, Any], status: 
         ],
         "notes": notes,
     }
-    (attempt_dir / "run_manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\\n", encoding="utf-8")
+    (attempt_dir / "run_manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     report = {
         "status": manifest["status"],
         "task_complete": bool(executed),
@@ -914,29 +822,32 @@ def collect_artifacts(seed: str, run_dir: Path, recipe: dict[str, Any], status: 
         "num_bands": recipe["num_bands"],
         "notes": notes,
     }
-    (APP / "report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\\n", encoding="utf-8")
+    (APP / "report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (APP / "REPORT.md").write_text(
-        "# Locked Wannier Runner Report\\n\\n"
-        f"- Material: {recipe['material_id']}\\n"
-        f"- Status: {manifest['status']}\\n"
-        f"- Projection mode: {recipe['projection_mode']} / {recipe['projection_variant']}\\n"
-        f"- Windows: {json.dumps(recipe['windows'], sort_keys=True)}\\n"
-        f"- Notes: {'; '.join(notes) if notes else 'none'}\\n",
+        "# Locked Wannier Runner Report\n\n"
+        f"- Material: {recipe['material_id']}\n"
+        f"- Status: {manifest['status']}\n"
+        f"- Projections: {json.dumps(recipe['projections'])}\n"
+        f"- Windows: {json.dumps(recipe['windows'], sort_keys=True)}\n"
+        f"- Notes: {'; '.join(notes) if notes else 'none'}\n",
         encoding="utf-8",
     )
-    return manifest
 
 
 def write_decisions(recipe: dict[str, Any], notes: list[str]) -> None:
+    rationale = recipe.get("rationale") or []
+    rationale_text = "\n".join(f"- {item}" for item in rationale if isinstance(item, str))
     (WORKFLOW_DIR / "DECISIONS.md").write_text(
-        "# Locked Workflow Decisions\\n\\n"
-        "The agent was restricted to recipe proposal only. The runner authored and executed the workflow.\\n\\n"
-        f"- Material: {recipe['material_id']}\\n"
-        f"- num_wann/num_bands: {recipe['num_wann']} / {recipe['num_bands']}\\n"
-        f"- Target DFT bands: 1-{recipe['target_dft_band_end']}\\n"
-        f"- Projections: {recipe['projection_mode']} {recipe['projections']}\\n"
-        f"- Energy windows: {json.dumps(recipe['windows'], sort_keys=True)}\\n"
-        f"- Repairs: {'; '.join(notes) if notes else 'none'}\\n",
+        "# Locked Workflow Decisions\n\n"
+        "DeepSeek proposed the recipe. The locked runner authored and executed the workflow from that recipe.\n\n"
+        f"- Material: {recipe['material_id']}\n"
+        f"- num_wann/num_bands: {recipe['num_wann']} / {recipe['num_bands']}\n"
+        f"- Target DFT bands: 1-{recipe['target_dft_band_end']}\n"
+        f"- Projections: {json.dumps(recipe['projections'])}\n"
+        f"- Energy windows: {json.dumps(recipe['windows'], sort_keys=True)}\n"
+        f"- Runner notes: {'; '.join(notes) if notes else 'none'}\n\n"
+        "## Agent Rationale\n\n"
+        f"{rationale_text if rationale_text else '- none supplied'}\n",
         encoding="utf-8",
     )
 
@@ -944,22 +855,20 @@ def write_decisions(recipe: dict[str, Any], notes: list[str]) -> None:
 def fail(material: str, message: str) -> int:
     log(f"FAILED {message}")
     write_runner_state("failed", message=message)
-    table = RECIPE_TABLE.get(material, {"num_wann": None, "num_bands": None, "target_end": None, "default_windows": [None, None, None, None]})
     recipe = {
         "material_id": material,
         "seedname": material,
-        "num_wann": table.get("num_wann"),
-        "num_bands": table.get("num_bands"),
-        "target_dft_band_end": table.get("target_end"),
+        "num_wann": None,
+        "num_bands": None,
+        "target_dft_band_end": None,
         "projections": [],
-        "projection_mode": "none",
-        "projection_variant": "none",
         "windows": {
-            "dis_win_min": table.get("default_windows", [None, None, None, None])[0],
-            "dis_win_max": table.get("default_windows", [None, None, None, None])[1],
-            "dis_froz_min": table.get("default_windows", [None, None, None, None])[2],
-            "dis_froz_max": table.get("default_windows", [None, None, None, None])[3],
+            "dis_win_min": None,
+            "dis_win_max": None,
+            "dis_froz_min": None,
+            "dis_froz_max": None,
         },
+        "rationale": [],
     }
     run_dir = WORKFLOW_DIR / "run_dir"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -985,19 +894,12 @@ def main() -> int:
     write_runner_state("running")
     try:
         material = material_id()
-        if material not in RECIPE_TABLE:
-            return fail(material, "material is not in the locked recipe table")
-        table = RECIPE_TABLE[material]
-        validate_context(material)
+        nscf = parse_nscf_input(MATERIAL_DIR / "nscf" / "input" / "nscf.in")
+        expected = expected_from_instruction()
         request = read_json(RECIPE_REQUEST_PATH)
-        recipe = normalize_recipe(material, request, table)
+        recipe = normalize_recipe(material, request, expected, nscf)
         write_locked_recipe(recipe)
         notes: list[str] = []
-
-        nscf_path = MATERIAL_DIR / "nscf" / "input" / "nscf.in"
-        nscf = parse_nscf_input(nscf_path)
-        if nscf["nbnd"] != recipe["num_bands"]:
-            raise ValueError(f"nscf.in nbnd={nscf['nbnd']} does not match locked num_bands={recipe['num_bands']}")
 
         run_dir = WORKFLOW_DIR / "run_dir"
         if run_dir.exists():
@@ -1006,84 +908,48 @@ def main() -> int:
         install_qe_save(run_dir)
         copy_pseudos(run_dir)
         seed = recipe["seedname"]
+        write_win(run_dir / f"{seed}.win", recipe, nscf)
+        write_pw2wan(run_dir / f"{seed}.pw2wan", seed)
+
         run_script = WORKFLOW_DIR / "run.sh"
         run_script.write_text(
-            "#!/usr/bin/env bash\\nset -euo pipefail\\ncd /app/workflow/run_dir\\n"
-            f"wannier90.x -pp {seed}\\n"
-            f"pw2wannier90.x -in {seed}.pw2wan\\n"
-            f"wannier90.x {seed}\\n",
+            "#!/usr/bin/env bash\nset -euo pipefail\ncd /app/workflow/run_dir\n"
+            f"wannier90.x -pp {shlex_quote(seed)}\n"
+            f"pw2wannier90.x -in {shlex_quote(seed + '.pw2wan')}\n"
+            f"wannier90.x {shlex_quote(seed)}\n",
             encoding="utf-8",
         )
         run_script.chmod(0o755)
 
-        pp_ok = False
-        variants_to_try = [recipe["projection_variant"]]
-        if (recipe["projection_variant"] != "fallback_1" and "fallback_1" in table["projection_variants"]):
-            variants_to_try.append("fallback_1")
-        for variant in variants_to_try:
-            recipe["projection_variant"] = variant
-            recipe["projections"] = list(table["projection_variants"][variant])
-            write_locked_recipe(recipe)
-            write_win(run_dir / f"{seed}.win", recipe, nscf)
-            result = run_command(["wannier90.x", "-pp", seed], run_dir, f"{seed}.pp.log", 600)
-            nnkp_path = run_dir / f"{seed}.nnkp"
-            if result.returncode == 0 and nnkp_path.is_file() and nnkp_path.stat().st_size > 0:
-                pp_ok = True
-                if variant != variants_to_try[0]:
-                    notes.append(f"allowed repair: switched projections to {variant} after -pp failure")
-                break
-            notes.append(f"wannier90 -pp failed for projection variant {variant}: returncode={result.returncode}, nnkp_present={nnkp_path.is_file()}")
-        if not pp_ok:
+        result = run_command(["wannier90.x", "-pp", seed], run_dir, f"{seed}.pp.log", 600)
+        if result.returncode != 0:
+            notes.append("wannier90.x -pp failed for the proposed projection recipe")
             write_decisions(recipe, notes)
             collect_artifacts(seed, run_dir, recipe, "failed", notes)
             write_runner_state("failed", message="wannier90 -pp failed")
             return 1
 
-        write_pw2wan(run_dir / f"{seed}.pw2wan", seed, )
         pw2 = run_command(["pw2wannier90.x", "-in", f"{seed}.pw2wan"], run_dir, f"{seed}.pw2wannier90.log", 3600)
         if pw2.returncode != 0:
-            notes.append("pw2wannier90.x failed; no arbitrary DFT rerun is allowed")
+            notes.append("pw2wannier90.x failed for the proposed recipe")
             write_decisions(recipe, notes)
             collect_artifacts(seed, run_dir, recipe, "failed", notes)
             write_runner_state("failed", message="pw2wannier90.x failed")
             return 1
 
-        repairs = apply_eig_repairs(recipe, table, run_dir / f"{seed}.eig")
-        if repairs:
-            notes.extend(f"allowed repair: {repair}" for repair in repairs)
-            write_locked_recipe(recipe)
-            write_win(run_dir / f"{seed}.win", recipe, nscf)
-            run_command(["wannier90.x", "-pp", seed], run_dir, f"{seed}.pp_after_window_repair.log", 600)
-
         try:
             return_code = run_wannier_final(seed, run_dir)
         except TimeoutError as exc:
             notes.append(str(exc))
-            write_locked_recipe(recipe)
             write_decisions(recipe, notes)
             collect_artifacts(seed, run_dir, recipe, "failed", notes)
             log("COMPLETE status=failed")
             write_runner_state("failed", message=str(exc))
             return 1
-        wout_text = (run_dir / f"{seed}.wout").read_text(encoding="utf-8", errors="replace") if (run_dir / f"{seed}.wout").is_file() else ""
-        if return_code != 0 or not (run_dir / f"{seed}_hr.dat").is_file():
-            if "disentanglement" in wout_text.lower() and "conver" in wout_text.lower():
-                notes.append("allowed repair: relaxed disentanglement tolerance once after nonconvergence")
-                write_win(run_dir / f"{seed}.win", recipe, nscf, dis_conv_tol="1.0d-4", conv_tol="1.0d-6")
-                try:
-                    run_wannier_final(seed, run_dir)
-                except TimeoutError as exc:
-                    notes.append(str(exc))
-                    write_locked_recipe(recipe)
-                    write_decisions(recipe, notes)
-                    collect_artifacts(seed, run_dir, recipe, "failed", notes)
-                    log("COMPLETE status=failed")
-                    write_runner_state("failed", message=str(exc))
-                    return 1
-        status = "success" if (run_dir / f"{seed}_hr.dat").is_file() and (run_dir / f"{seed}_hr.dat").stat().st_size > 0 else "failed"
+
+        status = "success" if return_code == 0 and (run_dir / f"{seed}_hr.dat").is_file() and (run_dir / f"{seed}_hr.dat").stat().st_size > 0 else "failed"
         if status != "success":
             notes.append("final Hamiltonian was not produced")
-        write_locked_recipe(recipe)
         write_decisions(recipe, notes)
         collect_artifacts(seed, run_dir, recipe, status, notes)
         log(f"COMPLETE status={status}")
@@ -1097,10 +963,466 @@ def main() -> int:
         return fail(material, str(exc))
 
 
+def shlex_quote(value: str) -> str:
+    import shlex
+
+    return shlex.quote(value)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+"""
+    return script.replace(
+        "def run_wannier_final(seed: str, run_dir: Path, timeout_sec: int = 7200) -> int:",
+        f"def run_wannier_final(seed: str, run_dir: Path, timeout_sec: int = {final_timeout_sec}) -> int:",
+    )
+
+def compile_recipe_script() -> str:
+    return r"""#!/usr/bin/env python3
+from __future__ import annotations
+
+import importlib.util
+import json
+import re
+import shutil
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+
+APP = Path("/app")
+WORKFLOW_DIR = APP / "workflow"
+RUNNER_PATH = APP / "locked_wannier_runner.py"
+REPORT_PATH = WORKFLOW_DIR / "compile_recipe_report.json"
+MAX_LOG_CHARS = 6000
+
+
+def load_runner() -> Any:
+    spec = importlib.util.spec_from_file_location("locked_wannier_runner", RUNNER_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not load {RUNNER_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def log_tail(path: Path, *, max_chars: int = MAX_LOG_CHARS) -> str:
+    if not path.is_file():
+        return ""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    return text[-max_chars:]
+
+
+def projection_count_diagnostics(recipe: dict[str, Any], nscf: dict[str, Any]) -> dict[str, Any]:
+    species_counts: dict[str, int] = {}
+    for atom in nscf.get("atoms", []):
+        if not atom:
+            continue
+        species = str(atom[0])
+        species_counts[species] = species_counts.get(species, 0) + 1
+
+    total = 0
+    details: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    species_pattern = re.compile(r"^([A-Za-z][A-Za-z0-9_+-]*)\s*:\s*(.+)$")
+    center_pattern = re.compile(r"^[fc]\s*=\s*[^:]+:\s*(.+)$", flags=re.IGNORECASE)
+    l_pattern = re.compile(r"\bl\s*=\s*([0-3])\b", flags=re.IGNORECASE)
+
+    for projection in recipe.get("projections", []):
+        line = str(projection).strip()
+        site_count = None
+        kind = None
+        selector_text = ""
+        species_match = species_pattern.match(line)
+        center_match = center_pattern.match(line)
+        if species_match:
+            species = species_match.group(1)
+            selector_text = species_match.group(2)
+            site_count = species_counts.get(species)
+            kind = "species"
+            if site_count is None:
+                warnings.append(f"projection {line!r} refers to species not found in nscf atoms")
+                site_count = 0
+        elif center_match:
+            selector_text = center_match.group(1)
+            site_count = 1
+            kind = "coordinate_center"
+        else:
+            warnings.append(f"projection {line!r} is not countable by the locked recipe diagnostics")
+            details.append({"line": line, "kind": "unknown", "count": None})
+            continue
+
+        angular_l_values = [int(value) for value in l_pattern.findall(selector_text)]
+        if not angular_l_values:
+            warnings.append(f"projection {line!r} has no explicit l= angular momentum selector")
+            details.append({"line": line, "kind": kind, "site_count": site_count, "count": None})
+            continue
+        count = int(site_count) * sum(2 * angular_l + 1 for angular_l in angular_l_values)
+        total += count
+        details.append({
+            "line": line,
+            "kind": kind,
+            "site_count": site_count,
+            "l_values": angular_l_values,
+            "count": count,
+        })
+
+    num_wann = int(recipe["num_wann"])
+    missing = num_wann - total
+    hints: list[str] = []
+    if missing > 0:
+        hints.append(
+            f"Projection count is {total}, but num_wann is {num_wann}; "
+            f"add {missing} more projection functions."
+        )
+        if missing <= 12:
+            hints.append(
+                "Safest repair: add coordinate-centered scalar projections "
+                "f=x,y,z:l=0 until the count matches num_wann."
+            )
+        else:
+            hints.append(
+                "Add coordinate-centered f=... or c=... projections using l=0/l=1/l=2 "
+                "multiplicities so the total equals num_wann exactly."
+            )
+        hints.append(
+            "Do not repair an undercount by duplicating l= channels, using pseudo-orbital "
+            "labels such as Co:3S, or inventing radial-projector selectors."
+        )
+    elif missing < 0:
+        hints.append(
+            f"Projection count is {total}, but num_wann is {num_wann}; "
+            f"remove {-missing} projection functions."
+        )
+    else:
+        hints.append(f"Projection count matches num_wann exactly at {num_wann}.")
+
+    return {
+        "num_wann": num_wann,
+        "estimated_projection_count": total,
+        "difference_num_wann_minus_count": missing,
+        "details": details,
+        "warnings": warnings,
+        "hints": hints,
+    }
+
+
+def upstream_pp_diagnostics(
+    compile_dir: Path,
+    seed: str,
+    recipe: dict[str, Any],
+    nscf: dict[str, Any],
+) -> dict[str, Any]:
+    pp_log_path = compile_dir / f"{seed}.compile.pp.log"
+    wout_path = compile_dir / f"{seed}.wout"
+    pp_log = log_tail(pp_log_path)
+    wout_tail = log_tail(wout_path)
+    combined = "\n".join(part for part in [pp_log, wout_tail] if part)
+    lower = combined.lower()
+
+    primary_cause = "wannier90.x -pp did not generate the .nnkp file"
+    hints: list[str] = []
+    if "too few projection functions" in lower:
+        primary_cause = "too few projection functions defined"
+        hints.append(
+            "Wannier90 rejected the projection block before writing .nnkp because "
+            "the usable projection count is smaller than num_wann."
+        )
+    elif "too many projection functions" in lower:
+        primary_cause = "too many projection functions defined"
+        hints.append(
+            "Wannier90 rejected the projection block before writing .nnkp because "
+            "the usable projection count is larger than num_wann."
+        )
+    elif "param_get_projection" in lower or "projection" in lower:
+        primary_cause = "projection syntax rejected by wannier90.x -pp"
+        hints.append(
+            "Inspect the projection block; use recipe-supported Wannier90 projection "
+            "syntax and avoid unsupported selector variants."
+        )
+
+    count_diagnostics = projection_count_diagnostics(recipe, nscf)
+    hints.extend(count_diagnostics["hints"])
+    return {
+        "primary_cause": primary_cause,
+        "hints": hints,
+        "projection_count_diagnostics": count_diagnostics,
+        "wannier90_pp_log_tail": pp_log,
+        "wout_tail": wout_tail,
+    }
+
+
+def missing_nnkp_message(seed: str, diagnostics: dict[str, Any]) -> str:
+    return (
+        f"wannier90.x -pp did not generate {seed}.nnkp. "
+        f"Primary cause: {diagnostics['primary_cause']}. "
+        "Revise the recipe projection block using the diagnostics in this report."
+    )
+
+
+def eig_by_k(path: Path) -> dict[int, dict[int, float]]:
+    values: dict[int, dict[int, float]] = {}
+    if not path.is_file():
+        return values
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        try:
+            band = int(parts[0])
+            kpt = int(parts[1])
+            energy = float(parts[2])
+        except ValueError:
+            continue
+        values.setdefault(kpt, {})[band] = energy
+    return values
+
+
+def window_report(recipe: dict[str, Any], eig_path: Path) -> dict[str, Any]:
+    values = eig_by_k(eig_path)
+    if not values:
+        return {
+            "passed": False,
+            "errors": ["missing_or_empty_eig_file"],
+            "hints": ["Check that pw2wannier90.x completed and wrote the .eig file."],
+        }
+
+    num_wann = int(recipe["num_wann"])
+    windows = recipe["windows"]
+    dis_win_min = float(windows["dis_win_min"])
+    dis_win_max = float(windows["dis_win_max"])
+    dis_froz_min = float(windows["dis_froz_min"])
+    dis_froz_max = float(windows["dis_froz_max"])
+
+    outer_counts: dict[int, int] = {}
+    frozen_counts: dict[int, int] = {}
+    details: dict[int, dict[str, Any]] = {}
+    errors: list[str] = []
+    hints: list[str] = []
+
+    for kpt, bands in sorted(values.items()):
+        energies = bands.values()
+        outer_count = sum(dis_win_min <= energy <= dis_win_max for energy in energies)
+        frozen_count = sum(dis_froz_min <= energy <= dis_froz_max for energy in energies)
+        outer_counts[kpt] = outer_count
+        frozen_counts[kpt] = frozen_count
+
+        if outer_count < num_wann or frozen_count > num_wann:
+            first_energy = bands.get(1)
+            target_energy = bands.get(num_wann)
+            next_energy = bands.get(num_wann + 1)
+            details[kpt] = {
+                "outer_count": outer_count,
+                "frozen_count": frozen_count,
+                "band_1_energy_ev": first_energy,
+                f"band_{num_wann}_energy_ev": target_energy,
+                f"band_{num_wann + 1}_energy_ev": next_energy,
+            }
+            if outer_count < num_wann:
+                errors.append(
+                    f"k-point {kpt}: outer window contains {outer_count} states, "
+                    f"but num_wann is {num_wann}"
+                )
+            if frozen_count > num_wann:
+                errors.append(
+                    f"k-point {kpt}: frozen window contains {frozen_count} states, "
+                    f"but num_wann is {num_wann}"
+                )
+
+    if errors:
+        first_bad = next(iter(details.values()), {})
+        band_1 = first_bad.get("band_1_energy_ev")
+        band_n = first_bad.get(f"band_{num_wann}_energy_ev")
+        band_next = first_bad.get(f"band_{num_wann + 1}_energy_ev")
+        if band_1 is not None:
+            hints.append(
+                "If low bands are excluded, lower dis_win_min below "
+                f"{float(band_1):.6f} eV with margin."
+            )
+        if band_n is not None:
+            hints.append(
+                f"Set dis_win_max above band {num_wann} energy "
+                f"{float(band_n):.6f} eV at every k-point, with margin."
+            )
+        if band_next is not None:
+            hints.append(
+                f"Keep dis_froz_max below the minimum band {num_wann + 1} "
+                "energy across k-points, with margin."
+            )
+
+    return {
+        "passed": not errors,
+        "errors": errors,
+        "hints": hints,
+        "num_kpoints": len(values),
+        "min_outer_count": min(outer_counts.values()) if outer_counts else None,
+        "max_frozen_count": max(frozen_counts.values()) if frozen_counts else None,
+        "bad_kpoint_details": {
+            str(kpt): detail
+            for kpt, detail in list(details.items())[:8]
+        },
+    }
+
+
+def write_report(report: dict[str, Any]) -> None:
+    WORKFLOW_DIR.mkdir(parents=True, exist_ok=True)
+    REPORT_PATH.write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    print(json.dumps(report, indent=2, sort_keys=True), flush=True)
+
+
+def fail(stage: str, message: str, **extra: Any) -> int:
+    write_report({
+        "status": "failed",
+        "stage": stage,
+        "message": message,
+        "recipe_path": "workflow/recipe_request.json",
+        "report_path": "workflow/compile_recipe_report.json",
+        **extra,
+    })
+    return 1
+
+
+def main() -> int:
+    WORKFLOW_DIR.mkdir(parents=True, exist_ok=True)
+    runner = load_runner()
+    compile_dir = WORKFLOW_DIR / "compile_run"
+    if compile_dir.exists():
+        shutil.rmtree(compile_dir)
+    compile_dir.mkdir(parents=True)
+
+    try:
+        material = runner.material_id()
+        nscf = runner.parse_nscf_input(runner.MATERIAL_DIR / "nscf" / "input" / "nscf.in")
+        expected = runner.expected_from_instruction()
+        request = runner.read_json(runner.RECIPE_REQUEST_PATH)
+        recipe = runner.normalize_recipe(material, request, expected, nscf)
+        runner.install_qe_save(compile_dir)
+        runner.copy_pseudos(compile_dir)
+        seed = recipe["seedname"]
+        runner.write_win(compile_dir / f"{seed}.win", recipe, nscf)
+        runner.write_pw2wan(compile_dir / f"{seed}.pw2wan", seed)
+
+        pp = runner.run_command(
+            ["wannier90.x", "-pp", seed],
+            compile_dir,
+            f"{seed}.compile.pp.log",
+            600,
+        )
+        if pp.returncode != 0:
+            diagnostics = upstream_pp_diagnostics(compile_dir, seed, recipe, nscf)
+            return fail(
+                "wannier90_pp",
+                missing_nnkp_message(seed, diagnostics),
+                upstream_diagnostics=diagnostics,
+            )
+        if not (compile_dir / f"{seed}.nnkp").is_file():
+            diagnostics = upstream_pp_diagnostics(compile_dir, seed, recipe, nscf)
+            return fail(
+                "wannier90_pp",
+                missing_nnkp_message(seed, diagnostics),
+                upstream_diagnostics=diagnostics,
+            )
+
+        pw2 = runner.run_command(
+            ["pw2wannier90.x", "-in", f"{seed}.pw2wan"],
+            compile_dir,
+            f"{seed}.compile.pw2wannier90.log",
+            3600,
+        )
+        if pw2.returncode != 0:
+            pw2_tail = log_tail(compile_dir / f"{seed}.compile.pw2wannier90.log")
+            if f"{seed}.nnkp" in pw2_tail and not (compile_dir / f"{seed}.nnkp").is_file():
+                diagnostics = upstream_pp_diagnostics(compile_dir, seed, recipe, nscf)
+                return fail(
+                    "wannier90_pp",
+                    missing_nnkp_message(seed, diagnostics),
+                    upstream_diagnostics=diagnostics,
+                    pw2wannier90_log_tail=pw2_tail,
+                )
+            return fail(
+                "pw2wannier90",
+                "pw2wannier90.x failed during compile; revise the recipe",
+                log_tail=pw2_tail,
+            )
+
+        windows = window_report(recipe, compile_dir / f"{seed}.eig")
+        if not windows["passed"]:
+            return fail(
+                "window_sanity",
+                "recipe would crash or be invalid in final Wannier90 window setup",
+                window_diagnostics=windows,
+            )
+
+        write_report({
+            "status": "passed",
+            "stage": "complete",
+            "message": "recipe passed compile checks; do not change it before final verifier",
+            "material_id": recipe["material_id"],
+            "seedname": seed,
+            "num_wann": recipe["num_wann"],
+            "num_bands": recipe["num_bands"],
+            "windows": recipe["windows"],
+            "window_diagnostics": windows,
+            "recipe_path": "workflow/recipe_request.json",
+            "report_path": "workflow/compile_recipe_report.json",
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        })
+        return 0
+    except Exception as exc:
+        return fail("exception", str(exc))
+
+
 if __name__ == "__main__":
     raise SystemExit(main())
 """
 
+
+def locked_runner_script(success_wave_timeout_sec: int = DEFAULT_SUCCESS_WAVE_TIMEOUT_SEC) -> str:
+    """Return the first script's locked runner, retaining the codex context gate."""
+    script = generic_locked_runner_script(success_wave_timeout_sec)
+    if WORKFLOW != "codex_self_review":
+        return script
+
+    script = script.replace(
+        'LOCKED_RECIPE_PATH = WORKFLOW_DIR / "LOCKED_RECIPE.json"\n'
+        'LOG_PATH = WORKFLOW_DIR / "locked_runner.log"',
+        'LOCKED_RECIPE_PATH = WORKFLOW_DIR / "LOCKED_RECIPE.json"\n'
+        'NEXT_SUMMARY_PATH = WORKFLOW_DIR / "NEXT_RUN_CONTEXT_SUMMARY.json"\n'
+        'LOG_PATH = WORKFLOW_DIR / "locked_runner.log"',
+        1,
+    )
+    context_validator = r'''
+
+
+def validate_context(material: str) -> None:
+    summary = read_json(NEXT_SUMMARY_PATH)
+    if summary.get("target_material") != material:
+        raise ValueError("NEXT_RUN_CONTEXT_SUMMARY.json target_material mismatch")
+    if summary.get("bundle_path") != "/app/next_run_context/ALL_NEXT_RUN_RECOMMENDATIONS.md":
+        raise ValueError("NEXT_RUN_CONTEXT_SUMMARY.json bundle_path mismatch")
+    if summary.get("index_path") != "/app/next_run_context/index.json":
+        raise ValueError("NEXT_RUN_CONTEXT_SUMMARY.json index_path mismatch")
+    if summary.get("read_complete_bundle") is not True:
+        raise ValueError("NEXT_RUN_CONTEXT_SUMMARY.json did not confirm complete bundle read")
+'''
+    script = script.replace(
+        "\ndef instruction_text() -> str:\n",
+        context_validator + "\n\ndef instruction_text() -> str:\n",
+        1,
+    )
+    script = script.replace(
+        "        material = material_id()\n"
+        '        nscf = parse_nscf_input(MATERIAL_DIR / "nscf" / "input" / "nscf.in")',
+        "        material = material_id()\n"
+        "        validate_context(material)\n"
+        '        nscf = parse_nscf_input(MATERIAL_DIR / "nscf" / "input" / "nscf.in")',
+        1,
+    )
+    return script
 
 def locked_runner_instruction_appendix(material: str) -> str:
     return f"""
@@ -1108,11 +1430,20 @@ def locked_runner_instruction_appendix(material: str) -> str:
 # Locked DeepSeek Execution Contract
 
 For this DeepSeek run, you are not the workflow executor. You are the recipe
-proposer only.
+proposer only. YOU HAVE {DEFAULT_RECIPE_AGENT_TIMEOUT_SEC} SECONDS to propose a recipe and write it to `workflow/recipe_request.json`.
 
-After reading `/app/next_run_context/ALL_NEXT_RUN_RECOMMENDATIONS.md` and
-writing `workflow/NEXT_RUN_CONTEXT_SUMMARY.json`, write exactly one proposed
-recipe file:
+In the `codex_self_review` workflow, first read the complete
+`/app/next_run_context/ALL_NEXT_RUN_RECOMMENDATIONS.md` bundle and write
+`workflow/NEXT_RUN_CONTEXT_SUMMARY.json` exactly as required by the supplied
+context instructions. This context requirement stays unchanged from the older
+self-debug workflow.
+
+Use the original task instructions, the supplied files under `/app/material`,
+and the copied self-debug/next-run context to decide the Wannierisation recipe
+yourself. You may inspect compact metadata/log snippets, but keep terminal
+output small.
+
+Write exactly one proposed recipe file:
 
 `workflow/recipe_request.json`
 
@@ -1121,11 +1452,11 @@ The recipe must be valid JSON. Use only this schema:
 ```json
 {{
   "material_id": "{material}",
+  "seedname": "{material}",
   "num_wann": null,
   "num_bands": null,
   "target_dft_band_end": null,
-  "projection_mode": "reference | explicit",
-  "projection_variant": "reference | fallback_1",
+  "projections": [],
   "windows": {{
     "dis_win_min": null,
     "dis_win_max": null,
@@ -1138,40 +1469,101 @@ The recipe must be valid JSON. Use only this schema:
 }}
 ```
 
-Do not run `/app/locked_wannier_runner.py`. Direct agent-side calls are rejected.
-Harbor's verifier will run that deterministic executor after you exit, before
-grading. This prevents agent tokens from being spent while Wannier90 is
-computing.
+`use_exclude_bands` must always be false. DO NOT SET IT TO TRUE. 
+All four window fields must be numeric. Do not leave any window value as null.
+
+`projections` must contain the actual Wannier90 projection lines you choose,
+for example strings in the syntax you would place between `begin projections`
+and `end projections`. 
+
+Only use projection forms that this workflow is known to handle reliably.
+
+Allowed species-centered forms:
+`Element:l=0`
+`Element:l=0;l=1`
+`Element:l=0;l=1;l=2`
+`Element:l=0;l=1;l=2;l=3`
+
+Allowed coordinate-centered forms:
+`f=x,y,z:l=0`
+`f=x,y,z:l=1`
+`f=x,y,z:l=0;l=1`
+`c=x,y,z:l=0`
+`c=x,y,z:l=1`
+`c=x,y,z:l=0;l=1`
+
+Do not use pseudo-orbital labels, principal-shell labels, radial-projector selectors, or atom-index selectors. Do not write selectors such as `Element=1:l=...`, repeated angular channels on one line, `l=0,mr=...`, `l=0(r=...)`, `r=...`, `mr=...`, or similar syntax.
+
+Projection counts are computed only from accepted lines:
+- `Element:l=L` contributes `number_of_Element_atoms * (2L + 1)`
+- `f=x,y,z:l=L` contributes `2L + 1`
+- `c=x,y,z:l=L` contributes `2L + 1`
+
+If multiple angular channels appear on one accepted line, add their multiplicities. 
+The total projection count must equal `num_wann` exactly. 
+If standard species-centered projections are too few, add coordinate-centered 
+`f=...` or `c=...` projections. Do not try to access extra UPF beta projectors or 
+radial projectors directly.
+
+Window values are absolute energies in eV, not Fermi-relative offsets. Before
+writing the recipe, compute per k-point counts from the QE eigenvalues:
+
+outer_count(k) = # bands with dis_win_min <= E_nk <= dis_win_max
+frozen_count(k) = # bands with dis_froz_min <= E_nk <= dis_froz_max
+
+The recipe is invalid unless min_k outer_count(k) >= num_wann and
+max_k frozen_count(k) <= num_wann. For target bands 1-N, choose dis_win_min
+below min_k E_1k and dis_win_max above max_k E_Nk, with margin. Keep
+dis_froz_max below the minimum energy of band N+1 across all k-points, with
+margin; if bands N and N+1 overlap, freeze fewer bands rather than freezing
+more than num_wann.
+
+Do not run `/app/locked_wannier_runner.py`. Direct agent-side calls are
+rejected. Harbor's verifier will run that deterministic executor after you
+exit, before grading. This prevents agent tokens from being spent while
+Wannier90 is computing.
 
 Do not run `wannier90.x`, `pw2wannier90.x`, `pw.x`, `rm`, `kill`, `pkill`, or
-`killall` yourself. Do not edit `.win`, `.pw2wan`, generated Wannier files, or
-files under `material/` yourself. Do not change kmesh, `num_wann`, `num_bands`,
-target bands, projections, windows, or DFT inputs after writing the recipe. Do
-not send `C-c`, `Ctrl-C`, `SIGINT`, terminal interrupt keys, or EOF/control
-keys. Do not poll for `report.json`, do not inspect logs, and do not attempt any
+`killall` yourself. The only allowed preflight execution path is
+`/app/compile_recipe.py`. Do not edit `.win`, `.pw2wan`, generated Wannier
+files, or files under `material/` yourself. Do not send `C-c`, `Ctrl-C`,
+`SIGINT`, terminal interrupt keys, or EOF/control keys. Do not poll for
+`report.json`, do not inspect final execution logs, and do not attempt any
 manual rescue path.
 
-The locked runner owns all execution, generated files, deterministic checks,
-and the only allowed repair table:
-- switch to the locked fallback projection variant after a `wannier90.x -pp`
-  parser/count failure;
-- adjust only frozen/outer windows from the generated `.eig`;
-- relax disentanglement tolerance once after a final Wannier90 nonconvergence;
-- fail with reports instead of improvising any other change.
+The locked runner will author `.win` and `.pw2wan` from your recipe, copy the
+provided QE save tree into `workflow/run_dir`, run `wannier90.x -pp`,
+`pw2wannier90.x`, and `wannier90.x`, then collect artifacts and reports.
+If your recipe is invalid or the commands fail, the attempt should fail rather
+than be silently corrected. The runner only performs broad JSON validation
+before execution; it will not repair projection syntax or projection counts.
 
-After writing `workflow/recipe_request.json`, stop. Return only a concise final
-JSON status like:
+After writing `workflow/recipe_request.json`, run:
+
+`/app/compile_recipe.py`
+
+This compile step runs only preflight checks: JSON/schema validation,
+`wannier90.x -pp`, `pw2wannier90.x`, and `.eig`-based window sanity. It does
+not run final `wannier90.x`, does not create the final Hamiltonian, and does
+not edit your recipe.
+
+If `/app/compile_recipe.py` fails, read the printed JSON diagnostics, update
+`workflow/recipe_request.json` yourself, and run `/app/compile_recipe.py`
+again. You may make at most 3 compile attempts. Do not stop until the compile
+report says `"status": "passed"`, unless you cannot produce a valid recipe.
+
+After compile passes, stop. Return only a concise final JSON status like:
 
 ```json
 {{
   "status": "recipe_submitted",
   "task_complete": true,
   "recipe_path": "workflow/recipe_request.json",
+  "compile_report_path": "workflow/compile_recipe_report.json",
   "runner": "deferred_to_harbor_verifier"
 }}
 ```
 """
-
 
 def upsert_locked_runner_instruction_appendix(instruction_text: str, material: str) -> str:
     marker = "# Locked DeepSeek Execution Contract"
@@ -1370,6 +1762,33 @@ def existing_run_counts(jobs_root: Path, valid_materials: set[str]) -> Counter[s
     return counts
 
 
+def task_timeout_sec(task_dir: Path, section: str) -> int:
+    task_toml = task_dir / "task.toml"
+    data = tomllib.loads(task_toml.read_text(encoding="utf-8"))
+    timeout_sec = data.get(section, {}).get("timeout_sec")
+    if type(timeout_sec) is not int or timeout_sec < 1:
+        raise ValueError(
+            f"{task_toml} must define [{section}].timeout_sec as a positive integer"
+        )
+    return timeout_sec
+
+
+def common_task_timeout_sec(
+    tasks: list[tuple[int, str, Path]],
+    section: str,
+) -> int:
+    timeouts = {
+        task_timeout_sec(task_dir, section)
+        for _num_wann, _material, task_dir in tasks
+    }
+    if len(timeouts) != 1:
+        raise ValueError(
+            f"selected tasks have different [{section}].timeout_sec values: "
+            f"{sorted(timeouts)}"
+        )
+    return timeouts.pop()
+
+
 def candidate_materials_from_include_only_csv(path: Path) -> dict[str, list[str]]:
     """Read target_material,candidate_material rows in the exact include-only CSV."""
     if not path.is_file():
@@ -1437,6 +1856,53 @@ def preview_list(values: list[str], *, limit: int = 12) -> str:
     return ", ".join(shown) + suffix
 
 
+def inject_locked_tools_into_dockerfile(dockerfile_text: str) -> str:
+    denied_commands = " ".join(shlex.quote(name) for name in LOCKED_DENIED_COMMANDS)
+    copy_snippet = (
+        f"COPY {LOCKED_RUNNER_NAME} {LOCKED_RUNNER_APP_PATH}\n"
+        f"COPY {COMPILE_RECIPE_NAME} {COMPILE_RECIPE_APP_PATH}\n"
+        f"COPY {LOCKED_COMMAND_WRAPPER_NAME} {LOCKED_COMMAND_WRAPPER_APP_PATH}\n"
+        f"COPY instruction.md /app/instruction.md\n"
+        f"RUN chmod +x {LOCKED_RUNNER_APP_PATH} {COMPILE_RECIPE_APP_PATH} {LOCKED_COMMAND_WRAPPER_APP_PATH} && "
+        f"mkdir -p {LOCKED_BIN_APP_DIR} && "
+        f"for name in {denied_commands}; do "
+        f"ln -sf {LOCKED_COMMAND_WRAPPER_APP_PATH} {LOCKED_BIN_APP_DIR}/$name; "
+        "done\n"
+    )
+    profile_lines = " ".join(
+        shlex.quote(line)
+        for line in terminus_login_trace_profile_script().splitlines()
+    )
+    profile_hook = (
+        "RUN mkdir -p /etc/profile.d && printf '%s\\n' "
+        f"{profile_lines} > /etc/profile.d/harbor-agent-trace.sh\n"
+    )
+
+    additions = ""
+    if f"COPY {LOCKED_RUNNER_NAME} {LOCKED_RUNNER_APP_PATH}" not in dockerfile_text:
+        additions += copy_snippet
+    else:
+        if f"COPY {COMPILE_RECIPE_NAME} {COMPILE_RECIPE_APP_PATH}" not in dockerfile_text:
+            additions += (
+                f"COPY {COMPILE_RECIPE_NAME} {COMPILE_RECIPE_APP_PATH}\n"
+                f"RUN chmod +x {COMPILE_RECIPE_APP_PATH}\n"
+            )
+        if (
+            "COPY instruction.md /app/instruction.md" not in dockerfile_text
+            and "COPY instruction.md /app/instruction.md" not in additions
+        ):
+            additions += "COPY instruction.md /app/instruction.md\n"
+    if "harbor-agent-trace.sh" not in dockerfile_text:
+        additions += profile_hook
+    if not additions:
+        return dockerfile_text
+
+    marker = "COPY material /app/material\n"
+    if marker in dockerfile_text:
+        return dockerfile_text.replace(marker, additions + marker, 1)
+    return dockerfile_text + "\n" + additions
+
+
 def inject_next_run_trace_tools_into_dockerfile(dockerfile_text: str) -> str:
     denied_commands = " ".join(shlex.quote(name) for name in LOCKED_DENIED_COMMANDS)
     install_snippet = (
@@ -1451,10 +1917,12 @@ def inject_next_run_trace_tools_into_dockerfile(dockerfile_text: str) -> str:
         f"COPY {NEXT_RUN_TRACE_WRAPPER_NAME} /app/{NEXT_RUN_TRACE_WRAPPER_NAME}\n"
         f"COPY {NEXT_RUN_TRACE_VERIFIER_NAME} /app/{NEXT_RUN_TRACE_VERIFIER_NAME}\n"
         f"COPY {LOCKED_RUNNER_NAME} {LOCKED_RUNNER_APP_PATH}\n"
+        f"COPY {COMPILE_RECIPE_NAME} {COMPILE_RECIPE_APP_PATH}\n"
         f"COPY {LOCKED_COMMAND_WRAPPER_NAME} {LOCKED_COMMAND_WRAPPER_APP_PATH}\n"
+        f"COPY instruction.md /app/instruction.md\n"
         f"RUN chmod +x /app/{NEXT_RUN_TRACE_WRAPPER_NAME} "
         f"/app/{NEXT_RUN_TRACE_VERIFIER_NAME} "
-        f"{LOCKED_RUNNER_APP_PATH} {LOCKED_COMMAND_WRAPPER_APP_PATH} && "
+        f"{LOCKED_RUNNER_APP_PATH} {COMPILE_RECIPE_APP_PATH} {LOCKED_COMMAND_WRAPPER_APP_PATH} && "
         f"mkdir -p {LOCKED_BIN_APP_DIR} && "
         f"for name in {denied_commands}; do "
         f"ln -sf {LOCKED_COMMAND_WRAPPER_APP_PATH} {LOCKED_BIN_APP_DIR}/$name; "
@@ -1489,8 +1957,20 @@ def inject_next_run_trace_tools_into_dockerfile(dockerfile_text: str) -> str:
     additions = ""
     if f"COPY {NEXT_RUN_TRACE_WRAPPER_NAME} /app/{NEXT_RUN_TRACE_WRAPPER_NAME}" not in dockerfile_text:
         additions += copy_snippet
-    elif f"COPY {LOCKED_RUNNER_NAME} {LOCKED_RUNNER_APP_PATH}" not in dockerfile_text:
-        additions += copy_snippet
+    else:
+        if f"COPY {LOCKED_RUNNER_NAME} {LOCKED_RUNNER_APP_PATH}" not in dockerfile_text:
+            additions += copy_snippet
+        else:
+            if f"COPY {COMPILE_RECIPE_NAME} {COMPILE_RECIPE_APP_PATH}" not in dockerfile_text:
+                additions += (
+                    f"COPY {COMPILE_RECIPE_NAME} {COMPILE_RECIPE_APP_PATH}\n"
+                    f"RUN chmod +x {COMPILE_RECIPE_APP_PATH}\n"
+                )
+            if (
+                "COPY instruction.md /app/instruction.md" not in dockerfile_text
+                and "COPY instruction.md /app/instruction.md" not in additions
+            ):
+                additions += "COPY instruction.md /app/instruction.md\n"
     if "harbor-agent-trace.sh" not in dockerfile_text:
         additions += profile_hook
     if not additions:
@@ -1500,7 +1980,6 @@ def inject_next_run_trace_tools_into_dockerfile(dockerfile_text: str) -> str:
     if marker in dockerfile_text:
         return dockerfile_text.replace(marker, additions + marker, 1)
     return dockerfile_text + "\n" + additions
-
 
 def locked_runner_verifier_hook_script() -> str:
     return f"""{LOCKED_RUNNER_VERIFIER_HOOK_MARKER}
@@ -1542,33 +2021,42 @@ def ensure_local_tests_dir(task_dir: Path) -> None:
     shutil.copytree(source_tests_dir, tests_dir, symlinks=True)
 
 
-def install_next_run_trace_tools(tasks: list[tuple[int, str, Path]]) -> None:
+def install_next_run_trace_tools(
+    tasks: list[tuple[int, str, Path]],
+    success_wave_timeout_sec: int,
+) -> None:
+    runner_text = (
+        locked_runner_script(success_wave_timeout_sec)
+        if WORKFLOW == "codex_self_review"
+        else generic_locked_runner_script(success_wave_timeout_sec)
+    )
+    compile_text = compile_recipe_script()
+    compile(runner_text, LOCKED_RUNNER_NAME, "exec")
+    compile(compile_text, COMPILE_RECIPE_NAME, "exec")
+
     for _num_wann, material, task_dir in tasks:
         environment_dir = task_dir / "environment"
-        wrapper_path = environment_dir / NEXT_RUN_TRACE_WRAPPER_NAME
-        wrapper_path.write_text(next_run_trace_wrapper_script(), encoding="utf-8")
-        wrapper_path.chmod(0o755)
 
-        verifier_path = environment_dir / NEXT_RUN_TRACE_VERIFIER_NAME
-        verifier_path.write_text(next_run_trace_verifier_script(), encoding="utf-8")
-        verifier_path.chmod(0o755)
+        if WORKFLOW == "codex_self_review":
+            wrapper_path = environment_dir / NEXT_RUN_TRACE_WRAPPER_NAME
+            wrapper_path.write_text(next_run_trace_wrapper_script(), encoding="utf-8")
+            wrapper_path.chmod(0o755)
 
-        runner_text = locked_runner_script()
-        compile(runner_text, LOCKED_RUNNER_NAME, "exec")
+            verifier_path = environment_dir / NEXT_RUN_TRACE_VERIFIER_NAME
+            verifier_path.write_text(next_run_trace_verifier_script(), encoding="utf-8")
+            verifier_path.chmod(0o755)
+
         runner_path = environment_dir / LOCKED_RUNNER_NAME
         runner_path.write_text(runner_text, encoding="utf-8")
         runner_path.chmod(0o755)
 
+        compile_path = environment_dir / COMPILE_RECIPE_NAME
+        compile_path.write_text(compile_text, encoding="utf-8")
+        compile_path.chmod(0o755)
+
         command_wrapper_path = environment_dir / LOCKED_COMMAND_WRAPPER_NAME
         command_wrapper_path.write_text(locked_command_wrapper_script(), encoding="utf-8")
         command_wrapper_path.chmod(0o755)
-
-        dockerfile_path = environment_dir / "Dockerfile"
-        dockerfile_text = dockerfile_path.read_text(encoding="utf-8")
-        dockerfile_path.write_text(
-            inject_next_run_trace_tools_into_dockerfile(dockerfile_text),
-            encoding="utf-8",
-        )
 
         instruction_path = task_dir / "instruction.md"
         instruction_text = instruction_path.read_text(encoding="utf-8")
@@ -1578,11 +2066,28 @@ def install_next_run_trace_tools(tasks: list[tuple[int, str, Path]]) -> None:
         )
         if updated_instruction_text != instruction_text:
             instruction_path.write_text(updated_instruction_text, encoding="utf-8")
+        (environment_dir / "instruction.md").write_text(
+            updated_instruction_text,
+            encoding="utf-8",
+        )
+
+        dockerfile_path = environment_dir / "Dockerfile"
+        dockerfile_text = dockerfile_path.read_text(encoding="utf-8")
+        dockerfile_path.write_text(
+            (
+                inject_next_run_trace_tools_into_dockerfile(dockerfile_text)
+                if WORKFLOW == "codex_self_review"
+                else inject_locked_tools_into_dockerfile(dockerfile_text)
+            ),
+            encoding="utf-8",
+        )
 
         ensure_local_tests_dir(task_dir)
         test_script_path = task_dir / "tests" / "test.sh"
         if not test_script_path.is_file():
-            raise FileNotFoundError(f"expected Harbor verifier script does not exist: {test_script_path}")
+            raise FileNotFoundError(
+                f"expected Harbor verifier script does not exist: {test_script_path}"
+            )
         test_script_text = test_script_path.read_text(encoding="utf-8")
         test_script_path.write_text(
             inject_locked_runner_verifier_hook(test_script_text),
@@ -1590,18 +2095,21 @@ def install_next_run_trace_tools(tasks: list[tuple[int, str, Path]]) -> None:
         )
         test_script_path.chmod(0o755)
 
-
-def deepseek_harbor_args(cli: argparse.Namespace) -> argparse.Namespace:
+def deepseek_harbor_args(
+    cli: argparse.Namespace,
+    tasks: list[tuple[int, str, Path]],
+) -> argparse.Namespace:
+    agent_timeout_sec = common_task_timeout_sec(tasks, "agent")
+    verifier_timeout_sec = common_task_timeout_sec(tasks, "verifier")
     trace_wrapper_path = (
         NEXT_RUN_TRACE_WRAPPER_APP_PATH
         if WORKFLOW == "codex_self_review"
         else self_debug_generator.TRACE_WRAPPER_APP_PATH
     )
-    trace_artifacts = (
-        list(NEXT_RUN_TRACE_ARTIFACTS)
-        if WORKFLOW == "codex_self_review"
-        else []
-    )
+    artifacts = list(CONTROLLED_ARTIFACTS)
+    if WORKFLOW == "codex_self_review":
+        artifacts = list(dict.fromkeys([*NEXT_RUN_TRACE_ARTIFACTS, *artifacts]))
+
     return argparse.Namespace(
         dataset=cli.dataset,
         agent="terminus-2",
@@ -1611,15 +2119,16 @@ def deepseek_harbor_args(cli: argparse.Namespace) -> argparse.Namespace:
         stop_on_error=cli.stop_on_error,
         docker_prune_after_batch=not cli.no_docker_prune_after_batch,
         docker_prune_after_material=False,
+        post_prune_commands=POST_PRUNE_COMMANDS,
         delete_after_run=True,
         extra_arg=[
             "--agent-env",
             f"{self_debug_generator.DEFAULT_TRACE_AGENT_WRAPPER_ENV}="
             f"{trace_wrapper_path}",
             "--agent-timeout-multiplier",
-            f"{cli.recipe_agent_timeout_sec / TASK_AGENT_TIMEOUT_SEC:.6g}",
+            f"{cli.recipe_agent_timeout_sec / agent_timeout_sec:.6g}",
             "--verifier-timeout-multiplier",
-            f"{cli.success_wave_timeout_sec / TASK_VERIFIER_TIMEOUT_SEC:.6g}",
+            f"{cli.success_wave_timeout_sec / verifier_timeout_sec:.6g}",
             "--max-retries",
             "2",
             "--retry-include",
@@ -1627,11 +2136,11 @@ def deepseek_harbor_args(cli: argparse.Namespace) -> argparse.Namespace:
             "--retry-include",
             "NonZeroAgentExitCodeError",
         ],
-        artifact=trace_artifacts,
+        artifact=artifacts,
         no_default_artifacts=False,
         save_generated_qe_save=False,
         jobs_root=cli.jobs_root,
-        target_success_runs=cli.target_success_runs,
+        target_success_runs=cli.target_success_runs if cli.target_runs is None else None,
         validate_new_success=False,
         max_attempts_per_needed_success=0,
         delete_failed_attempt_folders=False,
@@ -1648,23 +2157,31 @@ def deepseek_harbor_args(cli: argparse.Namespace) -> argparse.Namespace:
         trace_agent_wrapper_env_name=self_debug_generator.DEFAULT_TRACE_AGENT_WRAPPER_ENV,
     )
 
-
 def selected_materials(cli: argparse.Namespace) -> set[str]:
-    explicit = {name.strip() for name in [*MATERIALS, *cli.material] if name.strip()}
+    # In chemically similar mode, the CSV is the sole authority for
+    # which target materials should be run.
+    if WORKFLOW == "chemically similar":
+        candidates_by_target = candidate_materials_from_include_only_csv(
+            cli.candidate_run_error_table.expanduser().resolve()
+        )
+        return set(candidates_by_target)
+
+    # Other workflows can still use MATERIALS / --material overrides.
+    explicit = {
+        name.strip()
+        for name in [*MATERIALS, *cli.material]
+        if name.strip()
+    }
     if explicit:
         return explicit
 
     if WORKFLOW == "codex_self_review":
-        diagnoses_path = cli.next_run_diagnoses or DEFAULT_CODEX_NEXT_RUN_DIAGNOSES
+        diagnoses_path = (
+            cli.next_run_diagnoses or DEFAULT_CODEX_NEXT_RUN_DIAGNOSES
+        )
         return material_names_with_next_run_recommendations(diagnoses_path)
 
-    if cli.candidate_self_debug_reports_only:
-        candidates = candidate_materials_from_include_only_csv(
-            cli.candidate_run_error_table.expanduser().resolve()
-        )
-        return set(candidates)
-
-    return material_names_with_reports(cli.self_debug_reviews_root)
+    return set()
 
 
 def main() -> None:
@@ -1706,6 +2223,12 @@ def main() -> None:
             cli.next_run_diagnoses = DEFAULT_CODEX_NEXT_RUN_DIAGNOSES
         if not cli.next_run_diagnoses.is_file():
             raise SystemExit(f"Codex next-run diagnosis file does not exist: {cli.next_run_diagnoses}")
+
+    if WORKFLOW == "chemically similar":
+        # Chemically-similar mode is controlled entirely by the
+        # target_material -> candidate_material pairs in the CSV.
+        cli.include_candidate_self_debug_reports = True
+        cli.candidate_self_debug_reports_only = True
 
     if cli.candidate_self_debug_reports_only:
         cli.include_candidate_self_debug_reports = True
@@ -1781,7 +2304,6 @@ def main() -> None:
         print(" ".join(material for _num_wann, material, _source in tasks))
         return
 
-    args = deepseek_harbor_args(cli)
     skipped_materials = sorted(
         set(missing_dataset_materials)
         | set(skipped_missing_target_reports)
@@ -1825,7 +2347,6 @@ def main() -> None:
                 repeats_by_material[material] = needed
                 pending_tasks.append(task)
         tasks = pending_tasks
-        args.target_success_runs = None
     else:
         excluded = harbor_generator.DEFAULT_EXCLUDED_RESULT_DIR_NAMES
         success_counts = self_debug_generator.successful_run_counts(
@@ -1856,9 +2377,14 @@ def main() -> None:
         ),
         next_run_diagnoses_path=cli.next_run_diagnoses,
     )
-    if WORKFLOW == "codex_self_review":
-        install_next_run_trace_tools(augmented_tasks)
+    install_next_run_trace_tools(
+        augmented_tasks,
+        cli.success_wave_timeout_sec,
+    )
+    args = deepseek_harbor_args(cli, augmented_tasks)
     args.dataset = augmented_dataset
+    if cli.target_runs is not None:
+        args.target_success_runs = None
     if repeats_by_material is not None:
         augmented_tasks = [
             task
@@ -1867,9 +2393,9 @@ def main() -> None:
         ]
 
     if cli.target_runs is not None:
-        self_debug_generator.print_ordered_commands(args, augmented_tasks)
+        harbor_generator.print_ordered_commands(args, augmented_tasks)
     else:
-        self_debug_generator.print_target_success_loop(args, augmented_tasks)
+        harbor_generator.print_target_success_loop(args, augmented_tasks)
 
 
 if __name__ == "__main__":
