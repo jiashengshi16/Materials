@@ -9,6 +9,7 @@ No argparse. Edit MATERIALS and GEMINI_BIN below, then run:
 from __future__ import annotations
 import csv
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -139,11 +140,18 @@ def clean_dir(path: Path) -> None:
     path.mkdir(parents=True)
 
 
-def copy_file(src: Path, dst: Path) -> None:
+def copy_file(src: Path | str, dst: Path | str) -> None:
+    src = Path(src)
+    dst = Path(dst)
     if not src.is_file():
         raise FileNotFoundError(src)
     dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dst)
+    if dst.exists() or dst.is_symlink():
+        dst.unlink()
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
 
 
 def copy_file_if_present(src: Path, dst: Path) -> bool:
@@ -1132,6 +1140,13 @@ def collect_cases() -> list[TrialCase]:
     output_dirs: dict[Path, TrialCase] = {}
     for case in all_cases:
         output_dir = output_dir_for_case(case)
+
+        if output_dir.exists():
+            print(
+                f"Skipping existing review for {case.material} "
+                f"case={case.case_id}"
+            )
+            continue
         previous = output_dirs.get(output_dir)
         if previous is not None:
             if previous.material == case.material and previous.trial_dir == case.trial_dir:
