@@ -1,4 +1,3 @@
-import json
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -6,27 +5,36 @@ import matplotlib.pyplot as plt
 import matplotlib as mpl
 import networkx as nx
 
-JSON_PATH = Path("/home/jiasheng/WannierisationBenchmarking/material_similarity_candidates.json")
-ORIGINAL_CSV_PATH = Path("/home/jiasheng/WannierisationBenchmarking/jobs/successful_run_errors.csv")
-NEW_RUN_CSV_PATH = Path("/home/jiasheng/WannierisationBenchmarking/jobs/gemini_self_debug_reviews_chemical_similarity/all_error_ratios_by_material.csv")
+CANDIDATES_CSV_PATH = Path(
+    "/home/jiasheng/WannierisationBenchmarking/include_only_candidates.csv"
+)
+ERROR_RATIOS_CSV_PATH = Path(
+    "/home/jiasheng/WannierisationBenchmarking/jobsGeminiReviewsDeepseek/"
+    "ChemSimReruns/all_error_ratios_by_material.csv"
+)
 
-OUT_PNG = Path("/home/jiasheng/WannierisationBenchmarking/jobs/gemini_self_debug_reviews_chemical_similarity/material_dependency_graph.png")
-OUT_SVG = Path("/home/jiasheng/WannierisationBenchmarking/jobs/gemini_self_debug_reviews_chemical_similarity/material_dependency_graph.svg")
-LOWER_OUT_PNG = Path("/home/jiasheng/WannierisationBenchmarking/jobs/gemini_self_debug_reviews_chemical_similarity/material_dependency_graph_lower_error_ratio.png")
+OUT_PNG = Path(
+    "/home/jiasheng/WannierisationBenchmarking/jobsGeminiReviewsDeepseek/"
+    "ChemSimReruns/material_dependency_graph.png"
+)
+OUT_SVG = Path(
+    "/home/jiasheng/WannierisationBenchmarking/jobsGeminiReviewsDeepseek/"
+    "ChemSimReruns/material_dependency_graph.svg"
+)
+LOWER_OUT_PNG = Path(
+    "/home/jiasheng/WannierisationBenchmarking/jobsGeminiReviewsDeepseek/"
+    "ChemSimReruns/material_dependency_graph_lower_error_ratio.png"
+)
 
 TARGET_GREEN = "#7BC96F"
 CANDIDATE_ONLY_FILL_SIZE = 950
-
-# Target nodes are now drawn in TWO layers:
-#   1. TARGET_BASE_SIZE: full-size green disk showing this is a target material
-#   2. NEW_RUN_INNER_FILL_SIZE: smaller blue/red disk showing avg_new_run_error_ratio
-# Shrink THIS value if the blue/red center is too large.
 TARGET_BASE_SIZE = 1050
-NEW_RUN_INNER_FILL_SIZE = 200
-
 CANDIDATE_ONLY_RING_SIZE = 1060
 TARGET_AND_CANDIDATE_RING_SIZE = 1160
-RATIO_RING_LINEWIDTH = 2.4
+RATIO_RING_LINEWIDTH = 2.8
+MISSING_RING_COLOR = "#BBBBBB"
+RING_BACKING_COLOR = "#777777"
+
 
 def material_ratio_dict(
     df: pd.DataFrame,
@@ -50,6 +58,36 @@ def material_ratio_dict(
         raise ValueError(f"Unsupported aggregation {agg!r}; use 'mean' or 'min'.")
 
     return grouped.dropna().to_dict()
+
+
+def comparison_ratio_dict(
+    original_ratio_by_material: dict,
+    new_ratio_by_material: dict,
+) -> dict:
+    """
+    Return new/original for each material.
+
+    Interpretation:
+      - 1.0  => no change (white)
+      - <1.0 => new run is better / lower error (blue)
+      - >1.0 => new run is worse / higher error (red)
+    """
+    out = {}
+    for material in sorted(set(original_ratio_by_material) | set(new_ratio_by_material)):
+        original = original_ratio_by_material.get(material)
+        new = new_ratio_by_material.get(material)
+        if (
+            original is None
+            or new is None
+            or not np.isfinite(original)
+            or not np.isfinite(new)
+            or original <= 0
+            or new <= 0
+        ):
+            continue
+        out[material] = float(new) / float(original)
+    return out
+
 
 def make_log_ratio_norm(
     ratio_by_material: dict,
@@ -88,6 +126,7 @@ def make_log_ratio_norm(
         base=10,
     )
 
+
 def set_ratio_colorbar_ticks(cbar, norm):
     """Place readable ratio ticks on a log10-ratio colorbar."""
     max_abs = max(abs(float(norm.vmin)), abs(float(norm.vmax)))
@@ -107,56 +146,97 @@ def set_ratio_colorbar_ticks(cbar, norm):
 # ----------------------------
 # Load data
 # ----------------------------
-with open(JSON_PATH, "r") as f:
-    candidates_by_target = json.load(f)
+candidate_pairs_df = pd.read_csv(CANDIDATES_CSV_PATH)
+error_ratios_df = pd.read_csv(ERROR_RATIOS_CSV_PATH)
 
-original_df = pd.read_csv(ORIGINAL_CSV_PATH)
-new_run_df = pd.read_csv(NEW_RUN_CSV_PATH)
-
-# ORIGINAL_CSV_PATH is the old successful-run CSV used by the original script.
-# It provides the existing candidate outer-ring ratio.
-original_required_cols = {"material", "gemini_to_reference_ratio"}
-missing_original = original_required_cols - set(original_df.columns)
-if missing_original:
+candidate_required_cols = {"target_material", "candidate_material"}
+missing_candidate_cols = candidate_required_cols - set(candidate_pairs_df.columns)
+if missing_candidate_cols:
     raise ValueError(
-        f"Original successful-run CSV missing required columns: {missing_original}"
+        f"Candidate CSV missing required columns: {missing_candidate_cols}. "
+        f"Available columns: {list(candidate_pairs_df.columns)}"
     )
 
-# NEW_RUN_CSV_PATH is the new averaged CSV.
-# It provides the avg_new_run_error_ratio for target-node inner fill colors.
-new_run_required_cols = {"material", "avg_new_run_error_ratio"}
-missing_new_run = new_run_required_cols - set(new_run_df.columns)
-if missing_new_run:
+# The candidate CSV contains blank separator rows. Keep only actual
+# target -> candidate pairs and normalize material names to strings.
+candidate_pairs_df = (
+    candidate_pairs_df[["target_material", "candidate_material"]]
+    .dropna(subset=["target_material", "candidate_material"])
+    .copy()
+)
+candidate_pairs_df["target_material"] = (
+    candidate_pairs_df["target_material"].astype(str).str.strip()
+)
+candidate_pairs_df["candidate_material"] = (
+    candidate_pairs_df["candidate_material"].astype(str).str.strip()
+)
+candidate_pairs_df = candidate_pairs_df[
+    (candidate_pairs_df["target_material"] != "")
+    & (candidate_pairs_df["candidate_material"] != "")
+].drop_duplicates()
+
+
+def first_existing_column(df: pd.DataFrame, candidates: list[str], label: str) -> str:
+    """Return the first matching column name, with a useful error if none exist."""
+    for column in candidates:
+        if column in df.columns:
+            return column
     raise ValueError(
-        f"New-run averages CSV missing required columns: {missing_new_run}"
+        f"Could not find a {label} column in {ERROR_RATIOS_CSV_PATH}. "
+        f"Tried {candidates}. Available columns: {list(df.columns)}"
     )
 
-# Outer candidate ring = original successful-run average ratio from jobs/successful_run_errors.csv.
-# Inner target fill = avg_new_run_error_ratio from the new averaged CSV.
-candidate_ratio_col = "gemini_to_reference_ratio"
-new_run_ratio_col = "avg_new_run_error_ratio"
 
-# Existing output: use the same average-per-material aggregation as before.
-candidate_ratio_mean = material_ratio_dict(original_df, "material", candidate_ratio_col, agg="mean")
-new_run_ratio_mean = material_ratio_dict(new_run_df, "material", new_run_ratio_col, agg="mean")
+if "material" not in error_ratios_df.columns:
+    raise ValueError(
+        f"{ERROR_RATIOS_CSV_PATH} must contain a 'material' column. "
+        f"Available columns: {list(error_ratios_df.columns)}"
+    )
 
-# Added output: use the lower/best error ratio per material instead of averaging.
-candidate_ratio_lower = material_ratio_dict(original_df, "material", candidate_ratio_col, agg="min")
-new_run_ratio_lower = material_ratio_dict(new_run_df, "material", new_run_ratio_col, agg="min")
-
-# Diagnostics/statistics directly from successful_run_errors.csv.
-_successful_valid = (
-    original_df[["material", candidate_ratio_col]]
-    .replace([np.inf, -np.inf], np.nan)
-    .dropna(subset=["material", candidate_ratio_col])
+# Both original-run and new-run ratios come from the same CSV.
+original_run_ratio_col = first_existing_column(
+    error_ratios_df,
+    [
+        "avg_original_run_error_ratio",
+        "original_run_error_ratio",
+        "avg_original_error_ratio",
+        "original_error_ratio",
+        "gemini_to_reference_ratio",
+    ],
+    "original-run error-ratio",
 )
-_successful_valid = _successful_valid[_successful_valid[candidate_ratio_col] > 0]
-successful_run_stats = (
-    _successful_valid
-    .groupby("material")[candidate_ratio_col]
-    .agg(n_runs="count", mean_ratio="mean", best_ratio="min")
-    .sort_index()
+new_run_ratio_col = first_existing_column(
+    error_ratios_df,
+    [
+        "avg_new_run_error_ratio",
+        "new_run_error_ratio",
+        "avg_new_error_ratio",
+        "new_error_ratio",
+    ],
+    "new-run error-ratio",
 )
+
+print(f"Using original-run ratio column: {original_run_ratio_col}")
+print(f"Using new-run ratio column: {new_run_ratio_col}")
+
+# Average per-material values.
+original_ratio_mean = material_ratio_dict(
+    error_ratios_df, "material", original_run_ratio_col, agg="mean"
+)
+new_ratio_mean = material_ratio_dict(
+    error_ratios_df, "material", new_run_ratio_col, agg="mean"
+)
+
+# Best (lowest) per-material values.
+original_ratio_best = material_ratio_dict(
+    error_ratios_df, "material", original_run_ratio_col, agg="min"
+)
+new_ratio_best = material_ratio_dict(
+    error_ratios_df, "material", new_run_ratio_col, agg="min"
+)
+
+average_comparison_ratio = comparison_ratio_dict(original_ratio_mean, new_ratio_mean)
+best_comparison_ratio = comparison_ratio_dict(original_ratio_best, new_ratio_best)
 
 
 # ----------------------------
@@ -164,29 +244,21 @@ successful_run_stats = (
 # ----------------------------
 G = nx.DiGraph()
 
-# JSON keys are target materials.
-target_nodes = set(candidates_by_target.keys())
+target_nodes = set(candidate_pairs_df["target_material"])
+candidate_nodes = set(candidate_pairs_df["candidate_material"])
 
-# JSON list entries are candidate materials.
-candidate_nodes = set()
-
-for target, candidates in candidates_by_target.items():
+for row in candidate_pairs_df.itertuples(index=False):
+    target = row.target_material
+    cand = row.candidate_material
     G.add_node(target)
-    for cand in candidates:
-        candidate_nodes.add(cand)
-        G.add_node(cand)
-        G.add_edge(target, cand)
+    G.add_node(cand)
+    G.add_edge(target, cand)
 
 target_only_nodes = sorted(target_nodes - candidate_nodes)
 candidate_only_nodes = sorted(candidate_nodes - target_nodes)
 target_and_candidate_nodes = sorted(target_nodes & candidate_nodes)
 all_nodes = set(G.nodes)
-
-# IMPORTANT: outer successful-run rings are for EVERY plotted material node.
-# Do not restrict this to candidate nodes. Target-only green nodes also get
-# a successful-run ring if they have rows in successful_run_errors.csv.
 ring_nodes = sorted(all_nodes)
-target_fill_nodes = sorted(target_nodes)
 
 blue_white_red = mpl.colors.LinearSegmentedColormap.from_list(
     "blue_white_red",
@@ -239,7 +311,7 @@ def _node_size_for_clearance(node: str) -> float:
     if node in target_and_candidate_nodes:
         return max(TARGET_AND_CANDIDATE_RING_SIZE, TARGET_BASE_SIZE)
     if node in target_only_nodes:
-        return TARGET_BASE_SIZE
+        return max(TARGET_AND_CANDIDATE_RING_SIZE, TARGET_BASE_SIZE)
     if node in candidate_only_nodes:
         return max(CANDIDATE_ONLY_RING_SIZE, CANDIDATE_ONLY_FILL_SIZE)
     return TARGET_BASE_SIZE
@@ -272,7 +344,6 @@ def _spread_targets(pos: dict, min_dist_frac: float = 0.18, iterations: int = 10
 
     for _ in range(iterations):
         delta = np.zeros_like(coords)
-        max_move = 0.0
         for i in range(len(targets)):
             for j in range(i + 1, len(targets)):
                 diff = coords[j] - coords[i]
@@ -340,7 +411,6 @@ def _initial_radial_candidate_layout(
             v = np.asarray(old_pos[n], dtype=float) - center
             return float(np.arctan2(v[1], v[0])) if np.linalg.norm(v) > 1e-12 else 0.0
 
-        # Stable order from original layout, then name.
         private = sorted(private, key=lambda n: (old_angle(n), n))
 
         idx = 0
@@ -348,7 +418,6 @@ def _initial_radial_candidate_layout(
         while idx < len(private):
             count = min(max_per_ring + 4 * ring, len(private) - idx)
             radius = base_radius + ring * ring_gap
-            # Rotate each ring to avoid spokes lining up when there are many nodes.
             offset = start_angle + ring * np.deg2rad(17.0)
             for k in range(count):
                 theta = offset + 2.0 * np.pi * k / count
@@ -357,8 +426,6 @@ def _initial_radial_candidate_layout(
                 idx += 1
             ring += 1
 
-    # Put shared candidate-only nodes near the centroid of their target parents,
-    # then the force/clearance passes will separate them cleanly.
     for node in sorted(shared):
         parents = [p for p in G.predecessors(node) if p in target_positions]
         if not parents:
@@ -456,16 +523,11 @@ def _straight_edge_clearance_pass(
                 if not (0.10 < t < 0.90):
                     continue
 
-                # Strongest protection for green nodes, but apply to all nodes.
                 multiplier = 1.65 if w in target_nodes else 1.0
                 required = multiplier * radii[w] + gap
                 if dist < required:
                     normal = _unit(p - closest, fallback_angle=rng.uniform(0, 2 * np.pi))
                     push = 0.34 * (required - dist) * normal
-
-                    # Move the blocking node away from the segment, and move
-                    # endpoints slightly the other way. This keeps edges straight
-                    # while opening clearance.
                     delta[iw] += 1.35 * push
                     delta[iu] -= 0.20 * (1.0 - t) * push
                     delta[iv] -= 0.20 * t * push
@@ -485,7 +547,11 @@ def _normalize_layout(pos: dict, target_span: float = 1000.0):
     coords = np.asarray([pos[n] for n in nodes], dtype=float)
     center = coords.mean(axis=0)
     coords -= center
-    span = max(float(coords[:, 0].max() - coords[:, 0].min()), float(coords[:, 1].max() - coords[:, 1].min()), 1.0)
+    span = max(
+        float(coords[:, 0].max() - coords[:, 0].min()),
+        float(coords[:, 1].max() - coords[:, 1].min()),
+        1.0,
+    )
     coords *= target_span / span
     for n, xy in zip(nodes, coords):
         pos[n] = xy
@@ -495,15 +561,10 @@ def _normalize_layout(pos: dict, target_span: float = 1000.0):
 _normalize_layout(pos, target_span=1000.0)
 _spread_targets(pos, min_dist_frac=0.20, iterations=1200)
 _initial_radial_candidate_layout(pos, pos0, base_radius_frac=0.120, ring_gap_frac=0.078, max_per_ring=7)
-
-# The sequence below is intentional: collision -> edge clearance -> collision.
-# The last collision pass is what guarantees nodes do not sit on top of each other.
 _hard_resolve_node_collisions(pos, min_gap_frac=0.021, iterations=3500)
 _straight_edge_clearance_pass(pos, iterations=1200, clearance_gap_frac=0.016)
 _hard_resolve_node_collisions(pos, min_gap_frac=0.024, iterations=4000)
 _normalize_layout(pos, target_span=1000.0)
-
-# NetworkX drawing accepts tuples/lists; keep final positions simple.
 pos = {n: tuple(xy) for n, xy in pos.items()}
 
 
@@ -511,39 +572,30 @@ pos = {n: tuple(xy) for n, xy in pos.items()}
 # Draw
 # ----------------------------
 def draw_graph(
-    candidate_ratio: dict,
-    new_run_ratio: dict,
+    comparison_ratio: dict,
     out_png: Path,
     out_svg: Path | None = None,
     aggregation_label: str = "average",
 ):
-    candidate_norm = make_log_ratio_norm(candidate_ratio, ring_nodes)
-    new_run_norm = make_log_ratio_norm(new_run_ratio, target_fill_nodes)
+    comparison_norm = make_log_ratio_norm(comparison_ratio, ring_nodes)
 
-    def candidate_ring_color(material: str):
-        r = candidate_ratio.get(material)
+    def outer_ring_color(material: str):
+        r = comparison_ratio.get(material)
         if r is None or not np.isfinite(r) or r <= 0:
-            return "#BBBBBB"
-        return blue_white_red(candidate_norm(np.log10(r)))
-
-    def target_fill_color(material: str):
-        r = new_run_ratio.get(material)
-        if r is None or not np.isfinite(r) or r <= 0:
-            return TARGET_GREEN  # fallback: original target green
-        return blue_white_red(new_run_norm(np.log10(r)))
+            return MISSING_RING_COLOR
+        return blue_white_red(comparison_norm(np.log10(r)))
 
     plt.figure(figsize=(22, 16))
     ax = plt.gca()
 
     ax.set_title(
         "Material similarity dependency graph\n"
-        f"Inner fill = {aggregation_label} new-run error ratio, Green outline = target material, "
-        f"Outer ring = {aggregation_label} successful-run ratio",
+        f"Outer ring = {aggregation_label} new-run/original-run error ratio "
+        "(white = no change, blue = better, red = worse)",
         fontsize=15,
         pad=18,
     )
 
-    # Edges: target -> candidate
     nx.draw_networkx_edges(
         G,
         pos,
@@ -554,7 +606,6 @@ def draw_graph(
         edge_color="#666666",
     )
 
-    # Candidate-only fills: white center
     nx.draw_networkx_nodes(
         G,
         pos,
@@ -566,7 +617,6 @@ def draw_graph(
         ax=ax,
     )
 
-    # Target-only green base disks
     nx.draw_networkx_nodes(
         G,
         pos,
@@ -578,7 +628,6 @@ def draw_graph(
         ax=ax,
     )
 
-    # Target-and-candidate green base disks, inside the outer candidate ratio ring
     nx.draw_networkx_nodes(
         G,
         pos,
@@ -590,33 +639,6 @@ def draw_graph(
         ax=ax,
     )
 
-    # Target-only smaller blue/red inner disks for new-run error ratio
-    nx.draw_networkx_nodes(
-        G,
-        pos,
-        nodelist=target_only_nodes,
-        node_color=[target_fill_color(n) for n in target_only_nodes],
-        edgecolors="none",
-        linewidths=0.0,
-        node_size=NEW_RUN_INNER_FILL_SIZE,
-        ax=ax,
-    )
-
-    # Target-and-candidate smaller blue/red inner disks for new-run error ratio
-    nx.draw_networkx_nodes(
-        G,
-        pos,
-        nodelist=target_and_candidate_nodes,
-        node_color=[target_fill_color(n) for n in target_and_candidate_nodes],
-        edgecolors="none",
-        linewidths=0.0,
-        node_size=NEW_RUN_INNER_FILL_SIZE,
-        ax=ax,
-    )
-
-    # Outer successful-run rings for EVERY plotted material node.
-    # This is deliberately drawn AFTER all node fills so green target disks
-    # cannot cover their successful-run ring.
     def outer_ring_size(material: str) -> int:
         if material in target_nodes:
             return TARGET_AND_CANDIDATE_RING_SIZE
@@ -624,14 +646,12 @@ def draw_graph(
 
     outer_ring_sizes = [outer_ring_size(n) for n in ring_nodes]
 
-    # Backing stroke makes ratio ~= 1 rings visible; the actual ratio color
-    # is drawn on top of this. Missing/invalid CSV values are still gray.
     nx.draw_networkx_nodes(
         G,
         pos,
         nodelist=ring_nodes,
         node_color="none",
-        edgecolors="#777777",
+        edgecolors=RING_BACKING_COLOR,
         linewidths=RATIO_RING_LINEWIDTH + 1.2,
         node_size=[s + 90 for s in outer_ring_sizes],
         ax=ax,
@@ -642,13 +662,12 @@ def draw_graph(
         pos,
         nodelist=ring_nodes,
         node_color="none",
-        edgecolors=[candidate_ring_color(n) for n in ring_nodes],
+        edgecolors=[outer_ring_color(n) for n in ring_nodes],
         linewidths=RATIO_RING_LINEWIDTH,
         node_size=outer_ring_sizes,
         ax=ax,
     )
 
-    # Labels
     nx.draw_networkx_labels(
         G,
         pos,
@@ -657,37 +676,26 @@ def draw_graph(
         ax=ax,
     )
 
-    # Candidate/original-run outer-ring colorbar
-    candidate_sm = mpl.cm.ScalarMappable(norm=candidate_norm, cmap=blue_white_red)
-    candidate_sm.set_array([])
+    comparison_sm = mpl.cm.ScalarMappable(norm=comparison_norm, cmap=blue_white_red)
+    comparison_sm.set_array([])
 
-    candidate_cbar = plt.colorbar(candidate_sm, ax=ax, shrink=0.72, pad=0.01)
-    set_ratio_colorbar_ticks(candidate_cbar, candidate_norm)
-    candidate_cbar.set_label(
-        f"Outer ring: {aggregation_label} gemini_to_reference_ratio from successful_run_errors.csv",
+    comparison_cbar = plt.colorbar(comparison_sm, ax=ax, shrink=0.72, pad=0.02)
+    set_ratio_colorbar_ticks(comparison_cbar, comparison_norm)
+    comparison_cbar.set_label(
+        f"Outer ring: {aggregation_label} new-run/original-run error ratio "
+        "(1 = same, <1 = better, >1 = worse)",
         fontsize=11,
     )
 
-    # New-run inner-fill colorbar
-    new_run_sm = mpl.cm.ScalarMappable(norm=new_run_norm, cmap=blue_white_red)
-    new_run_sm.set_array([])
-
-    new_run_cbar = plt.colorbar(new_run_sm, ax=ax, shrink=0.72, pad=0.075)
-    set_ratio_colorbar_ticks(new_run_cbar, new_run_norm)
-    new_run_cbar.set_label(
-        f"Inner fill: {aggregation_label} new-run error ratio for target materials",
-        fontsize=11,
-    )
-
-    target_new_run_patch = mpl.lines.Line2D(
+    target_patch = mpl.lines.Line2D(
         [0], [0],
         marker="o",
         color="w",
-        markerfacecolor="#FCAE91",
-        markeredgecolor=TARGET_GREEN,
-        markeredgewidth=2,
+        markerfacecolor=TARGET_GREEN,
+        markeredgecolor="#99000D",
+        markeredgewidth=3,
         markersize=13,
-        label=f"Target material: green disk; smaller center colored by {aggregation_label} new-run error ratio",
+        label="Target material: green fill, outer ring colored by new-vs-original difference",
     )
 
     candidate_patch = mpl.lines.Line2D(
@@ -698,50 +706,33 @@ def draw_graph(
         markeredgecolor="#99000D",
         markeredgewidth=3,
         markersize=13,
-        label=f"Candidate-only material: outer ring colored by {aggregation_label} successful-run ratio",
+        label="Candidate-only material: white fill, outer ring colored by new-vs-original difference",
     )
 
     both_patch = mpl.lines.Line2D(
         [0], [0],
         marker="o",
         color="w",
-        markerfacecolor="#FCAE91",
+        markerfacecolor=TARGET_GREEN,
         markeredgecolor="#99000D",
         markeredgewidth=3,
         markersize=13,
-        label=f"Target + candidate: green disk; smaller center = {aggregation_label} new-run ratio; outer ring = {aggregation_label} successful-run ratio",
+        label="Target + candidate: green fill, outer ring colored by new-vs-original difference",
     )
 
-    missing_new_run_patch = mpl.lines.Line2D(
-        [0], [0],
-        marker="o",
-        color="w",
-        markerfacecolor=TARGET_GREEN,
-        markeredgecolor=TARGET_GREEN,
-        markeredgewidth=2,
-        markersize=13,
-        label="Target with no valid new-run ratio: all green fill",
-    )
-
-    unknown_candidate_patch = mpl.lines.Line2D(
+    unknown_patch = mpl.lines.Line2D(
         [0], [0],
         marker="o",
         color="w",
         markerfacecolor="#FFFFFF",
-        markeredgecolor="#BBBBBB",
+        markeredgecolor=MISSING_RING_COLOR,
         markeredgewidth=3,
         markersize=13,
-        label="Candidate with no valid successful-run ratio: gray outer ring",
+        label="No valid original/new comparison available: gray outer ring",
     )
 
     ax.legend(
-        handles=[
-            target_new_run_patch,
-            candidate_patch,
-            both_patch,
-            missing_new_run_patch,
-            unknown_candidate_patch,
-        ],
+        handles=[target_patch, candidate_patch, both_patch, unknown_patch],
         loc="upper left",
         frameon=True,
     )
@@ -760,88 +751,60 @@ def draw_graph(
     if out_svg is not None:
         print(f"Saved: {out_svg.resolve()}")
     print(f"Nodes: {G.number_of_nodes()}, edges: {G.number_of_edges()}")
-    print(f"Target-only nodes with new-run fill where available: {len(target_only_nodes)}")
-    print(f"White candidate-only nodes with successful-run outer ring: {len(candidate_only_nodes)}")
-    print(f"Target-and-candidate nodes with new-run fill and successful-run outer ring: {len(target_and_candidate_nodes)}")
-    print(f"All plotted material nodes expected to have outer ratio ring: {len(ring_nodes)}")
-    valid_ring_nodes = [m for m in ring_nodes if m in candidate_ratio and np.isfinite(candidate_ratio[m]) and candidate_ratio[m] > 0]
-    missing_ring_nodes = [m for m in ring_nodes if m not in candidate_ratio or not np.isfinite(candidate_ratio.get(m, np.nan)) or candidate_ratio.get(m, np.nan) <= 0]
-    target_valid_ring_nodes = [m for m in target_fill_nodes if m in candidate_ratio and np.isfinite(candidate_ratio[m]) and candidate_ratio[m] > 0]
-    target_missing_ring_nodes = [m for m in target_fill_nodes if m not in candidate_ratio or not np.isfinite(candidate_ratio.get(m, np.nan)) or candidate_ratio.get(m, np.nan) <= 0]
-    print(f"Plotted material nodes with valid successful-run ratio: {len(valid_ring_nodes)} / {len(ring_nodes)}")
-    print(f"Target/green nodes with valid successful-run ratio: {len(target_valid_ring_nodes)} / {len(target_fill_nodes)}")
-    if target_missing_ring_nodes:
-        print("Target/green nodes MISSING successful-run ratio in CSV:", ", ".join(target_missing_ring_nodes))
-    print(f"Target nodes expected to have new-run fill if present in CSV: {len(target_fill_nodes)}")
+    print(f"Target-only nodes: {len(target_only_nodes)}")
+    print(f"Candidate-only nodes: {len(candidate_only_nodes)}")
+    print(f"Target-and-candidate nodes: {len(target_and_candidate_nodes)}")
 
-    print("\nSuccessful-run stats for target/green nodes from successful_run_errors.csv:")
-    for material in target_fill_nodes:
-        if material in successful_run_stats.index:
-            row = successful_run_stats.loc[material]
-            print(
-                f"{material:20s} n_runs={int(row['n_runs']):3d}, "
-                f"mean={row['mean_ratio']:.6g}, best={row['best_ratio']:.6g}"
-            )
-        else:
-            print(f"{material:20s} MISSING from successful_run_errors.csv")
+    valid_ring_nodes = [
+        m for m in ring_nodes
+        if m in comparison_ratio and np.isfinite(comparison_ratio[m]) and comparison_ratio[m] > 0
+    ]
+    missing_ring_nodes = [
+        m for m in ring_nodes
+        if m not in comparison_ratio or not np.isfinite(comparison_ratio.get(m, np.nan)) or comparison_ratio.get(m, np.nan) <= 0
+    ]
+    print(f"Nodes with valid {aggregation_label} comparison ratio: {len(valid_ring_nodes)} / {len(ring_nodes)}")
+    if missing_ring_nodes:
+        print(
+            f"Nodes missing valid {aggregation_label} comparison ratio: "
+            + ", ".join(missing_ring_nodes)
+        )
 
-    print(f"\nLowest {aggregation_label} successful-run ratios among ring nodes:")
-    valid_candidate_ratios = [
-        (m, candidate_ratio[m])
+    valid_comparison_ratios = [
+        (m, comparison_ratio[m])
         for m in ring_nodes
-        if m in candidate_ratio and np.isfinite(candidate_ratio[m]) and candidate_ratio[m] > 0
+        if m in comparison_ratio and np.isfinite(comparison_ratio[m]) and comparison_ratio[m] > 0
     ]
-    for material, ratio in sorted(valid_candidate_ratios, key=lambda x: x[1])[:15]:
+
+    print(f"\nMost improved materials by {aggregation_label} comparison ratio (new/original < 1):")
+    for material, ratio in sorted(valid_comparison_ratios, key=lambda x: x[1])[:15]:
         print(
-            f"{material:20s} ratio={ratio:.6g}, "
+            f"{material:20s} new/original={ratio:.6g}, "
             f"log10={np.log10(ratio): .3f}, "
-            f"color={mpl.colors.to_hex(candidate_ring_color(material))}"
+            f"color={mpl.colors.to_hex(outer_ring_color(material))}"
         )
 
-    print(f"\nHighest {aggregation_label} successful-run ratios among ring nodes:")
-    for material, ratio in sorted(valid_candidate_ratios, key=lambda x: x[1], reverse=True)[:15]:
+    print(f"\nMost worsened materials by {aggregation_label} comparison ratio (new/original > 1):")
+    for material, ratio in sorted(valid_comparison_ratios, key=lambda x: x[1], reverse=True)[:15]:
         print(
-            f"{material:20s} ratio={ratio:.6g}, "
+            f"{material:20s} new/original={ratio:.6g}, "
             f"log10={np.log10(ratio): .3f}, "
-            f"color={mpl.colors.to_hex(candidate_ring_color(material))}"
-        )
-
-    print(f"\nLowest {aggregation_label} new-run ratios among target nodes:")
-    valid_new_run_ratios = [
-        (m, new_run_ratio[m])
-        for m in target_fill_nodes
-        if m in new_run_ratio and np.isfinite(new_run_ratio[m]) and new_run_ratio[m] > 0
-    ]
-    for material, ratio in sorted(valid_new_run_ratios, key=lambda x: x[1])[:15]:
-        print(
-            f"{material:20s} ratio={ratio:.6g}, "
-            f"log10={np.log10(ratio): .3f}, "
-            f"color={mpl.colors.to_hex(target_fill_color(material))}"
-        )
-
-    print(f"\nHighest {aggregation_label} new-run ratios among target nodes:")
-    for material, ratio in sorted(valid_new_run_ratios, key=lambda x: x[1], reverse=True)[:15]:
-        print(
-            f"{material:20s} ratio={ratio:.6g}, "
-            f"log10={np.log10(ratio): .3f}, "
-            f"color={mpl.colors.to_hex(target_fill_color(material))}"
+            f"color={mpl.colors.to_hex(outer_ring_color(material))}"
         )
 
 
-# Existing output, unchanged: average per material.
+# Average comparison graph.
 draw_graph(
-    candidate_ratio=candidate_ratio_mean,
-    new_run_ratio=new_run_ratio_mean,
+    comparison_ratio=average_comparison_ratio,
     out_png=OUT_PNG,
     out_svg=OUT_SVG,
     aggregation_label="average",
 )
 
-# New output: lower/best ratio per material instead of average.
+# Best/lower comparison graph.
 draw_graph(
-    candidate_ratio=candidate_ratio_lower,
-    new_run_ratio=new_run_ratio_lower,
+    comparison_ratio=best_comparison_ratio,
     out_png=LOWER_OUT_PNG,
     out_svg=None,
-    aggregation_label="lower",
+    aggregation_label="best",
 )
