@@ -1,13 +1,18 @@
 from pathlib import Path
+import json
+import re
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 import networkx as nx
 
-CANDIDATES_CSV_PATH = Path(
-    "/home/jiasheng/WannierisationBenchmarking/include_only_candidates.csv"
-)
+ROOT = Path("/home/jiasheng/WannierisationBenchmarking")
+
+CANDIDATES_CSV_PATH = ROOT / "include_only_candidates.csv"
+CANDIDATE_RUNS_DIR = ROOT / "jobsDeepseekProTerminus2Controlled"
+REFERENCE_ERROR_CSV = ROOT / "jobs" / "successful_run_errors.csv"
 ERROR_RATIOS_CSV_PATH = Path(
     "/home/jiasheng/WannierisationBenchmarking/jobsGeminiReviewsDeepseek/"
     "ChemSimReruns/all_error_ratios_by_material.csv"
@@ -34,6 +39,15 @@ TARGET_AND_CANDIDATE_RING_SIZE = 1160
 RATIO_RING_LINEWIDTH = 2.8
 MISSING_RING_COLOR = "#BBBBBB"
 RING_BACKING_COLOR = "#777777"
+CANDIDATE_MISSING_RING_COLOR = MISSING_RING_COLOR
+
+# Candidate-only rings use a separate sequential purple scale:
+# light purple = lower average candidate/reference error ratio,
+# dark purple = higher average candidate/reference error ratio.
+CANDIDATE_PURPLE = mpl.colors.LinearSegmentedColormap.from_list(
+    "candidate_error_purple",
+    ["#F2E8F7", "#D8B4E2", "#A45DB5", "#6A1B7B", "#2D063A"],
+)
 
 
 def material_ratio_dict(
@@ -143,6 +157,243 @@ def set_ratio_colorbar_ticks(cbar, norm):
     cbar.set_ticklabels([f"{10 ** t:.3g}" for t in tick_logs])
 
 
+def make_positive_log_norm(
+    ratio_by_material: dict,
+    materials,
+    low_percentile: float = 5,
+    high_percentile: float = 95,
+) -> mpl.colors.LogNorm:
+    """Return a robust log norm for positive candidate/reference error ratios."""
+    values = np.array([
+        float(ratio_by_material[m])
+        for m in materials
+        if (
+            m in ratio_by_material
+            and np.isfinite(ratio_by_material[m])
+            and ratio_by_material[m] > 0
+        )
+    ])
+
+    if len(values) == 0:
+        return mpl.colors.LogNorm(vmin=0.1, vmax=10.0, clip=True)
+
+    vmin = float(np.nanpercentile(values, low_percentile))
+    vmax = float(np.nanpercentile(values, high_percentile))
+    vmin = max(vmin, np.finfo(float).tiny)
+
+    if not np.isfinite(vmax) or vmax <= vmin:
+        center = float(np.nanmedian(values))
+        center = max(center, np.finfo(float).tiny)
+        vmin = center / 1.5
+        vmax = center * 1.5
+
+    return mpl.colors.LogNorm(vmin=vmin, vmax=vmax, clip=True)
+
+
+def set_positive_ratio_colorbar_ticks(cbar, norm):
+    """Place compact geometric ticks on a positive log-ratio colorbar."""
+    ticks = list(np.geomspace(float(norm.vmin), float(norm.vmax), 5))
+    if float(norm.vmin) < 1.0 < float(norm.vmax):
+        ticks.append(1.0)
+    ticks = sorted(set(float(t) for t in ticks))
+    cbar.set_ticks(ticks)
+    cbar.set_ticklabels([f"{t:.3g}" for t in ticks])
+
+
+def _normalize_material_token(value: str) -> str:
+    """Normalize a material/path token for tolerant path matching."""
+    return re.sub(r"[^a-z0-9]+", "", str(value).strip().lower())
+
+
+def _recursive_find_numeric_key(obj, wanted_key: str):
+    """Find the first finite numeric value for wanted_key in nested JSON."""
+    if isinstance(obj, dict):
+        if wanted_key in obj:
+            try:
+                value = float(obj[wanted_key])
+                if np.isfinite(value):
+                    return value
+            except (TypeError, ValueError):
+                pass
+        for value in obj.values():
+            found = _recursive_find_numeric_key(value, wanted_key)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for value in obj:
+            found = _recursive_find_numeric_key(value, wanted_key)
+            if found is not None:
+                return found
+    return None
+
+
+def _recursive_find_material_value(obj):
+    """Try common material-name keys in nested diagnostics JSON."""
+    keys = {
+        "material",
+        "material_id",
+        "material_name",
+        "candidate_material",
+        "formula",
+        "chemical_formula",
+    }
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if key in keys and isinstance(value, (str, int, float)):
+                return str(value).strip()
+        for value in obj.values():
+            found = _recursive_find_material_value(value)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for value in obj:
+            found = _recursive_find_material_value(value)
+            if found:
+                return found
+    return None
+
+
+def _match_known_material(raw_value: str | None, known_materials: set[str]) -> str | None:
+    """Match a raw material string to a graph material using normalized tokens."""
+    if not raw_value:
+        return None
+
+    normalized_lookup = {
+        _normalize_material_token(material): material
+        for material in known_materials
+    }
+    raw_norm = _normalize_material_token(raw_value)
+
+    if raw_norm in normalized_lookup:
+        return normalized_lookup[raw_norm]
+
+    # Prefer the longest match to avoid short formulas matching inside longer ones.
+    matches = [
+        (len(norm), material)
+        for norm, material in normalized_lookup.items()
+        if norm and norm in raw_norm
+    ]
+    if matches:
+        return max(matches)[1]
+    return None
+
+
+def _infer_material_for_diagnostics(
+    diagnostics_path: Path,
+    diagnostics_data,
+    known_materials: set[str],
+) -> str | None:
+    """Infer the candidate material from JSON metadata first, then from its path."""
+    from_json = _recursive_find_material_value(diagnostics_data)
+    matched = _match_known_material(from_json, known_materials)
+    if matched:
+        return matched
+
+    try:
+        relative_text = str(diagnostics_path.relative_to(CANDIDATE_RUNS_DIR).parent)
+    except ValueError:
+        relative_text = str(diagnostics_path.parent)
+    return _match_known_material(relative_text, known_materials)
+
+
+def load_candidate_average_error_ratios(
+    candidate_materials: set[str],
+) -> tuple[dict[str, float], pd.DataFrame]:
+    """
+    Load every candidate diagnostics.json, compute rmse_eV/reference_error for
+    its material, then average those run-level ratios per candidate material.
+    """
+    if not REFERENCE_ERROR_CSV.exists():
+        raise FileNotFoundError(f"Reference error CSV not found: {REFERENCE_ERROR_CSV}")
+    if not CANDIDATE_RUNS_DIR.exists():
+        raise FileNotFoundError(f"Candidate run directory not found: {CANDIDATE_RUNS_DIR}")
+
+    reference_df = pd.read_csv(REFERENCE_ERROR_CSV)
+    reference_material_col = first_existing_column(
+        reference_df,
+        [
+            "material",
+            "material_id",
+            "material_name",
+            "candidate_material",
+            "formula",
+        ],
+        "reference material",
+        path_for_error=REFERENCE_ERROR_CSV,
+    )
+    reference_error_col = first_existing_column(
+        reference_df,
+        [
+            "rmse_eV",
+            "reference_rmse_eV",
+            "reference_error_eV",
+            "reference_error",
+            "rmse",
+        ],
+        "reference rmse/error",
+        path_for_error=REFERENCE_ERROR_CSV,
+    )
+
+    reference_df = reference_df[[reference_material_col, reference_error_col]].copy()
+    reference_df[reference_material_col] = reference_df[reference_material_col].astype(str).str.strip()
+    reference_df[reference_error_col] = pd.to_numeric(reference_df[reference_error_col], errors="coerce")
+    reference_df = reference_df.replace([np.inf, -np.inf], np.nan).dropna()
+    reference_df = reference_df[reference_df[reference_error_col] > 0]
+
+    reference_error_by_material = (
+        reference_df.groupby(reference_material_col)[reference_error_col].mean().to_dict()
+    )
+    reference_error_by_normalized = {
+        _normalize_material_token(material): float(error)
+        for material, error in reference_error_by_material.items()
+    }
+
+    records = []
+    diagnostics_paths = sorted(CANDIDATE_RUNS_DIR.rglob("diagnostics.json"))
+    for diagnostics_path in diagnostics_paths:
+        try:
+            diagnostics_data = json.loads(diagnostics_path.read_text())
+        except Exception as exc:
+            print(f"WARNING: could not read {diagnostics_path}: {exc}")
+            continue
+
+        model_rmse = _recursive_find_numeric_key(diagnostics_data, "rmse_eV")
+        if model_rmse is None or not np.isfinite(model_rmse) or model_rmse <= 0:
+            print(f"WARNING: no valid rmse_eV in {diagnostics_path}")
+            continue
+
+        material = _infer_material_for_diagnostics(
+            diagnostics_path,
+            diagnostics_data,
+            candidate_materials,
+        )
+        if material is None:
+            print(f"WARNING: could not infer candidate material for {diagnostics_path}")
+            continue
+
+        reference_error = reference_error_by_normalized.get(_normalize_material_token(material))
+        if reference_error is None or not np.isfinite(reference_error) or reference_error <= 0:
+            print(f"WARNING: no valid reference error for candidate material {material}")
+            continue
+
+        records.append({
+            "material": material,
+            "diagnostics_path": str(diagnostics_path),
+            "model_rmse_eV": float(model_rmse),
+            "reference_rmse_eV": float(reference_error),
+            "candidate_error_ratio": float(model_rmse) / float(reference_error),
+        })
+
+    runs_df = pd.DataFrame.from_records(records)
+    if runs_df.empty:
+        return {}, runs_df
+
+    average_ratio_by_material = (
+        runs_df.groupby("material")["candidate_error_ratio"].mean().to_dict()
+    )
+    return average_ratio_by_material, runs_df
+
+
 # ----------------------------
 # Load data
 # ----------------------------
@@ -176,13 +427,18 @@ candidate_pairs_df = candidate_pairs_df[
 ].drop_duplicates()
 
 
-def first_existing_column(df: pd.DataFrame, candidates: list[str], label: str) -> str:
+def first_existing_column(
+    df: pd.DataFrame,
+    candidates: list[str],
+    label: str,
+    path_for_error: Path = ERROR_RATIOS_CSV_PATH,
+) -> str:
     """Return the first matching column name, with a useful error if none exist."""
     for column in candidates:
         if column in df.columns:
             return column
     raise ValueError(
-        f"Could not find a {label} column in {ERROR_RATIOS_CSV_PATH}. "
+        f"Could not find a {label} column in {path_for_error}. "
         f"Tried {candidates}. Available columns: {list(df.columns)}"
     )
 
@@ -259,6 +515,17 @@ candidate_only_nodes = sorted(candidate_nodes - target_nodes)
 target_and_candidate_nodes = sorted(target_nodes & candidate_nodes)
 all_nodes = set(G.nodes)
 ring_nodes = sorted(all_nodes)
+comparison_ring_nodes = sorted(target_nodes)
+candidate_ratio_ring_nodes = candidate_only_nodes
+
+candidate_average_error_ratio, candidate_run_ratios_df = load_candidate_average_error_ratios(
+    set(candidate_only_nodes)
+)
+print(
+    f"Loaded candidate/reference error ratios for "
+    f"{len(candidate_average_error_ratio)} / {len(candidate_only_nodes)} candidate-only materials "
+    f"from {len(candidate_run_ratios_df)} diagnostics files."
+)
 
 blue_white_red = mpl.colors.LinearSegmentedColormap.from_list(
     "blue_white_red",
@@ -577,7 +844,11 @@ def draw_graph(
     out_svg: Path | None = None,
     aggregation_label: str = "average",
 ):
-    comparison_norm = make_log_ratio_norm(comparison_ratio, ring_nodes)
+    comparison_norm = make_log_ratio_norm(comparison_ratio, comparison_ring_nodes)
+    candidate_ratio_norm = make_positive_log_norm(
+        candidate_average_error_ratio,
+        candidate_ratio_ring_nodes,
+    )
 
     def outer_ring_color(material: str):
         r = comparison_ratio.get(material)
@@ -585,13 +856,20 @@ def draw_graph(
             return MISSING_RING_COLOR
         return blue_white_red(comparison_norm(np.log10(r)))
 
-    plt.figure(figsize=(22, 16))
-    ax = plt.gca()
+    def candidate_outer_ring_color(material: str):
+        r = candidate_average_error_ratio.get(material)
+        if r is None or not np.isfinite(r) or r <= 0:
+            return CANDIDATE_MISSING_RING_COLOR
+        return CANDIDATE_PURPLE(candidate_ratio_norm(r))
+
+    fig, ax = plt.subplots(figsize=(22, 16))
 
     ax.set_title(
         "Material similarity dependency graph\n"
-        f"Outer ring = {aggregation_label} new-run/original-run error ratio "
-        "(white = no change, blue = better, red = worse)",
+        f"Green-node outer ring = {aggregation_label} new-run/original-run ratio "
+        "(blue = better, white = same, red = worse); "
+        "white candidate-node outer ring = average candidate/reference error ratio "
+        "(light purple = lower, dark purple = higher)",
         fontsize=15,
         pad=18,
     )
@@ -660,11 +938,22 @@ def draw_graph(
     nx.draw_networkx_nodes(
         G,
         pos,
-        nodelist=ring_nodes,
+        nodelist=comparison_ring_nodes,
         node_color="none",
-        edgecolors=[outer_ring_color(n) for n in ring_nodes],
+        edgecolors=[outer_ring_color(n) for n in comparison_ring_nodes],
         linewidths=RATIO_RING_LINEWIDTH,
-        node_size=outer_ring_sizes,
+        node_size=[outer_ring_size(n) for n in comparison_ring_nodes],
+        ax=ax,
+    )
+
+    nx.draw_networkx_nodes(
+        G,
+        pos,
+        nodelist=candidate_ratio_ring_nodes,
+        node_color="none",
+        edgecolors=[candidate_outer_ring_color(n) for n in candidate_ratio_ring_nodes],
+        linewidths=RATIO_RING_LINEWIDTH,
+        node_size=[outer_ring_size(n) for n in candidate_ratio_ring_nodes],
         ax=ax,
     )
 
@@ -679,11 +968,21 @@ def draw_graph(
     comparison_sm = mpl.cm.ScalarMappable(norm=comparison_norm, cmap=blue_white_red)
     comparison_sm.set_array([])
 
-    comparison_cbar = plt.colorbar(comparison_sm, ax=ax, shrink=0.72, pad=0.02)
+    comparison_cbar = fig.colorbar(comparison_sm, ax=ax, shrink=0.72, pad=0.02)
     set_ratio_colorbar_ticks(comparison_cbar, comparison_norm)
     comparison_cbar.set_label(
-        f"Outer ring: {aggregation_label} new-run/original-run error ratio "
+        f"Green-node outer ring: {aggregation_label} new-run/original-run error ratio "
         "(1 = same, <1 = better, >1 = worse)",
+        fontsize=11,
+    )
+
+    candidate_sm = mpl.cm.ScalarMappable(norm=candidate_ratio_norm, cmap=CANDIDATE_PURPLE)
+    candidate_sm.set_array([])
+    candidate_cbar = fig.colorbar(candidate_sm, ax=ax, shrink=0.72, pad=0.08)
+    set_positive_ratio_colorbar_ticks(candidate_cbar, candidate_ratio_norm)
+    candidate_cbar.set_label(
+        "White candidate-node outer ring: average candidate-run/reference error ratio "
+        "(light purple = lower, dark purple = higher)",
         fontsize=11,
     )
 
@@ -695,7 +994,7 @@ def draw_graph(
         markeredgecolor="#99000D",
         markeredgewidth=3,
         markersize=13,
-        label="Target material: green fill, outer ring colored by new-vs-original difference",
+        label="Target material: green fill, blue-white-red ring = new-vs-original difference",
     )
 
     candidate_patch = mpl.lines.Line2D(
@@ -703,10 +1002,10 @@ def draw_graph(
         marker="o",
         color="w",
         markerfacecolor="#FFFFFF",
-        markeredgecolor="#99000D",
+        markeredgecolor="#6A1B7B",
         markeredgewidth=3,
         markersize=13,
-        label="Candidate-only material: white fill, outer ring colored by new-vs-original difference",
+        label="Candidate-only material: white fill, purple ring = average candidate/reference error ratio",
     )
 
     both_patch = mpl.lines.Line2D(
@@ -717,7 +1016,7 @@ def draw_graph(
         markeredgecolor="#99000D",
         markeredgewidth=3,
         markersize=13,
-        label="Target + candidate: green fill, outer ring colored by new-vs-original difference",
+        label="Target + candidate: green fill, blue-white-red ring = new-vs-original difference",
     )
 
     unknown_patch = mpl.lines.Line2D(
@@ -728,7 +1027,7 @@ def draw_graph(
         markeredgecolor=MISSING_RING_COLOR,
         markeredgewidth=3,
         markersize=13,
-        label="No valid original/new comparison available: gray outer ring",
+        label="No valid ring metric available: gray outer ring",
     )
 
     ax.legend(
@@ -756,14 +1055,14 @@ def draw_graph(
     print(f"Target-and-candidate nodes: {len(target_and_candidate_nodes)}")
 
     valid_ring_nodes = [
-        m for m in ring_nodes
+        m for m in comparison_ring_nodes
         if m in comparison_ratio and np.isfinite(comparison_ratio[m]) and comparison_ratio[m] > 0
     ]
     missing_ring_nodes = [
-        m for m in ring_nodes
+        m for m in comparison_ring_nodes
         if m not in comparison_ratio or not np.isfinite(comparison_ratio.get(m, np.nan)) or comparison_ratio.get(m, np.nan) <= 0
     ]
-    print(f"Nodes with valid {aggregation_label} comparison ratio: {len(valid_ring_nodes)} / {len(ring_nodes)}")
+    print(f"Nodes with valid {aggregation_label} comparison ratio: {len(valid_ring_nodes)} / {len(comparison_ring_nodes)}")
     if missing_ring_nodes:
         print(
             f"Nodes missing valid {aggregation_label} comparison ratio: "
@@ -772,9 +1071,51 @@ def draw_graph(
 
     valid_comparison_ratios = [
         (m, comparison_ratio[m])
-        for m in ring_nodes
+        for m in comparison_ring_nodes
         if m in comparison_ratio and np.isfinite(comparison_ratio[m]) and comparison_ratio[m] > 0
     ]
+
+    valid_candidate_ratios = [
+        (m, candidate_average_error_ratio[m])
+        for m in candidate_ratio_ring_nodes
+        if (
+            m in candidate_average_error_ratio
+            and np.isfinite(candidate_average_error_ratio[m])
+            and candidate_average_error_ratio[m] > 0
+        )
+    ]
+    missing_candidate_ratios = [
+        m for m in candidate_ratio_ring_nodes
+        if (
+            m not in candidate_average_error_ratio
+            or not np.isfinite(candidate_average_error_ratio.get(m, np.nan))
+            or candidate_average_error_ratio.get(m, np.nan) <= 0
+        )
+    ]
+    print(
+        f"Candidate-only nodes with valid average candidate/reference ratio: "
+        f"{len(valid_candidate_ratios)} / {len(candidate_ratio_ring_nodes)}"
+    )
+    if missing_candidate_ratios:
+        print(
+            "Candidate-only nodes missing valid candidate/reference ratio: "
+            + ", ".join(missing_candidate_ratios)
+        )
+
+    if valid_candidate_ratios:
+        print("\nLowest average candidate/reference error ratios:")
+        for material, ratio in sorted(valid_candidate_ratios, key=lambda x: x[1])[:15]:
+            print(
+                f"{material:20s} candidate/reference={ratio:.6g}, "
+                f"color={mpl.colors.to_hex(candidate_outer_ring_color(material))}"
+            )
+
+        print("\nHighest average candidate/reference error ratios:")
+        for material, ratio in sorted(valid_candidate_ratios, key=lambda x: x[1], reverse=True)[:15]:
+            print(
+                f"{material:20s} candidate/reference={ratio:.6g}, "
+                f"color={mpl.colors.to_hex(candidate_outer_ring_color(material))}"
+            )
 
     print(f"\nMost improved materials by {aggregation_label} comparison ratio (new/original < 1):")
     for material, ratio in sorted(valid_comparison_ratios, key=lambda x: x[1])[:15]:
