@@ -1,0 +1,151 @@
+target_material,candidate_material,original_rank,tier,recommended_use,heuristic_transfer_score_0_100,best_use,main_caveat,selection_note,shared_elements,chemistry_score_0_1,electronic_score_0_1,scale_score_0_1,structure_score_0_1,target_num_wann,candidate_num_wann,target_num_bands,candidate_num_bands,target_num_atoms,candidate_num_atoms,target_bands_crossing_ef,candidate_bands_crossing_ef,target_boundary_crowding_fraction_0p25,candidate_boundary_crowding_fraction_0p25
+Al18Co4,Al12Ni4,1,A,include,84.9,direct Al-rich late-3d projection and Fermi-crowding analogue,"Exact windows, projection counts, and final status still must be re-derived for the target.",shared elements Al; strongest match: Fermi density,Al,0.904,0.679,0.709,0.923,124,100,183,162,22,16,2,4,0.677596,0.459716
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+Al4Mn2O8,Al4O8Zn2,1,A,include,87.5,near-isostructural workflow and O/Al projection analogue,Zn d10 cannot teach Mn open-shell d projections or magnetic sensitivity.,shared elements Al O; strongest match: size/num_wann,Al O,0.923,0.542,0.922,0.991,74,74,135,150,14,14,3,0,0.392308,0.384615
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+Al4O8Zn2,Al4Mn2O8,1,A,include,87.5,strong direct or complementary chemistry/structure analogue,Mn open-shell d states can make its windows much more complex than Zn d10.,shared elements Al O; strongest match: size/num_wann,Al O,0.923,0.542,0.922,0.991,74,74,150,135,14,14,0,3,0.384615,0.392308
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+Al4Sc2,Al4Y2,1,A,include,88.7,same-stoichiometry group-3 direct analogue,"Exact windows, projection counts, and final status still must be re-derived for the target.",shared elements Al; strongest match: Fermi density,Al,1,0.769,0.786,0.747,36,42,51,51,6,6,4,3,0.239437,0.185185
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+Al4Sc2,Al8Zr4,4,A,include,82,same-stoichiometry early-d bracket,different model scale,shared elements Al; strongest match: Fermi density,Al,0.97,0.593,0.449,0.801,36,84,51,108,6,12,4,3,0.239437,0.489362
+,,,,,,,,,,,,,,,,,,,,,,,
+Al8Zr4,Al4Y2,2,A,include,82,"same Al2M structure, group-3 bracket","Exact windows, projection counts, and final status still must be re-derived for the target.",shared elements Al; strongest match: Fermi density,Al,0.984,0.654,0.572,0.661,84,42,108,51,12,6,3,3,0.489362,0.185185
+Al8Zr4,Al4Sc2,3,A,include,82,same Al2M structure/chemistry direct analogue,different model scale,shared elements Al; strongest match: Fermi density,Al,0.97,0.593,0.449,0.801,84,36,108,51,12,6,3,4,0.489362,0.239437
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+Au2Sc,Au2Y,1,A,include,92.7,same Au and group-3 substitution,"Exact windows, projection counts, and final status still must be re-derived for the target.",shared elements Au; strongest match: Fermi density,Au,1,0.751,0.858,0.9,30,33,73,73,3,3,1,1,0.197842,0.102273
+Au2Sc,Ag2Sc,2,A,include,96,same Sc and coinage-metal substitution,Ag underrepresents Au relativistic/SOC effects.,shared elements Sc; strongest match: size/num_wann,Sc,1,0.799,1,0.972,30,30,73,73,3,3,1,1,0.197842,0.134545
+,,,,,,,,,,,,,,,,,,,,,,,
+Au2Sc,Ag2Y,4,A,include,93.1,strong direct or complementary chemistry/structure analogue,"Exact windows, projection counts, and final status still must be re-derived for the target.",matched valence/block family; strongest match: Fermi density,,0.983,0.794,0.858,0.879,30,33,73,73,3,3,1,1,0.197842,0.265152
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+B2Cr,B2Mn,1,A,include,89.4,"same diboride, adjacent 3d filling",Mn magnetism/open-shell behavior can dominate the report.,shared elements B; strongest match: Fermi density,B,0.984,0.844,0.79,0.69,18,21,30,31,3,3,4,3,0.0651042,0.0785124
+,,,,,,,,,,,,,,,,,,,,,,,
+B2Cr,B2Ta,3,A,include,82,"same diboride, nearby d filling with 5d delocalization","Exact windows, projection counts, and final status still must be re-derived for the target.",shared elements B; strongest match: size/num_wann,B,0.956,0.669,0.745,0.626,18,21,30,28,3,3,4,4,0.0651042,0.0355556
+,,,,,,,,,,,,,,,,,,,,,,,
+B2Hf,B2Ti,1,A,include,86,same-group diboride direct analogue,Ti 3d WFs are typically more compact than Hf 5d WFs.,shared elements B; strongest match: size/num_wann,B,1,0.665,1,0.515,18,18,27,27,3,3,2,2,0.123209,0.0827887
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+C2Cd2O6,C2Cu2O6,1,A,include,82,same-size carbonate structure with d-manifold stress test,Cu d9/open-shell failure modes may not transfer to Cd d10.,shared elements C O; strongest match: size/num_wann,C O,1,0.327,0.797,0.691,50,58,102,123,10,10,0,2,0.559322,0.131488
+C2Cd2O6,C4O12Sr4,2,A,include,82,closed-shell carbonate-framework analogue,"different electronic difficulty, different model scale",shared elements C O; strongest match: Fermi density,C O,0.807,0.539,0.42,0.614,50,116,102,192,10,20,0,0,0.559322,0.614634
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+C2Cu2O6,C2Cd2O6,1,A,include,82,carbonate structure and site-count anchor,Cd carbonate lacks the difficult Cu d manifold.,shared elements C O; strongest match: size/num_wann,C O,1,0.327,0.797,0.691,58,50,123,102,10,10,2,0,0.131488,0.559322
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+C4O12Sr4,C2Cd2O6,2,A,include,82,carbonate molecular-orbital direct analogue,"different electronic difficulty, different model scale",shared elements C O; strongest match: Fermi density,C O,0.807,0.539,0.42,0.614,116,50,192,102,20,10,0,0,0.614634,0.559322
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+C4O12Sr4,O2Sr,5,A,include,82,same-Sr/O cation-state complement,different model scale,shared elements O Sr; strongest match: Fermi density,O Sr,0.744,0.635,0.34,0.575,116,21,192,33,20,3,0,0,0.614634,0.309278
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+Cl2V,Br2V,1,A,include,96,same-metal dihalide direct analogue,Br p states are more diffuse and shifted relative to Cl p.,shared elements V; strongest match: size/num_wann,V,1,0.878,1,0.883,18,18,40,40,3,3,3,3,0.19209,0.221212
+Cl2V,Cl2Ti,2,A,include,92.9,strong direct or complementary chemistry/structure analogue,"Exact windows, projection counts, and final status still must be re-derived for the target.",shared elements Cl; strongest match: size/num_wann,Cl,0.984,0.652,0.979,0.944,18,18,40,39,3,3,3,2,0.19209,0.0377907
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+Cl4Li4O16,Mg4O12Se4,1,A,include,82,strong direct or complementary chemistry/structure analogue,"Exact windows, projection counts, and final status still must be re-derived for the target.",shared elements O; strongest match: Fermi density,O,0.749,0.753,0.766,0.8,100,80,204,156,24,20,0,0,0.472222,0.207627
+Cl4Li4O16,Li4O6Si2,2,A,include,82,same-Li/O closed-shell oxysalt analogue,"different structure/coordination, different model scale",shared elements Li O; strongest match: Fermi density,Li O,0.756,0.858,0.474,0.544,100,52,204,84,24,12,0,0,0.472222,0.332075
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+Cr2F4,F4Ni2,1,A,include,85.2,same MF2 structure with fuller d shell,Ni d bands are more filled and may be easier to isolate.,shared elements F; strongest match: Fermi density,F,0.885,0.742,0.813,0.753,36,42,84,96,6,6,4,4,0.100295,0.187919
+Cr2F4,Co2F4,2,A,include,84.1,same MF2 structure and oxidation-style analogue,Different d filling and magnetic order can alter frozen windows.,shared elements F; strongest match: size/num_wann,F,0.917,0.679,0.804,0.751,36,42,84,93,6,6,4,2,0.100295,0.14094
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+H8O16W4,B8H16O16,3,A,include,82,H/O network and localization analogue,No W d manifold is represented.,shared elements H O; strongest match: band-boundary crowding,H O,0.756,0.455,0.624,0.532,124,112,240,204,28,40,0,0,0.409091,0.564417
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+Hf10Si6,Hf6Si4,1,A,include,86.1,same Hf–Si chemistry across nearby phase,"Exact windows, projection counts, and final status still must be re-derived for the target.",shared elements Hf Si; strongest match: band-boundary crowding,Hf Si,0.989,0.777,0.663,0.758,124,76,216,132,16,10,4,5,0.471503,0.471963
+Hf10Si6,Hf4Si2,2,A,include,82,strong direct or complementary chemistry/structure analogue,different model scale,shared elements Hf Si; strongest match: chemistry,Hf Si,0.981,0.664,0.522,0.843,124,48,216,84,16,6,4,4,0.471503,0.276699
+Hf10Si6,Si6Y10,3,A,include,82,same 5:3 stoichiometric/structural analogue,"Exact windows, projection counts, and final status still must be re-derived for the target.",shared elements Si; strongest match: Fermi density,Si,0.97,0.584,0.682,0.813,124,154,216,201,16,16,4,4,0.471503,0.821839
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+Hg3O3,O2Pd2,2,A,include,82,binary heavy-metal oxide analogue,Pd d8 and Hg d10/6s character differ substantially.,shared elements O; strongest match: Fermi density,O,0.937,0.712,0.663,0.518,42,28,117,72,6,4,0,2,0.06639,0.0534125
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+Mg2O10Ti4,Co2O8W2,3,A,include,82,transition-metal oxide entanglement/structure analogue,Co open-shell/W 5d complexity can overstate the target difficulty.,shared elements O; strongest match: band-boundary crowding,O,0.702,0.582,0.764,0.885,88,84,168,165,16,12,0,2,0.327402,0.247104
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+N2Na2O6,Li4O6Si2,2,A,include,82,alkali/oxygen projection analogue,"different electronic difficulty, different structure/coordination",shared elements O; strongest match: Fermi density,O,0.794,0.494,0.699,0.477,42,52,96,84,10,12,0,0,0.430233,0.332075
+N2Na2O6,C2N2Na2,,,,,,,,,,,,,,,,,,,,,,
+N2Na2O6,K4O6S2,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+O2Pd2,Hg3O3,2,A,include,82,heavy binary oxide direct analogue,different structure/coordination,shared elements O; strongest match: Fermi density,O,0.937,0.712,0.663,0.518,28,42,72,117,4,6,2,0,0.0534125,0.06639
+O2Pd2,O2Pb2,3,A,include,82,same-stoichiometry binary oxide structural analogue,chemistry/orbital mismatch,shared elements O; strongest match: size/num_wann,O,0.588,0.695,0.829,0.577,28,26,72,60,4,4,2,0,0.0534125,0.0714286
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+Pd4S8,Ru4S8,1,A,include,82.7,same MS2 stoichiometry and 4d–S chemistry,different structure/coordination,shared elements S; strongest match: size/num_wann,S,0.951,0.657,0.947,0.492,72,72,180,168,12,12,0,0,0.135266,0.174863
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+Pd4S8,Co4S8,5,A,include,82,same MS2 structure with 3d/magnetic stress test,Co magnetism can dominate failure modes.,shared elements S; strongest match: size/num_wann,S,0.97,0.42,0.765,0.479,72,84,180,174,12,12,0,4,0.135266,0.317204
+,,,,,,,,,,,,,,,,,,,,,,,
+RuTi,RhSc,1,A,include,96,isoelectronic same-size B2-like analogue,"Exact windows, projection counts, and final status still must be re-derived for the target.",matched valence/block family; strongest match: size/num_wann,,0.901,0.915,1,0.89,20,20,42,42,2,2,3,3,0.3,0.296167
+,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,
+RuTi,RuZr,4,A,include,91.9,same Ru and group-4 direct analogue,"Exact windows, projection counts, and final status still must be re-derived for the target.",shared elements Ru; strongest match: Fermi density,Ru,1,0.787,0.802,0.865,20,23,42,42,2,2,3,3,0.3,0.415493
+RuTi,FeTi,5,A,include,88,isoelectronic same-Ti analogue with magnetic stress test,Fe magnetism/localization can mislead a nonmagnetic Ru target.,shared elements Ti; strongest match: size/num_wann,Ti,1,0.632,0.802,0.901,20,23,42,42,2,2,3,3,0.3,0.447619
+B2Ta,B2Ti,,,,,,,,,,,,,,,,,,,,,,
+B2Ta,B2Y,,,,,,,,,,,,,,,,,,,,,,
+CTi,NNb,,,,,,,,,,,,,,,,,,,,,,
+Cr6Ga2,Ga2Mo6,,,,,,,,,,,,,,,,,,,,,,
+Cr6Ga2,Cr6Si2,,,,,,,,,,,,,,,,,,,,,,
+Al2Mo6,Ga2Mo6,,,,,,,,,,,,,,,,,,,,,,
+Al2Mo6,Mo6Si2,,,,,,,,,,,,,,,,,,,,,,
+FLi,BrLi,,,,,,,,,,,,,,,,,,,,,,
+Hf4Ni4,Ni4Zr4,,,,,,,,,,,,,,,,,,,,,,
+Cl2Ti,Br2Ti,,,,,,,,,,,,,,,,,,,,,,
+Si6Y10,Hf10Si6,,,,,,,,,,,,,,,,,,,,,,
