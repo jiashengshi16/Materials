@@ -30,97 +30,79 @@ import generate_harbor_num_wann_order_command as harbor_generator
 import generate_harbor_deepseek_self_debug_context_command as controlled
 
 
-# MATERIALS = [
-#     "Al18Co4",
-#     "Al4Sc2",
-#     "Li4O6Si2",
-#     "Si6Y10",
-#     "Mg2O10Ti4",
-# ]
-
-
-# MATERIALS = [
-#     'Al18Co4',
-#     'Al4Mn2O8',
-#     'Al4O8Zn2',
-#     'Al4Sc2',
-#     'Al8Zr4',
-#     'Au2Sc',
-#     'B2Cr',
-#     'B2Hf',
-#     'Bi4Cl12',
-#     'C2Cd2O6',
-#     'C2Cu2O6',
-#     'C4O12Sr4',
-#     'Cl2V',
-#     'Cl4Li4O16',
-#     'Co4Sc8',
-#     'Cr2F4',
-#     'Cr6Si2',
-#     'H8O16W4',
-#     'Hf10Si6',
-#     'Hg3O3',
-#     'Mg2O10Ti4',
-#     'N2Na2O6',
-#     'NNb',
-#     'Ni4Zr4',
-#     'O2Pd2',
-#     'Pd4S8',
-#     'RuTi',
-#     'AgMg',
-#     'FNa',
-
-#     Candidate Materials below
-#     'Al12Ni4',
-# 'Al4Y2',
-# 'Au2Y',
-# 'Ag2Sc',
-# 'Ag2Y',
-# 'B2Mn',
-# 'B2Ta',
-# 'B2Ti',
-# 'O2Sr',
-# 'Br2V',
-# 'Cl2Ti',
-# 'Mg4O12Se4',
-# 'Li4O6Si2',
-# 'F4Ni2',
-# 'Co2F4',
-# 'Cr6Ga2',
-# 'Mo6Si2',
-# 'Al2Mo6',
-# 'Ga2Mo6',
-# 'B8H16O16',
-# 'Hf6Si4',
-# 'Hf4Si2',
-# 'Si6Y10',
-# 'Co2O8W2',
-# 'CTi',
-# 'Hf4Ni4',
-# 'Pt4Y4',
-# 'O2Pb2',
-# 'Ru4S8',
-# 'Co4S8',
-# 'FeTi',
-# 'RuZr',
-# 'RhSc',
-# 'FLi',
-# 'BrNa',
-# 'AgSc',
-# ]
 MATERIALS=[
-    'B2Y',
-    'BrLi',
-    'Br2Ti'
+'Al18Co4',
+'Al12Ni4',
+'Al4Mn2O8',
+'Al4O8Zn2',
+'Al4Sc2',
+'Al4Y2',
+'Al8Zr4',
+'Au2Sc',
+'Au2Y',
+'Ag2Sc',
+'Ag2Y',
+'B2Cr',
+'B2Mn',
+'B2Ta',
+'B2Hf',
+'B2Ti',
+'C2Cd2O6',
+'C2Cu2O6',
+'C4O12Sr4',
+'O2Sr',
+'Cl2V',
+'Br2V',
+'Cl2Ti',
+'Cl4Li4O16',
+'Mg4O12Se4',
+'Li4O6Si2',
+'Cr2F4',
+'F4Ni2',
+'Co2F4',
+'H8O16W4',
+'B8H16O16',
+'Hf10Si6',
+'Hf6Si4',
+'Hf4Si2',
+'Si6Y10',
+'Hg3O3',
+'O2Pd2',
+'Mg2O10Ti4',
+'Co2O8W2',
+'N2Na2O6',
+'C2N2Na2',
+'K4O6S2',
+'O2Pb2',
+'Pd4S8',
+'Ru4S8',
+'Co4S8',
+'RuTi',
+'RhSc',
+'RuZr',
+'FeTi',
+'B2Y',
+'CTi',
+'NNb',
+'Cr6Ga2',
+'Ga2Mo6',
+'Cr6Si2',
+'Al2Mo6',
+'Mo6Si2',
+'FLi',
+'BrLi',
+'Hf4Ni4',
+'Ni4Zr4',
+'Br2Ti'
 ]
+
 
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 MODEL = "openai/deepseek-v4-pro"
-DEFAULT_JOBS_ROOT = harbor_generator.ROOT / "jobsDeepseekProTerminus2Controlled"
+DEFAULT_JOBS_ROOT = harbor_generator.ROOT / "jobsDeepseekProTerminus2ControlledIter2"
 DEFAULT_COUNT_JOBS_ROOTS = [
-    harbor_generator.ROOT / "jobsDeepseekProTerminus2Controlled",
-    harbor_generator.ROOT / "jobsDeepseekProTerminus2Candidates",
-]
+    harbor_generator.ROOT / "jobsDeepseekProTerminus2ControlledIter2"
+    ]
 
 DEFAULT_AUGMENTED_DATASET_PARENT = harbor_generator.ROOT / "harbor_datasets"
 POST_PRUNE_COMMANDS = [
@@ -143,6 +125,7 @@ LOCKED_FINAL_TIMEOUT_CLEANUP_BUFFER_SEC = 300
 CONTROLLED_ARTIFACTS = [
     "/app/workflow/recipe_request.json",
     "/app/workflow/compile_recipe_report.json",
+    "/app/workflow/compile_recipe_reports",
     "/app/workflow/LOCKED_RECIPE.json",
     "/app/workflow/DECISIONS.md",
     "/app/workflow/locked_runner.log",
@@ -965,7 +948,7 @@ APP = Path("/app")
 WORKFLOW_DIR = APP / "workflow"
 RUNNER_PATH = APP / "locked_wannier_runner.py"
 REPORT_PATH = WORKFLOW_DIR / "compile_recipe_report.json"
-MAX_LOG_CHARS = 6000
+REPORTS_DIR = WORKFLOW_DIR / "compile_recipe_reports"
 
 
 def load_runner() -> Any:
@@ -977,11 +960,10 @@ def load_runner() -> Any:
     return module
 
 
-def log_tail(path: Path, *, max_chars: int = MAX_LOG_CHARS) -> str:
+def log_tail(path: Path) -> str:
     if not path.is_file():
         return ""
-    text = path.read_text(encoding="utf-8", errors="replace")
-    return text[-max_chars:]
+    return path.read_text(encoding="utf-8", errors="replace")
 
 
 def projection_count_diagnostics(recipe: dict[str, Any], nscf: dict[str, Any]) -> dict[str, Any]:
@@ -1093,7 +1075,18 @@ def upstream_pp_diagnostics(
 
     primary_cause = "wannier90.x -pp did not generate the .nnkp file"
     hints: list[str] = []
-    if "too few projection functions" in lower:
+    if "kmesh_get_bvector" in lower or "not enough bvectors found" in lower:
+        primary_cause = "Wannier90 k-mesh b-vector search failed"
+        hints.extend([
+            "This is a Wannier90 preprocessing failure in automatic b-vector selection, "
+            "usually caused by degenerate neighbour shells for the cell/k-point grid.",
+            "This is not a projection syntax/count issue; changing projections alone is "
+            "unlikely to fix it.",
+            "If the workflow allows raw Wannier90 controls, try kmesh_tol or "
+            "devel_flag = kmesh_degen. Otherwise the material/k-grid likely cannot be "
+            "made to pass with the locked recipe schema.",
+        ])
+    elif "too few projection functions" in lower:
         primary_cause = "too few projection functions defined"
         hints.append(
             "Wannier90 rejected the projection block before writing .nnkp because "
@@ -1124,6 +1117,13 @@ def upstream_pp_diagnostics(
 
 
 def missing_nnkp_message(seed: str, diagnostics: dict[str, Any]) -> str:
+    if diagnostics["primary_cause"] == "Wannier90 k-mesh b-vector search failed":
+        return (
+            f"wannier90.x -pp did not generate {seed}.nnkp. "
+            f"Primary cause: {diagnostics['primary_cause']}. "
+            "This is a k-mesh/cell geometry issue, not a projection recipe issue; "
+            "see upstream_diagnostics.hints and wout_tail."
+        )
     return (
         f"wannier90.x -pp did not generate {seed}.nnkp. "
         f"Primary cause: {diagnostics['primary_cause']}. "
@@ -1237,11 +1237,21 @@ def window_report(recipe: dict[str, Any], eig_path: Path) -> dict[str, Any]:
 
 def write_report(report: dict[str, Any]) -> None:
     WORKFLOW_DIR.mkdir(parents=True, exist_ok=True)
-    REPORT_PATH.write_text(
-        json.dumps(report, indent=2, sort_keys=True) + "\n",
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    attempt_index = len(sorted(REPORTS_DIR.glob("compile_attempt_*.json"))) + 1
+    attempt_path = REPORTS_DIR / f"compile_attempt_{attempt_index:02d}.json"
+    report = {
+        **report,
+        "compile_attempt_index": attempt_index,
+        "compile_attempt_report_path": f"workflow/compile_recipe_reports/{attempt_path.name}",
+    }
+    report_text = json.dumps(report, indent=2, sort_keys=True) + "\n"
+    attempt_path.write_text(
+        report_text,
         encoding="utf-8",
     )
-    print(json.dumps(report, indent=2, sort_keys=True), flush=True)
+    REPORT_PATH.write_text(report_text, encoding="utf-8")
+    print(report_text, flush=True)
 
 
 def fail(stage: str, message: str, **extra: Any) -> int:
