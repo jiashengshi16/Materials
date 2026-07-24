@@ -1,40 +1,35 @@
 #!/usr/bin/env python3
-"""Evidence-backed consolidation of Gemini self-debug reviews for DeepSeek.
+"""Contradiction-only consolidation of Gemini self-debug reviews for DeepSeek.
 
 Pipeline
 ========
 
-1. Per-candidate-material consolidation
-   For every unique candidate material referenced by the candidate CSV, collect:
+1. Per-candidate-material contradiction review
+   For every unique candidate material referenced by the candidate CSV, collect
+   all per-run reviews and the original LLM-readable evidence for those runs.
 
-   - every per-run ``self_debug_report.json`` and matching Markdown report;
-   - the original LLM-readable run evidence for each source case, including the
-     trajectory, recipe/compile artifacts, ``.win``, ``.wout``, ``.eig``, logs,
-     verifier diagnostics, and a deterministic ``.amn_summary.json`` when the
-     reviewer helper can generate it.
+   Gemini's only synthesis task is to decide whether the reports make genuinely
+   contradictory claims about the same or materially equivalent run situation.
+   A detailed report is written only when such a contradiction exists. Different
+   recipes, failure stages, outcomes, or chemistry-specific situations are not
+   contradictions and must not be converted into general lessons.
 
-   Gemini must verify the run reviews against the staged source evidence before
-   producing ``material_consolidated.{md,json}``.
+2. Per-target cross-candidate contradiction review
+   For each target material, stage every candidate-material contradiction report,
+   every source run used to produce it, and compact target-side task inputs.
 
-2. Per-target cross-candidate consolidation
-   For each target material, stage:
+   The target report preserves candidate-material contradictions and adds detail
+   only for genuine cross-candidate conceptual contradictions. It does not create
+   cross-material consensus, transferable chemical rules, or a target recipe.
+   When no contradiction is found, the report is intentionally minimal.
 
-   - every candidate material consolidation;
-   - the complete source-evidence tree used by those material consolidations;
-   - compact target-side task inputs from the dataset when available.
-
-   Gemini produces one contradiction-aware ``ALL_SELF_DEBUG.{md,json}`` bundle.
-   It should inspect raw source evidence when candidate claims conflict or when a
-   high-impact claim needs verification. Different valid situations must remain
-   explicit conditional branches rather than being flattened.
-
-The final target outputs are also copied to the compatibility layout:
+The final target outputs retain the existing compatibility layout:
 
     <target>/target_consensus/self_debug_report.md
     <target>/target_consensus/self_debug_report.json
 
 A self-link candidate CSV is generated so the existing chemically-similar
-DeepSeek context loader can load exactly one reconciled target report.
+DeepSeek context loader can load exactly one contradiction-focused target report.
 
 Large/binary raw numerical files (``.amn``, ``.mmn``, ``.chk``, ``*_hr.dat`` and
 QE save trees) are intentionally not copied directly. The original reviewer also
@@ -67,6 +62,7 @@ DEFAULT_GEMINI_BIN = "gemini"
 DEFAULT_MAX_CONCURRENT_MATERIALS = 12
 DEFAULT_MAX_CONCURRENT_TARGETS = 12
 DEFAULT_MAX_ATTEMPTS = 5
+CONTRADICTION_SCHEMA_VERSION = 3
 
 REVIEW_ROOT_RELATIVE = Path("jobsGeminiReviewsDeepseekIter2") / "gemini_self_debug_reviews"
 MATERIAL_OUTPUT_ROOT_RELATIVE = (
@@ -773,8 +769,8 @@ def material_source_manifest(
             item["review_md_sha256"] = sha256_file(review.md_path)
         sources.append(item)
     return {
-        "schema_version": 2,
-        "stage": "per_candidate_material_evidence_backed_consolidation",
+        "schema_version": CONTRADICTION_SCHEMA_VERSION,
+        "stage": "per_candidate_material_contradiction_review",
         "material": material,
         "source_run_count": len(reviews),
         "sources": sources,
@@ -815,8 +811,8 @@ def target_source_manifest(
             target_files.append({"path": relative, "sha256": sha256_file(src)})
 
     return {
-        "schema_version": 2,
-        "stage": "per_target_cross_candidate_evidence_backed_consolidation",
+        "schema_version": CONTRADICTION_SCHEMA_VERSION,
+        "stage": "per_target_cross_candidate_contradiction_review",
         "target_material": target,
         "candidate_materials_requested": candidates_requested,
         "candidate_materials_used": [item["candidate_material"] for item in sources],
@@ -831,47 +827,416 @@ def source_manifest_matches(output_dir: Path, expected: dict[str, Any]) -> bool:
     return path.is_file() and read_json_object(path) == expected
 
 
+def _list_field(data: dict[str, Any], key: str) -> list[Any] | None:
+    value = data.get(key)
+    return value if isinstance(value, list) else None
+
+
+def _material_input_case_ids(output_dir: Path) -> list[str]:
+    index = read_json_object(output_dir / "inputs" / "index.json")
+    reviews = index.get("run_reviews")
+    if not isinstance(reviews, list):
+        return []
+    return [
+        str(item.get("case_id"))
+        for item in reviews
+        if isinstance(item, dict) and item.get("case_id")
+    ]
+
+
+def _target_input_index(output_dir: Path) -> dict[str, Any]:
+    return read_json_object(output_dir / "inputs" / "index.json")
+
+
+def _target_input_candidate_contradictions(output_dir: Path) -> set[str]:
+    """Return candidates whose material-level report found a contradiction."""
+    index = _target_input_index(output_dir)
+    entries = index.get("candidate_consolidations")
+    if not isinstance(entries, list):
+        return set()
+
+    result: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        candidate = entry.get("candidate_material")
+        relative = entry.get("material_consolidated_json")
+        if not isinstance(candidate, str) or not isinstance(relative, str):
+            continue
+        data = read_json_object(output_dir / relative)
+        if data.get("contradiction_found") is True:
+            result.add(candidate)
+    return result
+
+
 def material_output_is_valid(output_dir: Path) -> bool:
     md_path = output_dir / "material_consolidated.md"
     json_path = output_dir / "material_consolidated.json"
     if not md_path.is_file() or not md_path.read_text(encoding="utf-8").strip():
         return False
+
     data = read_json_object(json_path)
-    if not data.get("material"):
+    if data.get("schema_version") != CONTRADICTION_SCHEMA_VERSION:
         return False
-    required = (
+    if not isinstance(data.get("material"), str) or not data["material"].strip():
+        return False
+    if data.get("case_id") != "material_contradiction_review":
+        return False
+
+    verdict = data.get("verdict")
+    if verdict not in {"contradiction_found", "no_contradiction", "insufficient_evidence"}:
+        return False
+    contradiction_found = data.get("contradiction_found")
+    if not isinstance(contradiction_found, bool):
+        return False
+    if not isinstance(data.get("summary"), str):
+        return False
+
+    required_lists = (
+        "source_case_ids",
+        "source_evidence_checks_performed",
+        "review_claims_corrected_by_source_evidence",
+        "contradictions",
+        "non_contradictory_differences",
+        "evidence_gaps",
+    )
+    if any(_list_field(data, key) is None for key in required_lists):
+        return False
+
+    contradictions = data["contradictions"]
+    if contradiction_found != bool(contradictions):
+        return False
+    if verdict == "contradiction_found" and not contradiction_found:
+        return False
+    if verdict in {"no_contradiction", "insufficient_evidence"} and contradiction_found:
+        return False
+
+    expected_case_ids = set(_material_input_case_ids(output_dir))
+    reported_case_ids = {str(value) for value in data["source_case_ids"]}
+    if expected_case_ids and reported_case_ids != expected_case_ids:
+        return False
+    if data.get("source_run_count") != len(expected_case_ids):
+        return False
+
+    forbidden_generalization_fields = (
         "stable_findings",
         "run_dependent_findings",
-        "resolved_contradictions",
-        "unresolved_contradictions",
         "safe_transferable_knowledge",
-        "do_not_generalize",
-        "evidence_gaps",
-        "review_claims_corrected_by_source_evidence",
+        "high_confidence_cross_candidate_knowledge",
+        "conditional_knowledge",
+        "candidate_specific_knowledge",
+        "deepseek_decision_checks",
     )
-    return all(isinstance(data.get(key), list) for key in required)
+    if any(data.get(key) not in (None, [], "") for key in forbidden_generalization_fields):
+        return False
+
+    # A no-contradiction result must remain intentionally sparse.
+    if not contradiction_found:
+        if len(data["non_contradictory_differences"]) > 5:
+            return False
+        md_text = md_path.read_text(encoding="utf-8")
+        if len(md_text) > 1500 or len(md_text.splitlines()) > 20:
+            return False
+    else:
+        for item in contradictions:
+            if not isinstance(item, dict):
+                return False
+            required = {
+                "topic",
+                "contradiction_type",
+                "status",
+                "claims",
+                "why_incompatible",
+                "source_evidence",
+                "resolution_or_conditions",
+                "safe_deepseek_instruction",
+            }
+            if not required.issubset(item):
+                return False
+    return True
 
 
-def target_output_is_valid(output_dir: Path) -> bool:
+def target_output_validation_errors(output_dir: Path) -> list[str]:
+    errors: list[str] = []
     md_path = output_dir / "ALL_SELF_DEBUG.md"
     json_path = output_dir / "ALL_SELF_DEBUG.json"
     if not md_path.is_file() or not md_path.read_text(encoding="utf-8").strip():
-        return False
+        errors.append("missing_or_empty_ALL_SELF_DEBUG.md")
+
     data = read_json_object(json_path)
-    if not data.get("target_material"):
-        return False
-    required = (
+    if data.get("schema_version") != CONTRADICTION_SCHEMA_VERSION:
+        errors.append("schema_version_mismatch")
+    if not isinstance(data.get("target_material"), str) or not data["target_material"].strip():
+        errors.append("missing_target_material")
+    if data.get("case_id") != "target_cross_candidate_contradiction_review":
+        errors.append("case_id_mismatch")
+
+    verdict = data.get("verdict")
+    if verdict not in {"contradictions_found", "no_contradiction", "insufficient_evidence"}:
+        errors.append("invalid_verdict")
+    contradiction_found = data.get("contradiction_found")
+    cross_found = data.get("cross_candidate_contradiction_found")
+    if not isinstance(contradiction_found, bool) or not isinstance(cross_found, bool):
+        errors.append("contradiction_booleans_must_be_bool")
+    if not isinstance(data.get("summary"), str):
+        errors.append("missing_summary")
+
+    required_lists = (
+        "candidate_materials_requested",
+        "candidate_materials_used",
+        "missing_candidate_materials",
+        "source_evidence_checks_performed",
+        "candidate_material_contradictions",
+        "cross_candidate_conceptual_contradictions",
+        "non_contradictory_differences",
+        "deepseek_usage_constraints",
+        "evidence_gaps",
+    )
+    missing_list_fields = [key for key in required_lists if _list_field(data, key) is None]
+    if missing_list_fields:
+        errors.append("missing_list_fields:" + ",".join(missing_list_fields))
+
+    candidate_items = data.get("candidate_material_contradictions")
+    cross_items = data.get("cross_candidate_conceptual_contradictions")
+    candidate_items = candidate_items if isinstance(candidate_items, list) else []
+    cross_items = cross_items if isinstance(cross_items, list) else []
+    any_items = bool(candidate_items or cross_items)
+    if contradiction_found != any_items:
+        errors.append(
+            f"contradiction_found_mismatch:got={contradiction_found!r},expected={any_items!r}"
+        )
+    if cross_found != bool(cross_items):
+        errors.append(
+            f"cross_candidate_contradiction_found_mismatch:got={cross_found!r},"
+            f"expected={bool(cross_items)!r}"
+        )
+    if verdict == "contradictions_found" and not contradiction_found:
+        errors.append("verdict_contradictions_found_but_no_contradictions")
+    if verdict in {"no_contradiction", "insufficient_evidence"} and contradiction_found:
+        errors.append(f"verdict_{verdict}_but_contradictions_present")
+
+    input_index = _target_input_index(output_dir)
+    for key in (
+        "candidate_materials_requested",
+        "candidate_materials_used",
+        "missing_candidate_materials",
+    ):
+        expected = input_index.get(key)
+        if isinstance(expected, list) and data.get(key) != expected:
+            errors.append(f"{key}_mismatch")
+
+    forbidden_generalization_fields = (
         "high_confidence_cross_candidate_knowledge",
         "conditional_knowledge",
         "candidate_specific_knowledge",
         "reconciled_cross_candidate_conflicts",
         "unresolved_cross_candidate_conflicts",
-        "do_not_generalize",
         "deepseek_decision_checks",
-        "evidence_gaps",
-        "source_evidence_checks_performed",
+        "safe_transferable_knowledge",
+        "stable_findings",
     )
-    return all(isinstance(data.get(key), list) for key in required)
+    forbidden_present = [
+        key for key in forbidden_generalization_fields if data.get(key) not in (None, [], "")
+    ]
+    if forbidden_present:
+        errors.append("forbidden_generalization_fields:" + ",".join(forbidden_present))
+
+    # Do not allow the target stage to silently discard a material-level contradiction.
+    expected_candidates = _target_input_candidate_contradictions(output_dir)
+    reported_candidates = {
+        str(item.get("candidate_material"))
+        for item in candidate_items
+        if isinstance(item, dict) and item.get("candidate_material")
+    }
+    if expected_candidates != reported_candidates:
+        errors.append(
+            "candidate_material_contradictions_mismatch:"
+            f"expected={sorted(expected_candidates)},reported={sorted(reported_candidates)}"
+        )
+
+    if not contradiction_found:
+        non_contradictory = data.get("non_contradictory_differences")
+        if isinstance(non_contradictory, list) and len(non_contradictory) > 5:
+            errors.append("too_many_non_contradictory_differences_for_no_contradiction")
+        if md_path.is_file():
+            md_text = md_path.read_text(encoding="utf-8")
+            if len(md_text) > 1500 or len(md_text.splitlines()) > 20:
+                errors.append("markdown_too_long_for_no_contradiction")
+    else:
+        for item in candidate_items:
+            if not isinstance(item, dict):
+                errors.append("candidate_material_contradiction_item_not_object")
+                continue
+            if not {"candidate_material", "summary", "contradictions", "source_report"}.issubset(item):
+                errors.append(
+                    "candidate_material_contradiction_missing_fields:"
+                    + str(item.get("candidate_material") or "<unknown>")
+                )
+            if not isinstance(item.get("contradictions"), list):
+                errors.append(
+                    "candidate_material_contradiction_contradictions_not_list:"
+                    + str(item.get("candidate_material") or "<unknown>")
+                )
+        for item in cross_items:
+            if not isinstance(item, dict):
+                errors.append("cross_candidate_contradiction_item_not_object")
+                continue
+            required = {
+                "topic",
+                "status",
+                "candidate_claims",
+                "why_conceptually_incompatible",
+                "chemistry_or_context_caveat",
+                "source_evidence",
+                "target_side_discriminator_checks",
+                "safe_deepseek_instruction",
+            }
+            if not required.issubset(item):
+                errors.append(
+                    "cross_candidate_contradiction_missing_fields:"
+                    + str(item.get("topic") or "<unknown>")
+                )
+    return errors
+
+
+def target_output_is_valid(output_dir: Path) -> bool:
+    return not target_output_validation_errors(output_dir)
+
+
+def _write_skipped_run_status(output_dir: Path, *, reason: str) -> None:
+    write_json(
+        output_dir / "run_status.json",
+        {
+            "model": "not_invoked",
+            "success": True,
+            "skipped": True,
+            "reason": reason,
+            "attempts": [],
+        },
+    )
+
+
+def write_single_run_material_output(
+    output_dir: Path,
+    material: str,
+    reviews: list[RunReview],
+) -> None:
+    case_ids = [review.case_id for review in reviews]
+    summary = "A contradiction review requires at least two runs; only one run was available."
+    write_json(
+        output_dir / "material_consolidated.json",
+        {
+            "schema_version": CONTRADICTION_SCHEMA_VERSION,
+            "material": material,
+            "case_id": "material_contradiction_review",
+            "verdict": "insufficient_evidence",
+            "source_run_count": len(reviews),
+            "source_case_ids": case_ids,
+            "contradiction_found": False,
+            "summary": summary,
+            "source_evidence_checks_performed": [],
+            "review_claims_corrected_by_source_evidence": [],
+            "contradictions": [],
+            "non_contradictory_differences": [],
+            "evidence_gaps": ["Fewer than two runs were available for same-material comparison."],
+        },
+    )
+    write_text(
+        output_dir / "material_consolidated.md",
+        f"# Material contradiction review: {material}\n\n"
+        f"**Result:** {summary}\n",
+    )
+    _write_skipped_run_status(output_dir, reason="fewer_than_two_runs")
+
+
+def _candidate_material_contradiction_payloads(
+    candidates_used: list[str],
+    material_results: dict[str, MaterialConsolidationResult],
+) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    for candidate in candidates_used:
+        result = material_results.get(candidate)
+        if result is None:
+            continue
+        data = read_json_object(result.json_path)
+        if data.get("contradiction_found") is not True:
+            continue
+        payloads.append(
+            {
+                "candidate_material": candidate,
+                "source_case_id": data.get("case_id"),
+                "summary": data.get("summary"),
+                "contradictions": data.get("contradictions", []),
+                "source_report": str(result.json_path),
+            }
+        )
+    return payloads
+
+
+def write_single_candidate_target_output(
+    output_dir: Path,
+    target: str,
+    candidates_requested: list[str],
+    candidates_used: list[str],
+    missing_candidates: list[str],
+    material_results: dict[str, MaterialConsolidationResult],
+) -> None:
+    material_contradictions = _candidate_material_contradiction_payloads(
+        candidates_used,
+        material_results,
+    )
+    contradiction_found = bool(material_contradictions)
+    if contradiction_found:
+        verdict = "contradictions_found"
+        summary = (
+            "Candidate-material contradictions were preserved, but fewer than two "
+            "candidate materials were available for cross-candidate comparison."
+        )
+    else:
+        verdict = "insufficient_evidence"
+        summary = (
+            "No candidate-material contradiction was present, and fewer than two "
+            "candidate materials were available for cross-candidate comparison."
+        )
+
+    write_json(
+        output_dir / "ALL_SELF_DEBUG.json",
+        {
+            "schema_version": CONTRADICTION_SCHEMA_VERSION,
+            "material": target,
+            "target_material": target,
+            "case_id": "target_cross_candidate_contradiction_review",
+            "verdict": verdict,
+            "candidate_materials_requested": candidates_requested,
+            "candidate_materials_used": candidates_used,
+            "missing_candidate_materials": missing_candidates,
+            "contradiction_found": contradiction_found,
+            "cross_candidate_contradiction_found": False,
+            "summary": summary,
+            "source_evidence_checks_performed": [],
+            "candidate_material_contradictions": material_contradictions,
+            "cross_candidate_conceptual_contradictions": [],
+            "non_contradictory_differences": [],
+            "deepseek_usage_constraints": [
+                "Use only the preserved contradiction warnings; no cross-candidate rule was inferred."
+            ] if contradiction_found else [],
+            "evidence_gaps": [
+                "Fewer than two candidate materials were available for cross-candidate comparison."
+            ],
+        },
+    )
+
+    lines = [
+        f"# Target contradiction review: {target}",
+        "",
+        f"**Result:** {summary}",
+    ]
+    if material_contradictions:
+        lines.extend(["", "## Candidate-material contradictions"])
+        for item in material_contradictions:
+            lines.append(f"- **{item['candidate_material']}**: {item.get('summary') or 'Contradiction found.'}")
+    write_text(output_dir / "ALL_SELF_DEBUG.md", "\n".join(lines) + "\n")
+    _write_skipped_run_status(output_dir, reason="fewer_than_two_candidate_materials")
 
 
 # ---------------------------------------------------------------------------
@@ -880,98 +1245,108 @@ def target_output_is_valid(output_dir: Path) -> bool:
 
 
 def material_prompt(material: str, run_count: int) -> str:
-    return f"""# Evidence-backed per-material consolidation: {material}
+    return f"""# Contradiction-only same-material review: {material}
 
-You are consolidating {run_count} independently reviewed Wannierisation run(s)
-for the same candidate material, `{material}`.
+You are comparing {run_count} independently reviewed Wannierisation runs for the
+same candidate material, `{material}`.
 
-This is NOT merely a summary of model-written reviews. The original LLM-readable
-source evidence for every run is staged under each input case directory.
+Your task is NOT to consolidate lessons, create best practices, recommend a future
+recipe, or summarize every run. Your only synthesis task is to determine whether
+the run reviews contain genuine contradictions.
 
-Start with `inputs/index.json`. For every case listed there, read:
-
-1. `self_debug_report.json` as a claim index;
-2. `case_files/case_metadata.json`;
-3. the relevant original evidence under `case_files/`, especially the actual
-   trajectory, recipe/compile files, `.win`, `.wout`, deterministic
-   `.amn_summary.json`, `.eig`, logs, and verifier diagnostics.
-
-The per-run reports are not authoritative. Verify substantive claims against the
-original source evidence. If a review conflicts with the source files, correct it
-and record the correction explicitly.
+The original LLM-readable source evidence for every run is staged under each input
+case directory. Start with `inputs/index.json`. For every case, use
+`self_debug_report.json` only as a claim index, then verify any potentially
+contradictory claim against the relevant files under `case_files/`.
 
 Do not browse the internet or inspect files outside this consolidation directory.
 
-## Method
+## What counts as a contradiction
 
-- Reconstruct what differed between runs: recipe, projections, windows, failure
-  stage, convergence, localization, and final outcome.
-- Do not majority-vote.
-- Weight contract facts and direct observations above plausible interpretations.
-- Preserve threshold-dependent AMN language. Do not convert effective-rank
-  sensitivity into an unqualified mathematical rank claim.
-- A repeated symptom is not automatically a root cause.
-- When apparent contradictions arise, first test whether the runs were in
-  genuinely different situations.
-- If both findings are valid under different conditions, preserve both as explicit
-  situation branches.
-- If source evidence cannot resolve a conflict, leave it unresolved.
-- Do not infer hidden reference recipes or copy exact candidate parameters into a
-  future target recommendation.
+Report a contradiction only when two or more reviews make incompatible claims
+about the same or materially equivalent event, recipe feature, numerical signal,
+or causal diagnosis, for example:
 
-## Required outputs
+- the same projection recipe and outcome are called both defective and good;
+- the same coordinate projector is claimed to be both atom-coincident and empty;
+- one review says a specific observed warning occurred and another says it did not;
+- the same run evidence is used to support opposite causal conclusions without a
+  condition that makes both conclusions compatible.
+
+## What does NOT count
+
+Do not report a contradiction merely because:
+
+- the recipes, windows, projections, failure stages, or outcomes differ;
+- different runs expose different valid problems;
+- one statement is a direct observation and another is only a hypothesis;
+- both claims can coexist under explicit, evidence-backed conditions;
+- the reports use different wording but reach compatible conclusions.
+
+First compare exact recipes, coordinates, windows, failure stages, convergence,
+localization, RMSE/reward, and the confidence level of each claim. Do not
+majority-vote. Preserve threshold-dependent AMN language and never turn AMN
+sensitivity into an unqualified rank-deficiency claim.
+
+## Output policy
 
 Write exactly:
 
 - `material_consolidated.md`
 - `material_consolidated.json`
 
-The JSON must include at least:
+Use schema version {CONTRADICTION_SCHEMA_VERSION}:
 
 ```json
 {{
-  "schema_version": 2,
+  "schema_version": {CONTRADICTION_SCHEMA_VERSION},
   "material": "{material}",
-  "case_id": "material_consensus",
-  "verdict": "evidence_backed_consolidated_context",
+  "case_id": "material_contradiction_review",
+  "verdict": "contradiction_found | no_contradiction | insufficient_evidence",
   "source_run_count": {run_count},
   "source_case_ids": [],
+  "contradiction_found": false,
+  "summary": "one concise sentence",
   "source_evidence_checks_performed": [],
   "review_claims_corrected_by_source_evidence": [],
-  "stable_findings": [
-    {{
-      "topic": "normalized topic",
-      "claim": "evidence-backed claim",
-      "evidence_level": "contract_fact | direct_observation | proven | strongly_supported",
-      "supporting_cases": [],
-      "contradicting_cases": [],
-      "source_evidence": [],
-      "conditions": [],
-      "transfer_safety": "high | conditional | low"
-    }}
-  ],
-  "run_dependent_findings": [],
-  "resolved_contradictions": [],
-  "unresolved_contradictions": [],
-  "safe_transferable_knowledge": [],
-  "do_not_generalize": [],
+  "contradictions": [],
+  "non_contradictory_differences": [],
   "evidence_gaps": []
 }}
 ```
 
-In the Markdown, use sections:
+If no genuine contradiction exists:
 
-1. Evidence reviewed
-2. Stable knowledge
-3. Situation-dependent knowledge
-4. Corrections to per-run reviews
-5. Resolved contradictions
-6. Unresolved contradictions
-7. Safe transferable knowledge
-8. Do not generalize
+- set `verdict` to `no_contradiction`;
+- set `contradiction_found` to `false`;
+- leave `contradictions` empty;
+- keep `non_contradictory_differences` empty unless one short entry is needed to
+  explain why an apparent conflict was actually recipe- or situation-specific;
+- make the Markdown minimal: a heading, one result sentence, and optionally a
+  short evidence-gap sentence. Do not emit stable findings, lessons learned,
+  transferable knowledge, candidate recommendations, or a general review.
 
-Cite staged file paths for every high-impact claim. Do not merely concatenate the
-run reviews.
+If a genuine contradiction exists, each item in `contradictions` must include:
+
+- `topic`;
+- `contradiction_type`;
+- `status`: `resolved | conditional | unresolved`;
+- `claims`: the incompatible claims with case IDs and confidence levels;
+- `why_incompatible`;
+- `source_evidence` with staged paths;
+- `resolution_or_conditions`;
+- `safe_deepseek_instruction` explaining what a future run must not assume.
+
+The detailed Markdown should contain only:
+
+1. Contradiction summary
+2. Source evidence checked
+3. Detailed contradictions
+4. Resolution or unresolved conditions
+5. Safe DeepSeek usage constraints
+6. Evidence gaps
+
+Do not add sections for stable knowledge, good practices, or recommendations.
 """
 
 
@@ -980,8 +1355,40 @@ def target_prompt(
     candidates_requested: list[str],
     candidates_used: list[str],
     missing_candidates: list[str],
+    candidate_materials_with_contradictions: list[str],
 ) -> str:
-    return f"""# Evidence-backed cross-candidate knowledge for target: {target}
+    has_preserved_contradictions = bool(candidate_materials_with_contradictions)
+
+    example_verdict = (
+        "contradictions_found"
+        if has_preserved_contradictions
+        else "contradictions_found | no_contradiction | insufficient_evidence"
+    )
+
+    example_candidate_contradictions = [
+        {
+            "candidate_material": candidate,
+            "summary": (
+                "Copy the summary from the staged "
+                "material_consolidated.json."
+            ),
+            "contradictions": [
+                {
+                    "instruction": (
+                        "Copy the contradiction objects from the staged "
+                        "material_consolidated.json."
+                    )
+                }
+            ],
+            "source_report": (
+                "Use the staged material_consolidated.json path "
+                "from inputs/index.json."
+            ),
+        }
+        for candidate in candidate_materials_with_contradictions
+    ]
+
+    return f"""# Contradiction-only cross-candidate review for target: {target}
 
 Candidate materials requested:
 {', '.join(candidates_requested) or 'none'}
@@ -992,95 +1399,123 @@ Candidate materials available:
 Missing candidate materials:
 {', '.join(missing_candidates) or 'none'}
 
-This target-level stage has access to BOTH:
+Candidate materials whose material-level reports already have
+`contradiction_found: true` and therefore MUST appear in
+`candidate_material_contradictions`:
+{', '.join(candidate_materials_with_contradictions) or 'none'}
 
-- each candidate's evidence-backed `material_consolidated.json/.md`; and
-- the complete staged source-evidence tree used for that candidate consolidation.
+Your task is NOT to consolidate cross-material lessons or create a target recipe.
+Produce a report containing only contradiction information.
 
-Compact target task inputs are under `target_material_files/` when available.
+This stage has access to:
 
-Start with `inputs/index.json`. Read all candidate consolidations. Then inspect the
-candidate source evidence whenever:
+- each candidate's `material_consolidated.json/.md` contradiction review;
+- every underlying per-run review and staged source-evidence tree under that
+  candidate's `source_runs/` directory;
+- compact target task inputs under `target_material_files/` when available.
 
-- candidate conclusions conflict;
-- a high-impact causal claim needs verification;
-- a material consolidation appears to have flattened different run situations;
-- a lesson's transfer condition is unclear.
+Start with `inputs/index.json`.
 
-Do not blindly trust the material consolidations. They are indexes into evidence,
-not substitutes for evidence. Record which source files you checked.
+## Required two-part check
 
-## Objective
+1. Preserve every candidate-material contradiction already found by the material
+   stage. Do not silently drop, weaken, or rewrite it into a general rule.
+2. Independently check for genuine conceptual contradictions across different
+   candidate materials by comparing the underlying per-run claims and evidence.
 
-Produce one contradiction-aware context bundle for DeepSeek. Do not guess a final
-target recipe. The target mapping does not prove that any candidate lesson applies.
-Use the target task files only to identify observable similarities/differences and
-checks DeepSeek should perform.
+A cross-candidate conceptual contradiction exists only when reports make opposite
+claims about the same diagnostic mechanism or proposed remedy, such as treating
+same-site same-l padding as categorically fatal in one candidate but recommending
+it as the remedy in another, without clearly stated chemical or numerical
+conditions that reconcile the claims.
 
-For each apparent conceptual contradiction:
+Different materials are expected to have different chemistry and lessons. Do not
+flag a contradiction merely because candidates used different recipes, orbitals,
+windows, failure stages, or material-specific explanations. Chemistry can explain
+an apparent conflict; when it does, classify it as a non-contradictory difference,
+not as shared knowledge.
 
-1. Determine whether the candidate materials were actually in different situations.
-2. If both conclusions are valid under different conditions, preserve explicit
-   branches:
-   - IF situation A is observed, lesson A applies.
-   - IF situation B is observed, lesson B applies.
-3. State the target-side evidence that distinguishes the branches.
-4. Prefer evidence hierarchy over frequency.
-5. If still unresolved after checking source evidence, label it unresolved and do
-   not present either side as fact.
-6. Never flatten material-specific exceptions simply to produce a clean narrative.
-7. Never copy exact window energies or projection lists from a candidate into the
-   target merely because the materials were mapped together.
+Do not invent a winning rule. Do not write statements such as "hit-the-cap is
+standard", "spread outliers are physical", "symmetry is more important than
+rank", or equivalent broad conclusions unless the contradiction itself is a claim
+that such unsupported generalization appeared. Your output is a conflict map, not
+a consensus document.
 
-## Required outputs
+## Output policy
 
 Write exactly:
 
 - `ALL_SELF_DEBUG.md`
 - `ALL_SELF_DEBUG.json`
 
-The JSON must include at least:
+Use schema version {CONTRADICTION_SCHEMA_VERSION}:
 
 ```json
 {{
-  "schema_version": 2,
+  "schema_version": {CONTRADICTION_SCHEMA_VERSION},
   "material": "{target}",
   "target_material": "{target}",
-  "case_id": "target_cross_candidate_consensus",
-  "verdict": "evidence_backed_consolidated_context",
+  "case_id": "target_cross_candidate_contradiction_review",
+  "verdict": "{example_verdict}",
   "candidate_materials_requested": {json.dumps(candidates_requested)},
   "candidate_materials_used": {json.dumps(candidates_used)},
   "missing_candidate_materials": {json.dumps(missing_candidates)},
-  "usage_contract": [
-    "Candidate evidence is context, not automatically true for the target."
-  ],
+  "contradiction_found": {json.dumps(has_preserved_contradictions)},
+  "cross_candidate_contradiction_found": false,
+  "summary": "one concise sentence",
   "source_evidence_checks_performed": [],
-  "high_confidence_cross_candidate_knowledge": [],
-  "conditional_knowledge": [],
-  "candidate_specific_knowledge": [],
-  "reconciled_cross_candidate_conflicts": [],
-  "unresolved_cross_candidate_conflicts": [],
-  "do_not_generalize": [],
-  "deepseek_decision_checks": [],
+  "candidate_material_contradictions":
+    {json.dumps(example_candidate_contradictions, indent=2)},
+  "cross_candidate_conceptual_contradictions": [],
+  "non_contradictory_differences": [],
+  "deepseek_usage_constraints": [],
   "evidence_gaps": []
 }}
 ```
 
-The Markdown must begin with a warning that candidate knowledge must be matched to
-the target's observed situation. Use sections:
+`candidate_material_contradictions` must contain one entry for every candidate
+whose staged `material_consolidated.json` has `contradiction_found: true`. Each
+entry must preserve the candidate material name, summary, contradiction items, and
+source report path.
 
-1. How to use this bundle
-2. Source evidence checked
-3. High-confidence cross-candidate knowledge
-4. Conditional knowledge by unique situation
-5. Reconciled contradictions
-6. Candidate-specific knowledge
-7. Unresolved conflicts
-8. Do not generalize
-9. Target-side decision checklist
+Set `contradiction_found` to `true` and `verdict` to `contradictions_found`
+whenever either `candidate_material_contradictions` OR
+`cross_candidate_conceptual_contradictions` is non-empty. A target with preserved
+candidate-material contradictions is not a `no_contradiction` result, even when
+there are no new cross-candidate conceptual contradictions.
 
-Keep it concise enough for DeepSeek context, but never remove the conditions needed
-to make apparently contradictory lessons coexist safely.
+For each item in `cross_candidate_conceptual_contradictions`, include:
+
+- `topic`;
+- `status`: `resolved_by_context | conditional | unresolved`;
+- `candidate_claims` with candidate material, case ID, and confidence level;
+- `why_conceptually_incompatible`;
+- `chemistry_or_context_caveat`;
+- `source_evidence` with staged paths;
+- `target_side_discriminator_checks`;
+- `safe_deepseek_instruction`.
+
+If neither candidate-material contradictions nor cross-candidate conceptual
+contradictions exist:
+
+- set `verdict` to `no_contradiction`;
+- set both contradiction booleans to `false`;
+- leave both contradiction arrays empty;
+- keep the Markdown minimal: a warning heading and one result sentence;
+- do not output high-confidence knowledge, conditional knowledge, candidate-specific
+  lessons, decision checklists, generalized advice, or a cross-material summary.
+
+If contradictions exist, the Markdown should contain only:
+
+1. How to use this contradiction report
+2. Candidate-material contradictions
+3. Cross-candidate conceptual contradictions
+4. Context that resolves apparent conflicts
+5. Safe DeepSeek usage constraints
+6. Evidence gaps
+
+Candidate evidence remains namespaced to its source material. Never convert a
+contradiction into a universal chemical rule.
 """
 
 
@@ -1098,6 +1533,7 @@ def run_gemini_job(
     max_attempts: int,
     output_names: tuple[str, ...],
     validator: Callable[[Path], bool],
+    validation_errors: Callable[[Path], list[str]] | None = None,
 ) -> None:
     prompt_path = work_dir / "prompt.md"
     write_text(prompt_path, prompt)
@@ -1128,12 +1564,14 @@ def run_gemini_job(
         stdout = completed.stdout or ""
         write_text(attempt_log, stdout)
         valid = validator(work_dir)
+        errors = [] if valid or validation_errors is None else validation_errors(work_dir)
         attempts.append(
             {
                 "attempt": attempt_index,
                 "returncode": completed.returncode,
                 "attempt_log_path": attempt_log.name,
                 "valid_output": valid,
+                **({"validation_errors": errors} if errors else {}),
             }
         )
         write_json(
@@ -1151,7 +1589,8 @@ def run_gemini_job(
             write_text(combined_log, stdout)
             return
         print(
-            f"Gemini attempt {attempt_index}/{max_attempts} failed validation in {work_dir}",
+            f"Gemini attempt {attempt_index}/{max_attempts} failed validation in {work_dir}"
+            + (f": {'; '.join(errors)}" if errors else ""),
             file=sys.stderr,
         )
 
@@ -1217,8 +1656,8 @@ def stage_material_inputs(
     write_json(
         inputs_dir / "index.json",
         {
-            "schema_version": 2,
-            "stage": "per_candidate_material_evidence_backed_consolidation",
+            "schema_version": CONTRADICTION_SCHEMA_VERSION,
+            "stage": "per_candidate_material_contradiction_review",
             "material": material,
             "run_reviews": entries,
             "missing_source_evidence_cases": missing_evidence_cases,
@@ -1311,15 +1750,18 @@ def consolidate_one_material(
             f"Staging original evidence failed for {material}: " + ", ".join(staged_missing)
         )
     write_json(output_dir / "source_manifest.json", manifest)
-    run_gemini_job(
-        work_dir=output_dir,
-        prompt=material_prompt(material, len(reviews)),
-        gemini_bin=gemini_bin,
-        model=model,
-        max_attempts=max_attempts,
-        output_names=("material_consolidated.md", "material_consolidated.json"),
-        validator=material_output_is_valid,
-    )
+    if len(reviews) < 2:
+        write_single_run_material_output(output_dir, material, reviews)
+    else:
+        run_gemini_job(
+            work_dir=output_dir,
+            prompt=material_prompt(material, len(reviews)),
+            gemini_bin=gemini_bin,
+            model=model,
+            max_attempts=max_attempts,
+            output_names=("material_consolidated.md", "material_consolidated.json"),
+            validator=material_output_is_valid,
+        )
     publish_material_aliases(output_dir, material_root)
     return MaterialConsolidationResult(
         material=material,
@@ -1396,8 +1838,8 @@ def stage_target_inputs(
     write_json(
         inputs_dir / "index.json",
         {
-            "schema_version": 2,
-            "stage": "per_target_cross_candidate_evidence_backed_consolidation",
+            "schema_version": CONTRADICTION_SCHEMA_VERSION,
+            "stage": "per_target_cross_candidate_contradiction_review",
             "target_material": target,
             "candidate_materials_requested": candidates_requested,
             "candidate_materials_used": candidates_used,
@@ -1485,20 +1927,36 @@ def consolidate_one_target(
             f"Internal candidate staging mismatch for {target}: {staged_used} != {candidates_used}"
         )
     write_json(output_dir / "source_manifest.json", manifest)
-    run_gemini_job(
-        work_dir=output_dir,
-        prompt=target_prompt(
+    if len(candidates_used) < 2:
+        write_single_candidate_target_output(
+            output_dir,
             target,
             candidates_requested,
             candidates_used,
             missing_candidates,
-        ),
-        gemini_bin=gemini_bin,
-        model=model,
-        max_attempts=max_attempts,
-        output_names=("ALL_SELF_DEBUG.md", "ALL_SELF_DEBUG.json"),
-        validator=target_output_is_valid,
-    )
+            material_results,
+        )
+    else:
+        run_gemini_job(
+            work_dir=output_dir,
+            prompt=target_prompt(
+                target,
+                candidates_requested,
+                candidates_used,
+                missing_candidates,
+                [
+                    candidate
+                    for candidate in candidates_used
+                    if candidate in _target_input_candidate_contradictions(output_dir)
+                ],
+            ),
+            gemini_bin=gemini_bin,
+            model=model,
+            max_attempts=max_attempts,
+            output_names=("ALL_SELF_DEBUG.md", "ALL_SELF_DEBUG.json"),
+            validator=target_output_is_valid,
+            validation_errors=target_output_validation_errors,
+        )
     publish_target_aliases(output_dir, target_root)
     return TargetConsolidationResult(
         target=target,
@@ -1549,7 +2007,7 @@ def write_overall_index(
     write_json(
         path,
         {
-            "schema_version": 2,
+            "schema_version": CONTRADICTION_SCHEMA_VERSION,
             "model": model,
             "source_reviews_root": str(reviews_root),
             "source_run_roots": [str(path) for path in run_roots],
@@ -1567,6 +2025,8 @@ def write_overall_index(
                     "json": str(result.json_path),
                     "markdown": str(result.md_path),
                     "skipped_as_fresh": result.skipped_as_fresh,
+                    "verdict": read_json_object(result.json_path).get("verdict"),
+                    "contradiction_found": read_json_object(result.json_path).get("contradiction_found"),
                 }
                 for material, result in sorted(material_results.items())
             },
@@ -1578,6 +2038,9 @@ def write_overall_index(
                     "candidate_materials_used": list(result.candidates_used),
                     "missing_candidate_materials": list(result.missing_candidates),
                     "skipped_as_fresh": result.skipped_as_fresh,
+                    "verdict": read_json_object(result.json_path).get("verdict"),
+                    "contradiction_found": read_json_object(result.json_path).get("contradiction_found"),
+                    "cross_candidate_contradiction_found": read_json_object(result.json_path).get("cross_candidate_contradiction_found"),
                 }
                 for target, result in sorted(target_results.items())
             },
@@ -1595,7 +2058,7 @@ def write_overall_index(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Evidence-backed per-material and per-target Gemini consolidation for "
+            "Contradiction-only per-material and cross-candidate Gemini review for "
             "DeepSeek self-debug context."
         )
     )
@@ -1741,7 +2204,7 @@ def main() -> None:
     material_failures: dict[str, str] = {}
     material_workers = min(cli.max_concurrent_materials, max(1, len(unique_candidates)))
     print(
-        f"Evidence-backed material consolidation: {len(unique_candidates)} unique candidate(s), "
+        f"Same-material contradiction review: {len(unique_candidates)} unique candidate(s), "
         f"concurrency={material_workers}."
     )
     with ThreadPoolExecutor(max_workers=material_workers) as pool:
@@ -1773,14 +2236,14 @@ def main() -> None:
             else:
                 material_results[material] = result
                 state = "fresh" if result.skipped_as_fresh else "generated"
-                print(f"Material consolidation {state}: {material}")
+                print(f"Material contradiction review {state}: {material}")
 
     target_results: dict[str, TargetConsolidationResult] = {}
     target_failures: dict[str, str] = {}
     target_items = sorted(candidates_by_target.items())
     target_workers = min(cli.max_concurrent_targets, max(1, len(target_items)))
     print(
-        f"Evidence-backed target consolidation: {len(target_items)} target(s), "
+        f"Cross-candidate contradiction review: {len(target_items)} target(s), "
         f"concurrency={target_workers}."
     )
     with ThreadPoolExecutor(max_workers=target_workers) as pool:
@@ -1812,7 +2275,7 @@ def main() -> None:
             else:
                 target_results[target] = result
                 state = "fresh" if result.skipped_as_fresh else "generated"
-                print(f"Target consolidation {state}: {target}")
+                print(f"Target contradiction review {state}: {target}")
 
     successful_targets = sorted(target_results)
     write_compatibility_csv(compatibility_csv, successful_targets)
