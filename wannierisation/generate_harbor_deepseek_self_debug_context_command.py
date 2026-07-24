@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Print Harbor commands for DeepSeek runs with prior self-debug context.
-
+...
 The self-debug / next-run context input surface is preserved, while recipe
 compilation, locked execution, timeout budgeting, and verifier-side execution
 follow the same controlled path as generate_harbor_deepseek.py.
