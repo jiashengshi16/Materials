@@ -94,6 +94,7 @@ LOCKED_DENIED_COMMANDS = [
 CONTROLLED_ARTIFACTS = [
     "/app/workflow/recipe_request.json",
     "/app/workflow/compile_recipe_report.json",
+    "/app/workflow/compile_recipe_reports",
     "/app/workflow/LOCKED_RECIPE.json",
     "/app/workflow/DECISIONS.md",
     "/app/workflow/locked_runner.log",
@@ -995,7 +996,7 @@ APP = Path("/app")
 WORKFLOW_DIR = APP / "workflow"
 RUNNER_PATH = APP / "locked_wannier_runner.py"
 REPORT_PATH = WORKFLOW_DIR / "compile_recipe_report.json"
-MAX_LOG_CHARS = 6000
+REPORTS_DIR = WORKFLOW_DIR / "compile_recipe_reports"
 
 
 def load_runner() -> Any:
@@ -1007,11 +1008,10 @@ def load_runner() -> Any:
     return module
 
 
-def log_tail(path: Path, *, max_chars: int = MAX_LOG_CHARS) -> str:
+def log_tail(path: Path) -> str:
     if not path.is_file():
         return ""
-    text = path.read_text(encoding="utf-8", errors="replace")
-    return text[-max_chars:]
+    return path.read_text(encoding="utf-8", errors="replace")
 
 
 def projection_count_diagnostics(recipe: dict[str, Any], nscf: dict[str, Any]) -> dict[str, Any]:
@@ -1123,7 +1123,18 @@ def upstream_pp_diagnostics(
 
     primary_cause = "wannier90.x -pp did not generate the .nnkp file"
     hints: list[str] = []
-    if "too few projection functions" in lower:
+    if "kmesh_get_bvector" in lower or "not enough bvectors found" in lower:
+        primary_cause = "Wannier90 k-mesh b-vector search failed"
+        hints.extend([
+            "This is a Wannier90 preprocessing failure in automatic b-vector selection, "
+            "usually caused by degenerate neighbour shells for the cell/k-point grid.",
+            "This is not a projection syntax/count issue; changing projections alone is "
+            "unlikely to fix it.",
+            "If the workflow allows raw Wannier90 controls, try kmesh_tol or "
+            "devel_flag = kmesh_degen. Otherwise the material/k-grid likely cannot be "
+            "made to pass with the locked recipe schema.",
+        ])
+    elif "too few projection functions" in lower:
         primary_cause = "too few projection functions defined"
         hints.append(
             "Wannier90 rejected the projection block before writing .nnkp because "
@@ -1154,6 +1165,13 @@ def upstream_pp_diagnostics(
 
 
 def missing_nnkp_message(seed: str, diagnostics: dict[str, Any]) -> str:
+    if diagnostics["primary_cause"] == "Wannier90 k-mesh b-vector search failed":
+        return (
+            f"wannier90.x -pp did not generate {seed}.nnkp. "
+            f"Primary cause: {diagnostics['primary_cause']}. "
+            "This is a k-mesh/cell geometry issue, not a projection recipe issue; "
+            "see upstream_diagnostics.hints and wout_tail."
+        )
     return (
         f"wannier90.x -pp did not generate {seed}.nnkp. "
         f"Primary cause: {diagnostics['primary_cause']}. "
@@ -1267,11 +1285,21 @@ def window_report(recipe: dict[str, Any], eig_path: Path) -> dict[str, Any]:
 
 def write_report(report: dict[str, Any]) -> None:
     WORKFLOW_DIR.mkdir(parents=True, exist_ok=True)
-    REPORT_PATH.write_text(
-        json.dumps(report, indent=2, sort_keys=True) + "\n",
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    attempt_index = len(sorted(REPORTS_DIR.glob("compile_attempt_*.json"))) + 1
+    attempt_path = REPORTS_DIR / f"compile_attempt_{attempt_index:02d}.json"
+    report = {
+        **report,
+        "compile_attempt_index": attempt_index,
+        "compile_attempt_report_path": f"workflow/compile_recipe_reports/{attempt_path.name}",
+    }
+    report_text = json.dumps(report, indent=2, sort_keys=True) + "\n"
+    attempt_path.write_text(
+        report_text,
         encoding="utf-8",
     )
-    print(json.dumps(report, indent=2, sort_keys=True), flush=True)
+    REPORT_PATH.write_text(report_text, encoding="utf-8")
+    print(report_text, flush=True)
 
 
 def fail(stage: str, message: str, **extra: Any) -> int:
