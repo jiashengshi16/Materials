@@ -13,6 +13,9 @@ import os
 import re
 import shutil
 import subprocess
+import threading
+
+import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,88 +24,45 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 HARBOR_DATASET_ROOT = ROOT / "harbor_datasets" / "wannier_200"
 CANDIDATE_RUN_ERROR_TABLE = ROOT / "include_only_candidates.csv"
+
 # Hardcoded experiment controls.
 # Choose either "chemically similar" or "list".
 MATERIAL_SELECTION_MODE = "chemically similar"
 
-MATERIALS = [
-
-'Al18Co4',
-'Al4Sc2',
-'Li4O6Si2',
-'Si6Y10',
-'Mg2O10Ti4',
-"Al4Mn2O8",
-"C4O12Sr4",
-'B2Ta',
-'RuTi',
-'Ag2Y',
-'NNb',
-'C2Cu2O6'
-]
-
 # MATERIALS = [
-#     "Al12Ni4",
-#     "Al4Mn2O8",
-#     "Al4O8Zn2",
-#     'Al4Y2',
-#     "Al8Zr4",
-#     "Al4Sc2",
-# "Kr2",
-# 'Au2Y',
-# 'Ag2Sc',
-# 'Ag2Y',
-# 'B2Mn',
-# 'B2Ta',
-# 'B2Ti',
-# 'C2Cu2O6',
-# 'C4O12Sr4',
-# 'C2Cd2O6',
-# 'O2Sr',
-# 'Br2V',
-# 'Cl2Ti',
-# 'Mg4O12Se4',
+
+# 'Al18Co4',
+# 'Al4Sc2',
 # 'Li4O6Si2',
-# 'F4Ni2',
-# 'Co2F4',
-# 'Cr6Ga2',
-# 'Mo6Si2',
-# 'Al2Mo6',
-# 'Ga2Mo6',
-# 'B8H16O16',
-# 'Ne',
-# 'Hf6Si4',
-# 'Hf4Si2',
 # 'Si6Y10',
-# 'O2Pd2',
-# 'Co2O8W2',
-# 'CTi',
-# 'Hf4Ni4',
-# 'Pt4Y4',
-# 'Hg3O3',
-# 'O2Pb2',
-# 'Ru4S8',
-# 'Co4S8',
-# 'FeTi',
-# 'RuZr',
-# 'RhSc',
-# 'FLi',
-# 'BrNa',
-# 'Ar2',
-# 'AgSc',
+# 'Mg2O10Ti4',
+# "Al4Mn2O8",
+# "C4O12Sr4",
+# 'B2Ta',
+# 'RuTi',
+# 'Ag2Y',
+# 'NNb',
+# 'C2Cu2O6'
 # ]
 
 MODEL = "gemini-3.5-flash"
 GEMINI_BIN = "gemini"
 MAX_CONCURRENT_GEMINI = 12
-OUTPUT_ROOT = ROOT / "jobsGeminiReviewsDeepseek" / "gemini_self_debug_reviews"
+OUTPUT_ROOT = ROOT / "jobsGeminiReviewsDeepseekIter2" / "gemini_self_debug_reviews"
 RUN_ROOTS = [
-    ROOT / "jobsDeepseekProTerminus2Controlled",
+    ROOT / "jobsDeepseekProTerminus2ControlledIter2",
 ]
 NUM_WANN_JOB_RE = re.compile(
     r"^num_wann_ordered__(?P<timestamp>.+?)__pid(?P<pid>\d+)__"
     r"(?P<middle>.+?)__num_wann_(?P<num_wann>\d+)__(?P<material>.+)$"
 )
+
+# Deterministic AMN diagnostics. Raw .amn/.mmn/.chk/_hr.dat files are not staged
+# for Gemini; the complete .amn is reduced numerically before the review starts.
+AMN_EFFECTIVE_RANK_RELATIVE_TOLS = (1.0e-6, 1.0e-8, 1.0e-10)
+AMN_WORST_KPOINT_LIMIT = 8
+MAX_CONCURRENT_AMN_SUMMARIES = 2
+AMN_SUMMARY_SEMAPHORE = threading.Semaphore(MAX_CONCURRENT_AMN_SUMMARIES)
 
 
 @dataclass(frozen=True)
@@ -187,23 +147,744 @@ def has_attempt_file(attempt: Path, material: str, suffix: str) -> bool:
     return bool(sorted(attempt.glob(f"*{suffix}")))
 
 
+def optional_attempt_file(attempt: Path, material: str, suffix: str) -> Path | None:
+    """Resolve an exact per-material artifact, falling back to one unambiguous suffix match."""
+    exact = attempt / f"{material}{suffix}"
+    if exact.is_file():
+        return exact
+    matches = sorted(path for path in attempt.glob(f"*{suffix}") if path.is_file())
+    return matches[0] if len(matches) == 1 else None
+
+
+def finite_json_float(value: float) -> float | None:
+    """Return a JSON-safe finite float; represent infinities/NaNs as null."""
+    value = float(value)
+    return value if np.isfinite(value) else None
+
+
+def fortran_float(value: str) -> float:
+    return float(value.replace("D", "E").replace("d", "e"))
+
+
+def parse_win_numeric_parameters(path: Path) -> dict[str, int | float]:
+    """Read the small set of numeric .win parameters needed for AMN diagnostics."""
+    wanted = {
+        "num_wann",
+        "num_bands",
+        "dis_win_min",
+        "dis_win_max",
+        "dis_froz_min",
+        "dis_froz_max",
+    }
+    result: dict[str, int | float] = {}
+    for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw_line.split("!", 1)[0].strip()
+        if "=" not in line:
+            continue
+        key, raw_value = (part.strip() for part in line.split("=", 1))
+        key = key.lower()
+        if key not in wanted:
+            continue
+        token = raw_value.split()[0].rstrip(",")
+        try:
+            if key in {"num_wann", "num_bands"}:
+                result[key] = int(token)
+            else:
+                result[key] = fortran_float(token)
+        except ValueError:
+            continue
+    return result
+
+
+def amn_recipe_parameters(case: TrialCase, win_path: Path | None) -> tuple[dict[str, Any], list[str]]:
+    """Collect recipe/window parameters without depending on any hidden reference data."""
+    parameters: dict[str, Any] = {}
+    sources: list[str] = []
+
+    if win_path is not None:
+        parsed_win = parse_win_numeric_parameters(win_path)
+        if parsed_win:
+            parameters.update(parsed_win)
+            sources.append(str(win_path))
+
+    wannier_parameters = case.manifest.get("wannier_parameters")
+    if isinstance(wannier_parameters, dict):
+        for key in (
+            "num_wann",
+            "num_bands",
+            "dis_win_min",
+            "dis_win_max",
+            "dis_froz_min",
+            "dis_froz_max",
+        ):
+            if key not in parameters and key in wannier_parameters:
+                parameters[key] = wannier_parameters[key]
+        sources.append("run_manifest.json:wannier_parameters")
+
+    for key in ("num_wann", "num_bands"):
+        if key not in parameters and key in case.manifest:
+            parameters[key] = case.manifest[key]
+
+    recipe_paths = (
+        case.trial_dir / "artifacts" / "app" / "workflow" / "LOCKED_RECIPE.json",
+        case.trial_dir / "artifacts" / "app" / "workflow" / "recipe_request.json",
+    )
+    for recipe_path in recipe_paths:
+        recipe = read_json_object_if_present(recipe_path)
+        if not recipe:
+            continue
+        for key in ("num_wann", "num_bands"):
+            if key not in parameters and key in recipe:
+                parameters[key] = recipe[key]
+        windows = recipe.get("windows")
+        if isinstance(windows, dict):
+            for key in ("dis_win_min", "dis_win_max", "dis_froz_min", "dis_froz_max"):
+                if key not in parameters and key in windows:
+                    parameters[key] = windows[key]
+        sources.append(str(recipe_path))
+
+    if "num_wann" not in parameters:
+        folder_num_wann = case.job_metadata.get("num_wann_from_folder")
+        if isinstance(folder_num_wann, int):
+            parameters["num_wann"] = folder_num_wann
+            sources.append("job_folder:num_wann")
+
+    return parameters, sources
+
+
+def parse_amn_matrix(path: Path) -> tuple[np.ndarray, dict[str, Any], list[str]]:
+    """Parse a Wannier90 .amn file into A[k, band, projection]."""
+    with path.open(encoding="utf-8", errors="replace") as handle:
+        header_lines: list[str] = []
+        dimensions: tuple[int, int, int] | None = None
+
+        # Standard .amn has one comment line followed by three dimensions. Scan a
+        # few lines defensively so harmless extra header text does not break review.
+        for _ in range(20):
+            line = handle.readline()
+            if not line:
+                break
+            parts = line.split()
+            if len(parts) == 3:
+                try:
+                    values = tuple(int(part) for part in parts)
+                except ValueError:
+                    values = ()
+                if len(values) == 3 and all(value > 0 for value in values):
+                    dimensions = values  # num_bands, num_kpoints, num_projections
+                    break
+            header_lines.append(line.rstrip("\n"))
+
+        if dimensions is None:
+            raise ValueError("could not locate the .amn dimension line")
+
+        num_bands, num_kpoints, num_projections = dimensions
+        matrix = np.zeros(
+            (num_kpoints, num_bands, num_projections),
+            dtype=np.complex128,
+        )
+        seen = np.zeros(
+            (num_kpoints, num_bands, num_projections),
+            dtype=np.bool_,
+        )
+
+        parsed_records = 0
+        duplicate_records = 0
+        malformed_records = 0
+        out_of_range_records = 0
+        nonfinite_records = 0
+        nonblank_data_lines = 0
+
+        for line in handle:
+            if not line.strip():
+                continue
+            nonblank_data_lines += 1
+            parts = line.split()
+            if len(parts) < 5:
+                malformed_records += 1
+                continue
+            try:
+                band_index = int(parts[0])
+                projection_index = int(parts[1])
+                kpoint_index = int(parts[2])
+                real = fortran_float(parts[3])
+                imag = fortran_float(parts[4])
+            except ValueError:
+                malformed_records += 1
+                continue
+
+            if not (
+                1 <= band_index <= num_bands
+                and 1 <= projection_index <= num_projections
+                and 1 <= kpoint_index <= num_kpoints
+            ):
+                out_of_range_records += 1
+                continue
+            if not (np.isfinite(real) and np.isfinite(imag)):
+                nonfinite_records += 1
+                continue
+
+            parsed_records += 1
+            target = (
+                kpoint_index - 1,
+                band_index - 1,
+                projection_index - 1,
+            )
+            if seen[target]:
+                duplicate_records += 1
+                continue
+            seen[target] = True
+            matrix[target] = complex(real, imag)
+
+    expected_records = num_bands * num_kpoints * num_projections
+    unique_records = int(seen.sum())
+    missing_records = expected_records - unique_records
+    integrity = {
+        "expected_records": expected_records,
+        "nonblank_data_lines": nonblank_data_lines,
+        "parsed_records": parsed_records,
+        "unique_records": unique_records,
+        "missing_records": missing_records,
+        "duplicate_records": duplicate_records,
+        "malformed_records": malformed_records,
+        "out_of_range_records": out_of_range_records,
+        "nonfinite_records": nonfinite_records,
+        "complete_unique_coverage": missing_records == 0,
+        "analysis_reliable": (
+            missing_records == 0
+            and malformed_records == 0
+            and out_of_range_records == 0
+            and nonfinite_records == 0
+        ),
+    }
+    return matrix, integrity, header_lines
+
+
+def parse_eig_matrix(
+    path: Path,
+    *,
+    num_bands: int,
+    num_kpoints: int,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Parse .eig into energies[k, band] for the AMN band pool."""
+    energies = np.full((num_kpoints, num_bands), np.nan, dtype=np.float64)
+    parsed_records = 0
+    duplicate_records = 0
+    malformed_records = 0
+    out_of_range_records = 0
+    nonfinite_records = 0
+
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        parts = line.split()
+        if len(parts) < 3:
+            malformed_records += 1
+            continue
+        try:
+            band_index = int(parts[0])
+            kpoint_index = int(parts[1])
+            energy = fortran_float(parts[2])
+        except ValueError:
+            malformed_records += 1
+            continue
+        if not (
+            1 <= band_index <= num_bands
+            and 1 <= kpoint_index <= num_kpoints
+        ):
+            out_of_range_records += 1
+            continue
+        if not np.isfinite(energy):
+            nonfinite_records += 1
+            continue
+
+        target = (kpoint_index - 1, band_index - 1)
+        if np.isfinite(energies[target]):
+            duplicate_records += 1
+            continue
+        energies[target] = energy
+        parsed_records += 1
+
+    expected_records = num_bands * num_kpoints
+    missing_records = int(np.isnan(energies).sum())
+    return energies, {
+        "expected_records_for_amn_band_pool": expected_records,
+        "parsed_unique_records": parsed_records,
+        "missing_records_for_amn_band_pool": missing_records,
+        "duplicate_records": duplicate_records,
+        "malformed_records": malformed_records,
+        "out_of_range_records": out_of_range_records,
+        "nonfinite_records": nonfinite_records,
+        "complete_for_amn_band_pool": missing_records == 0,
+    }
+
+def matrix_singular_metrics(matrix: np.ndarray) -> dict[str, Any]:
+    """Compute compact SVD conditioning and effective-rank sensitivity metrics."""
+    num_columns = int(matrix.shape[1])
+
+    if matrix.shape[0] == 0 or num_columns == 0:
+        singular_values = np.zeros(num_columns, dtype=np.float64)
+    else:
+        singular_values = np.linalg.svd(matrix, compute_uv=False)
+        if singular_values.size < num_columns:
+            singular_values = np.pad(
+                singular_values,
+                (0, num_columns - singular_values.size),
+                mode="constant",
+            )
+
+    sigma_max = float(singular_values[0]) if singular_values.size else 0.0
+    sigma_min = float(singular_values[-1]) if singular_values.size else 0.0
+    normalized_smallest = sigma_min / sigma_max if sigma_max > 0.0 else 0.0
+
+    effective_ranks: dict[str, int] = {}
+    for tolerance in AMN_EFFECTIVE_RANK_RELATIVE_TOLS:
+        threshold = tolerance * sigma_max
+        effective_ranks[f"{tolerance:.0e}"] = int(
+            np.count_nonzero(singular_values > threshold)
+        )
+
+    return {
+        "effective_rank_by_relative_threshold": effective_ranks,
+        "normalized_smallest_singular_value": normalized_smallest,
+    }
+
+
+def projection_pair_correlation(matrix: np.ndarray) -> tuple[float, tuple[int, int] | None]:
+    """Return the largest normalized absolute column correlation at one k-point."""
+    num_projections = matrix.shape[1]
+    if num_projections < 2 or matrix.shape[0] == 0:
+        return 0.0, None
+
+    gram = matrix.conj().T @ matrix
+    norms = np.sqrt(np.maximum(np.real(np.diag(gram)), 0.0))
+    denominator = norms[:, None] * norms[None, :]
+    correlation = np.zeros_like(np.real(gram), dtype=np.float64)
+    valid = denominator > 0.0
+    correlation[valid] = np.abs(gram[valid]) / denominator[valid]
+    np.fill_diagonal(correlation, 0.0)
+
+    flat_index = int(np.argmax(correlation))
+    row, column = np.unravel_index(flat_index, correlation.shape)
+    maximum = float(correlation[row, column])
+    if maximum <= 0.0:
+        return 0.0, None
+    return maximum, (int(row) + 1, int(column) + 1)
+
+def analyze_amn_pool(
+    amn: np.ndarray,
+    *,
+    band_masks: np.ndarray | None = None,
+) -> dict[str, Any]:
+    """Aggregate compact AMN conditioning and effective-rank sensitivity diagnostics."""
+    num_kpoints, _num_bands, num_projections = amn.shape
+
+    normalized_smallest_values: list[float] = []
+    worst_kpoints: list[dict[str, Any]] = []
+    effective_rank_sensitivity_counts = {
+        f"{tolerance:.0e}": 0
+        for tolerance in AMN_EFFECTIVE_RANK_RELATIVE_TOLS
+    }
+
+    maximum_pair_correlation = 0.0
+    maximum_pair: tuple[int, int] | None = None
+    maximum_pair_kpoint: int | None = None
+    selected_band_counts: list[int] = []
+
+    for kpoint_index in range(num_kpoints):
+        matrix = amn[kpoint_index]
+
+        if band_masks is not None:
+            mask = band_masks[kpoint_index]
+            matrix = matrix[mask]
+
+        selected_band_count = int(matrix.shape[0])
+        selected_band_counts.append(selected_band_count)
+
+        metrics = matrix_singular_metrics(matrix)
+
+        normalized_smallest = float(
+            metrics["normalized_smallest_singular_value"]
+        )
+        normalized_smallest_values.append(normalized_smallest)
+
+        effective_ranks = metrics[
+            "effective_rank_by_relative_threshold"
+        ]
+
+        for tolerance_key, effective_rank in effective_ranks.items():
+            if int(effective_rank) < num_projections:
+                effective_rank_sensitivity_counts[tolerance_key] += 1
+
+        pair_correlation, pair = projection_pair_correlation(matrix)
+        if pair_correlation > maximum_pair_correlation:
+            maximum_pair_correlation = pair_correlation
+            maximum_pair = pair
+            maximum_pair_kpoint = kpoint_index + 1
+
+        worst_kpoints.append(
+            {
+                "kpoint_index": kpoint_index + 1,
+                "bands_in_analyzed_pool": selected_band_count,
+                "normalized_smallest_singular_value": normalized_smallest,
+                "effective_rank_by_relative_threshold": effective_ranks,
+            }
+        )
+
+    # These are the k-points with the smallest relative singular value.
+    # This is a numerical ordering only; it is not a categorical bad/good judgment.
+    worst_kpoints.sort(
+        key=lambda item: float(
+            item["normalized_smallest_singular_value"]
+        )
+    )
+    worst_kpoints = worst_kpoints[:AMN_WORST_KPOINT_LIMIT]
+
+    return {
+        "num_projection_columns": num_projections,
+
+        "effective_rank_sensitivity": {
+            tolerance: {
+                "kpoints_below_projection_count": count,
+                "fraction_of_kpoints": (
+                    count / num_kpoints
+                    if num_kpoints
+                    else None
+                ),
+            }
+            for tolerance, count
+            in effective_rank_sensitivity_counts.items()
+        },
+
+        "minimum_normalized_smallest_singular_value": (
+            min(normalized_smallest_values)
+            if normalized_smallest_values
+            else None
+        ),
+
+        "median_normalized_smallest_singular_value": (
+            float(np.median(normalized_smallest_values))
+            if normalized_smallest_values
+            else None
+        ),
+
+        "minimum_bands_in_analyzed_pool": (
+            min(selected_band_counts)
+            if selected_band_counts
+            else 0
+        ),
+
+        "maximum_bands_in_analyzed_pool": (
+            max(selected_band_counts)
+            if selected_band_counts
+            else 0
+        ),
+
+        "worst_kpoints": worst_kpoints,
+
+        # Retained as a raw numerical observation in the JSON.
+        # Do not automatically promote a single maximum correlation
+        # into a diagnosis in direct_observations.
+        "projection_redundancy": {
+            "maximum_normalized_pair_correlation":
+                maximum_pair_correlation,
+            "most_correlated_projection_pair": (
+                list(maximum_pair)
+                if maximum_pair is not None
+                else None
+            ),
+            "kpoint_index": maximum_pair_kpoint,
+        },
+    }
+
+def effective_rank_sensitivity_text(
+    label: str,
+    analysis: dict[str, Any],
+    num_kpoints: int,
+) -> str:
+    parts = []
+
+    for tolerance, values in analysis["effective_rank_sensitivity"].items():
+        count = int(values["kpoints_below_projection_count"])
+        parts.append(f"{tolerance}: {count}/{num_kpoints}")
+
+    return (
+        f"{label} effective-rank sensitivity "
+        f"(k-points with effective rank below the projection count): "
+        + ", ".join(parts)
+        + ". These values are threshold-dependent numerical descriptors, "
+        "not categorical proof of a defective projection recipe."
+    )
+
+def summarize_amn_case(case: TrialCase) -> dict[str, Any]:
+    """Create deterministic projection diagnostics from the complete raw .amn file."""
+    material = case.material
+    amn_path = optional_attempt_file(case.attempt_dir, material, ".amn")
+    win_path = optional_attempt_file(case.attempt_dir, material, ".win")
+    eig_path = optional_attempt_file(case.attempt_dir, material, ".eig")
+
+    parameters, parameter_sources = amn_recipe_parameters(case, win_path)
+    expected_num_wann = parameters.get("num_wann")
+    try:
+        expected_num_wann = (
+            int(expected_num_wann)
+            if expected_num_wann is not None
+            else None
+        )
+    except (TypeError, ValueError):
+        expected_num_wann = None
+
+    summary: dict[str, Any] = {
+        "summary_schema_version": 2,
+        "material": material,
+        "status": "missing_amn",
+        "source_file": amn_path.name if amn_path is not None else None,
+        "source_file_size_bytes": (
+            amn_path.stat().st_size
+            if amn_path is not None
+            else None
+        ),
+        "parameter_sources": parameter_sources,
+        "expected_num_wann": expected_num_wann,
+        "method": {
+            "description": (
+                "Deterministic numerical reduction of the complete Wannier90 "
+                ".amn matrix before Gemini review."
+            ),
+            "matrix_convention": "A[kpoint, band, projection]",
+            "effective_rank_relative_thresholds": list(
+                    AMN_EFFECTIVE_RANK_RELATIVE_TOLS
+                ),
+            "outer_window_rule": "dis_win_min <= eigenvalue <= dis_win_max",
+        },
+        "interpretation_limits": [
+            (
+                "AMN dimensions, file-integrity counts, band counts, singular-value "
+                "statistics, effective-rank sensitivity values, and projection-pair "
+                "correlations are direct numerical observations."
+            ),
+            (
+                "Effective-rank results are threshold-dependent numerical descriptors, "
+                "not categorical definitions of mathematical rank."
+            ),
+            (
+                "Small singular values or high pair correlations can indicate numerical "
+                "conditioning or redundancy risk but do not by themselves establish a "
+                "defective projection recipe or explain the final outcome."
+            ),
+            (
+                "Causal interpretation must be checked against the old decision chain, "
+                ".wout, execution logs, and verifier diagnostics."
+            ),
+        ],
+    }
+
+    if amn_path is None:
+        summary["direct_observations"] = [
+            "No raw .amn file was available in the source attempt, so deterministic AMN diagnostics could not be generated."
+        ]
+        return summary
+
+    try:
+        with AMN_SUMMARY_SEMAPHORE:
+            amn, integrity, header_lines = parse_amn_matrix(amn_path)
+            num_kpoints, num_bands, num_projections = amn.shape
+
+            summary["status"] = (
+                "parsed"
+                if integrity["analysis_reliable"]
+                else "parsed_with_integrity_warnings"
+            )
+            summary["header_lines"] = header_lines[:5]
+            summary["dimensions"] = {
+                "num_bands": num_bands,
+                "num_kpoints": num_kpoints,
+                "num_projections": num_projections,
+                "expected_num_wann": expected_num_wann,
+                "projection_count_matches_expected_num_wann": (
+                    num_projections == expected_num_wann
+                    if expected_num_wann is not None
+                    else None
+                ),
+            }
+            summary["file_integrity"] = integrity
+            summary["full_band_pool"] = analyze_amn_pool(amn)
+
+            outer_window_keys = ("dis_win_min", "dis_win_max")
+            frozen_window_keys = ("dis_froz_min", "dis_froz_max")
+            have_outer_window = all(key in parameters for key in outer_window_keys)
+            have_frozen_window = all(key in parameters for key in frozen_window_keys)
+
+            energies = None
+            eig_integrity = None
+            if eig_path is not None:
+                energies, eig_integrity = parse_eig_matrix(
+                    eig_path,
+                    num_bands=num_bands,
+                    num_kpoints=num_kpoints,
+                )
+
+            if energies is not None and have_outer_window:
+                dis_win_min = float(parameters["dis_win_min"])
+                dis_win_max = float(parameters["dis_win_max"])
+                finite_energies = np.isfinite(energies)
+                band_masks = (
+                    finite_energies
+                    & (energies >= dis_win_min)
+                    & (energies <= dis_win_max)
+                )
+                outer = analyze_amn_pool(amn, band_masks=band_masks)
+                outer.update(
+                    {
+                        "status": "available",
+                        "eig_source_file": eig_path.name,
+                        "dis_win_min_ev": dis_win_min,
+                        "dis_win_max_ev": dis_win_max,
+                        "eig_integrity": eig_integrity,
+                    }
+                )
+                summary["outer_window_restricted"] = outer
+            else:
+                missing_reasons: list[str] = []
+                if eig_path is None:
+                    missing_reasons.append("missing .eig file")
+                if not have_outer_window:
+                    missing_reasons.append("missing dis_win_min/dis_win_max")
+                summary["outer_window_restricted"] = {
+                    "status": "unavailable",
+                    "reasons": missing_reasons,
+                }
+
+            # Frozen-window diagnostics intentionally report only band counts.
+            # Requiring full projection rank inside the frozen window would be
+            # conceptually wrong whenever fewer than num_wann states are frozen.
+            if energies is not None and have_frozen_window:
+                dis_froz_min = float(parameters["dis_froz_min"])
+                dis_froz_max = float(parameters["dis_froz_max"])
+                finite_energies = np.isfinite(energies)
+                frozen_masks = (
+                    finite_energies
+                    & (energies >= dis_froz_min)
+                    & (energies <= dis_froz_max)
+                )
+                frozen_counts = np.count_nonzero(frozen_masks, axis=1)
+                exceeds_num_wann = (
+                    int(np.count_nonzero(frozen_counts > expected_num_wann))
+                    if expected_num_wann is not None
+                    else None
+                )
+                summary["frozen_window_band_counts"] = {
+                    "status": "available",
+                    "eig_source_file": eig_path.name,
+                    "dis_froz_min_ev": dis_froz_min,
+                    "dis_froz_max_ev": dis_froz_max,
+                    "minimum_frozen_band_count": int(frozen_counts.min()) if frozen_counts.size else 0,
+                    "maximum_frozen_band_count": int(frozen_counts.max()) if frozen_counts.size else 0,
+                    "median_frozen_band_count": float(np.median(frozen_counts)) if frozen_counts.size else 0.0,
+                    "kpoints_with_frozen_band_count_above_num_wann": exceeds_num_wann,
+                    "frozen_band_count_exceeds_num_wann": (
+                        exceeds_num_wann > 0 if exceeds_num_wann is not None else None
+                    ),
+                    "eig_integrity": eig_integrity,
+                    "interpretation": (
+                        "This checks the direct Wannier90 consistency condition that the number of frozen bands at any k-point should not exceed num_wann. No full-rank projection test is imposed on the frozen-only subspace."
+                    ),
+                }
+            else:
+                missing_reasons: list[str] = []
+                if eig_path is None:
+                    missing_reasons.append("missing .eig file")
+                if not have_frozen_window:
+                    missing_reasons.append("missing dis_froz_min/dis_froz_max")
+                summary["frozen_window_band_counts"] = {
+                    "status": "unavailable",
+                    "reasons": missing_reasons,
+                }
+
+            observations: list[str] = []
+
+            # File integrity is a genuinely direct observation.
+            if integrity["complete_unique_coverage"]:
+                observations.append(
+                    "The AMN parser found complete unique coverage of the "
+                    "expected matrix records."
+                )
+            else:
+                observations.append(
+                    "The AMN file does not have complete unique record coverage; "
+                    "numerical diagnostics should be treated cautiously."
+                )
+
+            # Projection count versus num_wann is also a direct structural observation.
+            if expected_num_wann is not None:
+                if num_projections == expected_num_wann:
+                    observations.append(
+                        f"The AMN contains {num_projections} projection columns, "
+                        f"matching num_wann={expected_num_wann}."
+                    )
+                else:
+                    observations.append(
+                        f"The AMN contains {num_projections} projection columns, "
+                        f"while num_wann={expected_num_wann}."
+                    )
+
+            # Report threshold-dependent sensitivity without converting any
+            # particular threshold into a categorical rank verdict.
+            observations.append(
+                effective_rank_sensitivity_text(
+                    "Full-band AMN",
+                    summary["full_band_pool"],
+                    num_kpoints,
+                )
+            )
+
+            # The outer-window version is usually the more directly relevant
+            # AMN view for disentanglement, when it can be constructed.
+            outer = summary["outer_window_restricted"]
+            if outer.get("status") == "available":
+                observations.append(
+                    effective_rank_sensitivity_text(
+                        "Outer-window AMN",
+                        outer,
+                        num_kpoints,
+                    )
+                )
+                observations.append(
+                    "The outer-window AMN statistics use this run's own .eig "
+                    "energies and dis_win_min/dis_win_max values."
+                )
+
+            # Frozen-window consistency is a direct count-based observation.
+            frozen = summary["frozen_window_band_counts"]
+            if frozen.get("status") == "available":
+                exceed_count = frozen.get(
+                    "kpoints_with_frozen_band_count_above_num_wann"
+                )
+                if exceed_count is not None:
+                    observations.append(
+                        f"The frozen window contains more than num_wann bands "
+                        f"at {exceed_count} of {num_kpoints} k-points."
+                    )
+
+            summary["direct_observations"] = observations
+            return summary
+    except Exception as exc:
+        summary["status"] = "parse_error"
+        summary["error"] = f"{type(exc).__name__}: {exc}"
+        summary["direct_observations"] = [
+            "The raw .amn file existed, but deterministic preprocessing failed; do not infer projection quality from the missing summary."
+        ]
+        return summary
+
+
 def optional_attempt_evidence_files(attempt: Path, material: str) -> list[Path]:
     """Return optional text-like artifacts that can improve forensic reviews."""
     patterns = (
-        f"{material}.amn",
         f"{material}.eig",
-        f"{material}.mmn",
         f"{material}.nnkp",
-        f"{material}_hr.dat",
         f"{material}.pp.log",
-        f"{material}.pw2wan",
-        f"{material}.wannier90.log",
-        "*.amn",
-        "*.mmn",
         "*.pp.log",
-        "*.pw2wan",
         "*pw2wan*.log",
-        "*.wannier90.log",
         "*.werr",
         "*.err",
     )
@@ -224,9 +905,6 @@ def optional_workflow_evidence_files(trial_dir: Path) -> list[tuple[Path, Path]]
         "artifacts/app/workflow/LOCKED_RECIPE.json",
         "artifacts/app/workflow/DECISIONS.md",
         "artifacts/app/workflow/locked_runner_state.json",
-        "artifacts/logs/artifacts/REPORT.md",
-        "artifacts/logs/artifacts/report.json",
-        "artifacts/manifest.json",
         "config.json",
         "exception.txt",
         "result.json",
@@ -239,6 +917,14 @@ def optional_workflow_evidence_files(trial_dir: Path) -> list[tuple[Path, Path]]
         src = trial_dir / relative
         if src.is_file():
             files.append((src, Path(relative)))
+
+    compile_reports_dir = trial_dir / "artifacts" / "app" / "workflow" / "compile_recipe_reports"
+    for src in sorted(compile_reports_dir.glob("compile_attempt_*.json")):
+        if src.is_file():
+            files.append((
+                src,
+                Path("artifacts/app/workflow/compile_recipe_reports") / src.name,
+            ))
     return files
 
 
@@ -577,40 +1263,94 @@ contradicted by later run output, or led to an avoidable failure or high RMSE.
 For any such issue, explain the evidence-backed diagnosis using only information
 that is present in the staged case files. 
 
-Read these files if present:
+Follow this evidence-reading order. The order is part of the forensic method:
+first reconstruct what the old model knew and chose, then inspect objective
+recipe diagnostics, and only then inspect later outcomes. Do not use Stage 3
+outcomes to retroactively claim that the old model knew something it could not
+have known at decision time.
 
-- `case_files/case_metadata.json` if present
-- `case_files/verifier/diagnostics.json` if present
-- `case_files/artifacts/attempt_1/{material}.win` if present
-- `case_files/artifacts/attempt_1/{material}.wout` if present
-- `case_files/artifacts/attempt_1/{material}.amn` if present
-- `case_files/artifacts/attempt_1/{material}.eig` if present
-- `case_files/artifacts/attempt_1/{material}.mmn` if present
-- `case_files/artifacts/attempt_1/{material}.nnkp` if present
-- `case_files/artifacts/attempt_1/{material}_hr.dat` if present
-- `case_files/artifacts/attempt_1/{material}.pp.log` if present
-- `case_files/artifacts/attempt_1/{material}.wannier90.log` if present
-- `case_files/artifacts/attempt_1/*.pw2wan`, `*pw2wan*.log`, `*.werr`,
-  or `*.err` if present
-- `case_files/artifacts/attempt_1/run_manifest.json` if present
-- `case_files/workflow_contract/artifacts/app/workflow/recipe_request.json` if present
-- `case_files/workflow_contract/artifacts/app/workflow/compile_recipe_report.json` if present
-- `case_files/workflow_contract/artifacts/app/workflow/locked_runner.log` if present
-- `case_files/workflow_contract/artifacts/app/workflow/LOCKED_RECIPE.json` if present
-- `case_files/workflow_contract/artifacts/app/workflow/DECISIONS.md` if present
-- `case_files/workflow_contract/artifacts/app/workflow/locked_runner_state.json` if present
-- `case_files/workflow_contract/artifacts/logs/artifacts/REPORT.md` if present
-- `case_files/workflow_contract/artifacts/logs/artifacts/report.json` if present
-- `case_files/workflow_contract/artifacts/manifest.json` if present
-- `case_files/workflow_contract/config.json` if present
-- `case_files/workflow_contract/exception.txt` if present
-- `case_files/workflow_contract/result.json` if present
-- `case_files/workflow_contract/trial.log` if present
-- `case_files/workflow_contract/verifier/test-stdout.txt` or `test-stderr.txt` if present
-- `case_files/agent/trajectory.json` if present
-- `case_files/agent/gemini-cli.trajectory.jsonl` if present
-- `case_files/agent/gemini-cli.txt` if present
-- `case_files/original_task_instructions.md` if present
+## STAGE 1 — Reconstruct the old decision and contract
+
+Read ALL OF THESE first, if present:
+
+- `case_files/original_task_instructions.md`
+- `case_files/agent/trajectory.json`
+- `case_files/workflow_contract/artifacts/app/workflow/recipe_request.json`
+- `case_files/workflow_contract/artifacts/app/workflow/compile_recipe_reports/compile_attempt_*.json`
+- `case_files/workflow_contract/artifacts/app/workflow/compile_recipe_report.json`
+- `case_files/workflow_contract/artifacts/app/workflow/LOCKED_RECIPE.json`
+- `case_files/workflow_contract/artifacts/app/workflow/DECISIONS.md`
+- `case_files/artifacts/attempt_1/{material}.win`
+
+From Stage 1, establish exactly what the old model proposed, what evidence it
+used at the time, which recipe fields it could control, what compile/preflight
+feedback it received, and what the locked runner changed or hard-coded. 
+You must inspect the workflow compiler reports before judging whether a recipe 
+failed scientifically. The folder compile_recipe_reports/ contains 
+per-compile-attempt feedback; compile_recipe_report.json is the final/summary report.
+
+## STAGE 2 — Inspect objective recipe diagnostics
+
+Only after Stage 1, read ALL OF THESE if present:
+
+- `case_files/artifacts/attempt_1/{material}.amn_summary.json`
+- `case_files/artifacts/attempt_1/{material}.eig`
+- `case_files/artifacts/attempt_1/{material}.nnkp`
+- `case_files/artifacts/attempt_1/{material}.pp.log`
+- `case_files/artifacts/attempt_1/*pw2wan*.log`
+- other compile/preprocessor error logs relevant to the recipe
+
+`{material}.amn_summary.json` is generated deterministically from the complete
+raw `.amn` before Gemini starts. Treat its dimensions, integrity counts,
+singular-value statistics, threshold-dependent effective-rank sensitivity,
+band counts, and outer-window-restricted statistics as DIRECT NUMERICAL
+OBSERVATIONS.
+
+Interpret the AMN diagnostics carefully:
+
+- Effective-rank counts are numerical sensitivity measurements at explicitly
+  stated relative SVD thresholds. They are not categorical definitions of
+  mathematical rank and must not be rewritten as simply "rank deficient" or
+  "full rank" without qualification.
+- A small normalized singular value or high projection-pair correlation can
+  identify possible conditioning or redundancy risk, but does not by itself
+  show that the projection recipe is defective or explain the final outcome.
+- Compare patterns across thresholds rather than privileging any single
+  threshold.
+- Projection-count mismatches and file-integrity problems are direct structural
+  observations.
+- Do not claim that an AMN observation caused the final outcome unless later
+  run evidence supports that causal link. Otherwise label the explanation
+  `plausible_but_unproven`.
+
+The raw `.amn`, `.mmn`, `.chk`, and `_hr.dat` files are intentionally not
+staged for Gemini. Do not request them, attempt to infer their raw contents, or
+list their intentional absence as an evidence gap. The complete `.amn` has
+already been reduced numerically. Raw `.mmn` and `_hr.dat` are not needed for
+the default forensic review; `.chk` is binary.
+
+## STAGE 3 — Inspect later outcomes
+
+Only after Stages 1 and 2, read ALL OF THESE if present:
+
+- `case_files/artifacts/attempt_1/{material}.wout`
+- `case_files/artifacts/attempt_1/run_manifest.json`
+- `case_files/case_metadata.json`
+- `case_files/verifier/diagnostics.json`
+- `case_files/workflow_contract/artifacts/app/workflow/locked_runner.log`
+- `case_files/workflow_contract/artifacts/app/workflow/locked_runner_state.json`
+- `case_files/workflow_contract/config.json`
+- `case_files/workflow_contract/exception.txt`
+- `case_files/workflow_contract/result.json`
+- `case_files/workflow_contract/trial.log`
+- `case_files/workflow_contract/verifier/test-stdout.txt`
+- `case_files/workflow_contract/verifier/test-stderr.txt`
+- `case_files/artifacts/attempt_1/*.werr`
+- `case_files/artifacts/attempt_1/*.err`
+
+Compare these later observations against the Stage 1 decision chain and the
+Stage 2 objective diagnostics. Separate symptoms from causes and explicitly
+distinguish old-model responsibility from locked-runner behavior.
 
 The per-run verifier diagnostics are allowed only as scalar final outcome
 metrics for this specific run. They do not provide the hidden reference recipe
@@ -619,10 +1359,10 @@ infer hidden reference settings, reference-only methods, or a Gemini/reference
 RMSE ratio. The diagnosis must obey `case_files/original_task_instructions.md`
 when judging what the old model could know or control.
 
-Do not handwave from aggregate statistics. The core diagnosis must
-come from this material's `.win`, `.wout`, `.amn`, `.eig`, `.mmn`, `.nnkp`,
-`_hr.dat`, preprocessor/pw2wannier/wannier90/error logs, workflow-contract
-files, run manifest, trajectory, and per-run verifier diagnostics, if present.
+Do not handwave from aggregate statistics. The core diagnosis must come from
+this material's `.win`, `.wout`, deterministic `.amn_summary.json`, `.eig`,
+`.nnkp`, preprocessor/pw2wannier/wannier90/error logs, workflow-contract files,
+run manifest, trajectory, and per-run verifier diagnostics, if present.
 
 Use the workflow-contract files to distinguish what the old model could control
 from what the locked runner hard-coded. Do not recommend or criticize the old
@@ -638,7 +1378,7 @@ Write exactly these two files:
 The Markdown report must be step-by-step and specific. For each substantive
 decision in the old trajectory, judge whether it was good, bad, mixed, or
 uncertain, and explain why USING CONCRETE EVIDENCE from `.win`, `.wout`,
-manifest notes, workflow-contract files, trajectory reasoning, and final error
+run manifest, workflow-contract files, trajectory reasoning, and final error
 metrics. Cite the file paths you used, and include line numbers when you have
 them from grep, rg, nl, or similar inspection. Cover at least:
 
@@ -677,10 +1417,11 @@ For every decision review, answer all of these forensic questions:
 - What later evidence in `.wout`, verifier diagnostics, or trajectory contradicts
   or weakens that decision?
 - Was the mistake avoidable without seeing the hidden reference recipe?
-- Which exact step failed, if any: recipe writing, compile/preflight,
+- Which exact step failed, if any: recipe writing, compile/preflight (look into
+each of compile_attempt_*.json and compile_recipe_report.json, not inferred from later .wout/RMSE),
   `wannier90.x -pp`, `pw2wannier90.x`, final `wannier90.x` disentanglement,
   final `wannier90.x` localization, artifact collection, verifier scoring, or
-  old-model interpretation?
+  old-model interpretation? 
 - What is the confidence level for any causal claim: `proven`,
   `strongly_supported`, `plausible_but_unproven`, or `unsupported`?
 - What remains uncertain because the logs do not contain enough information?
@@ -690,10 +1431,10 @@ runs. Therefore, prioritize advice safety over sounding decisive.
 
 Classify every finding into one of these categories:
 - CONTRACT FACT: directly follows from original_task_instructions.md,
-  recipe_request.json schema, compile_recipe_report.json, locked_runner.log,
-  or runner behavior.
-- DIRECT OBSERVATION: directly observed in .win, .wout, .eig, .nnkp,
-  diagnostics.json, trajectory.json, or logs.
+  recipe_request.json schema, compile_recipe_report.json, compile_recipe_reports/compile_attempt_*.json,
+  locked_runner.log, or runner behavior.
+- DIRECT OBSERVATION: directly observed in .win, .wout, .amn_summary.json,
+  .eig, .nnkp, diagnostics.json, trajectory.json, or logs.
 - PLAUSIBLE INTERPRETATION: chemically or numerically plausible, but not proven
   by a controlled comparison.
 - DO NOT GENERALIZE: a tempting explanation or next step that future runs should
@@ -727,6 +1468,8 @@ Before calling a projection or window decision "bad", do the relevant arithmetic
 from the available files when possible:
 
 - projection count must equal `num_wann`;
+- when `.amn_summary.json` exists, inspect full-pool and outer-window rank,
+  rank sensitivity, frozen-window band counts, and projection-pair correlation;
 - outer window per-k-point count must be at least `num_wann`;
 - frozen window per-k-point count must be at most `num_wann`;
 - coordinate-center claims must distinguish `f=` fractional coordinates from
@@ -820,6 +1563,18 @@ def build_case(case: TrialCase) -> Path:
         case_files / "artifacts" / "attempt_1" / "run_manifest.json",
     )
 
+    amn_summary = summarize_amn_case(case)
+    amn_summary_dst = (
+        case_files
+        / "artifacts"
+        / "attempt_1"
+        / f"{material}.amn_summary.json"
+    )
+    write_text(
+        amn_summary_dst,
+        json.dumps(amn_summary, indent=2, sort_keys=True) + "\n",
+    )
+
     staged_optional_artifacts: list[dict[str, str]] = []
     for src in optional_attempt_evidence_files(case.attempt_dir, material):
         dst = case_files / "artifacts" / "attempt_1" / src.name
@@ -849,11 +1604,6 @@ def build_case(case: TrialCase) -> Path:
         case_files / "agent" / "trajectory.json",
     )
 
-    for optional in ("gemini-cli.trajectory.jsonl", "gemini-cli.txt"):
-        src = case.trial_dir / "agent" / optional
-        if src.exists():
-            copy_file_if_present(src, case_files / "agent" / optional)
-
     diagnostics_src = case.trial_dir / "verifier" / "diagnostics.json"
     diagnostics_copied = copy_file_if_present(
         diagnostics_src,
@@ -879,6 +1629,23 @@ def build_case(case: TrialCase) -> Path:
         "wout_copied": wout_copied,
         "run_manifest_copied": manifest_copied,
         "trajectory_copied": trajectory_copied,
+        "amn_summary": {
+            "staged": str(amn_summary_dst.relative_to(case_dir)),
+            "status": amn_summary.get("status"),
+            "source_file": amn_summary.get("source_file"),
+        },
+        "raw_numeric_artifact_presence": {
+            "amn": has_attempt_file(case.attempt_dir, material, ".amn"),
+            "mmn": has_attempt_file(case.attempt_dir, material, ".mmn"),
+            "chk": has_attempt_file(case.attempt_dir, material, ".chk"),
+            "hr_dat": has_attempt_file(case.attempt_dir, material, "_hr.dat"),
+        },
+        "raw_numeric_artifacts_intentionally_not_staged": {
+            ".amn": "complete file is reduced deterministically into <material>.amn_summary.json",
+            ".mmn": "raw neighbor-overlap matrix is not needed for the default LLM forensic review",
+            ".chk": "binary Wannier90 checkpoint is not suitable as direct LLM evidence",
+            "_hr.dat": "raw real-space Hamiltonian is not needed for the default forensic diagnosis",
+        },
         "staged_optional_artifacts": staged_optional_artifacts,
         "staged_workflow_contract_artifacts": staged_workflow_contract_artifacts,
         "verifier_diagnostics_copied": diagnostics_copied,
@@ -1025,6 +1792,10 @@ def run_case(case: TrialCase) -> Path:
         f"{case.material} case={case.case_id} in {case_dir}"
     )
     run_gemini(case_dir)
+    case_files = case_dir / "case_files"
+    if case_files.exists():
+        shutil.rmtree(case_files)
+        print(f"Removed staged case files after successful review: {case_files}")
     return case_dir
 
 def candidate_materials_from_include_only_csv(
