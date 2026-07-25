@@ -73,7 +73,7 @@ TARGET_OUTPUT_ROOT_RELATIVE = (
 )
 DEFAULT_RUN_ROOT_RELATIVES = [Path("jobsDeepseekProTerminus2ControlledIter2")]
 DATASET_ROOT_RELATIVE = Path("harbor_datasets") / "wannier_200"
-CANDIDATE_TABLE_RELATIVE = Path("temp.csv")
+CANDIDATE_TABLE_RELATIVE = Path("include_only_candidates.csv")
 COMPATIBILITY_CSV_RELATIVE = (
     Path("jobsGeminiReviewsDeepseekIter2")
     / "consolidated_target_context_candidates.csv"
@@ -911,9 +911,11 @@ def material_output_is_valid(output_dir: Path) -> bool:
     if verdict in {"no_contradiction", "insufficient_evidence"} and contradiction_found:
         return False
 
-    expected_case_ids = set(_material_input_case_ids(output_dir))
-    reported_case_ids = {str(value) for value in data["source_case_ids"]}
-    if expected_case_ids and reported_case_ids != expected_case_ids:
+
+    expected_case_ids = _material_input_case_ids(output_dir)
+    reported_case_ids = [str(value) for value in data["source_case_ids"]]
+
+    if reported_case_ids != expected_case_ids:
         return False
     if data.get("source_run_count") != len(expected_case_ids):
         return False
