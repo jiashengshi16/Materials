@@ -34,7 +34,7 @@ SUPPORTED_WORKFLOWS = {"chemically similar", "codex_self_review"}
 
 DEEPSEEK_SELF_DEBUG_REVIEWS_ROOT = (
     self_debug_generator.ROOT
-    / "jobsGeminiReviewsDeepseek"
+    / "jobsGeminiReviewsDeepseekIter3"
     / "gemini_self_debug_reviews"
 )
 DEFAULT_CODEX_NEXT_RUN_DIAGNOSES = (
@@ -49,7 +49,7 @@ DEFAULT_CANDIDATE_RUN_ERROR_TABLE = (
 DEFAULT_JOBS_ROOT = (
     self_debug_generator.ROOT / "jobsGeminiReviewsDeepseek" / "jobsDeepseekProTerminus2ControlledSelfDebugContext"
     if WORKFLOW == "codex_self_review"
-    else self_debug_generator.ROOT / "jobsGeminiReviewsDeepseek"/ "ChemSimReruns"
+    else self_debug_generator.ROOT / "jobsGeminiReviewsDeepseekIter3"/ "ChemSimReruns"
 )
 DEFAULT_SELF_DEBUG_REVIEWS_ROOT = (
     DEEPSEEK_SELF_DEBUG_REVIEWS_ROOT
@@ -76,8 +76,8 @@ LOCKED_COMMAND_WRAPPER_APP_PATH = "/app/locked_command_wrapper.sh"
 LOCKED_BIN_APP_DIR = "/app/locked_bin"
 LOCKED_RUNNER_VERIFIER_HOOK_MARKER = "# Harbor deterministic locked runner pre-verifier hook"
 
-DEFAULT_RECIPE_AGENT_TIMEOUT_SEC = 1800
-DEFAULT_SUCCESS_WAVE_TIMEOUT_SEC = 7200
+DEFAULT_RECIPE_AGENT_TIMEOUT_SEC = 2700
+DEFAULT_SUCCESS_WAVE_TIMEOUT_SEC = 8100
 LOCKED_FINAL_TIMEOUT_CLEANUP_BUFFER_SEC = 300
 POST_PRUNE_COMMANDS = [
     ["docker", "tag", "wannier-qe-local:latest", "wannier-qe-gemini-base:0.46.0"],
@@ -105,6 +105,55 @@ NEXT_RUN_TRACE_ARTIFACTS = [
     "/app/workflow/NEXT_RUN_CONTEXT_SUMMARY.json",
 ]
 
+CONTRADICTION_WARNING = """
+## Warning about conflicting reports
+
+These are independent reviews from different runs.
+
+Reports for the same candidate material may have parts that contradict each other.
+Reports from different candidate materials may also have parts that contradict each other.
+
+If there's a contradiction for the current strategy, inspect the individual
+reports under `/app/self_debug_context/raw/` and decide which conclusion is
+supported by the specific run evidence. Different recipes, failure stages, or
+run outcomes are not automatically contradictions.
+
+If the conflict cannot be resolved, preserve the uncertainty instead of
+inventing a consensus.
+""".strip()
+
+
+def add_contradiction_warning(
+    augmented_tasks: list[tuple[int, str, Path]],
+) -> None:
+    for _num_wann, _material, task_dir in augmented_tasks:
+        bundle = (
+            task_dir
+            / "self_debug_context"
+            / "ALL_SELF_DEBUG_REPORTS.md"
+        )
+
+        if not bundle.is_file():
+            continue
+
+        text = bundle.read_text(encoding="utf-8")
+
+        if "## Warning about conflicting reports" in text:
+            continue
+
+        lines = text.splitlines()
+        insert_at = min(6, len(lines))
+
+        lines[insert_at:insert_at] = [
+            "",
+            CONTRADICTION_WARNING,
+            "",
+        ]
+
+        bundle.write_text(
+            "\n".join(lines).rstrip() + "\n",
+            encoding="utf-8",
+        )
 
 def next_run_trace_wrapper_script() -> str:
     return """#!/usr/bin/env bash
@@ -1497,6 +1546,21 @@ The recipe must be valid JSON. Use only this schema:
 }}
 ```
 
+Interpret the two error measures differently and use both:
+
+- The raw candidate RMSE in eV is the absolute interpolation error for this run.
+- The error ratio is `candidate RMSE / reference_error_eV` for another system on
+  the same material. A ratio below 1 means the candidate beat that reference, a
+  ratio near 1 means comparable performance, and a ratio above 1 means worse
+  relative performance.
+- Raw RMSE alone can mis-rank run quality across materials: a numerically small
+  RMSE can still be poor relative to an easy same-material reference, while a
+  larger RMSE can still be comparatively strong for a difficult material.
+- Use the ratio to improve comparison of candidate-run quality, but never rank a
+  candidate's importance or relevance to a new target material from the ratio
+  alone. Also consider chemical similarity, transferability of the diagnosed
+  decisions, evidence quality, and what controls were available to the old run.
+
 `use_exclude_bands` must always be false. DO NOT SET IT TO TRUE. 
 All four window fields must be numeric. Do not leave any window value as null.
 
@@ -2405,6 +2469,9 @@ def main() -> None:
         ),
         next_run_diagnoses_path=cli.next_run_diagnoses,
     )
+
+    add_contradiction_warning(augmented_tasks)
+
     install_next_run_trace_tools(
         augmented_tasks,
         cli.success_wave_timeout_sec,
