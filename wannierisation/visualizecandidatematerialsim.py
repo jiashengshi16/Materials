@@ -11,23 +11,23 @@ import networkx as nx
 ROOT = Path("/home/jiasheng/WannierisationBenchmarking")
 
 CANDIDATES_CSV_PATH = ROOT / "include_only_candidates.csv"
-CANDIDATE_RUNS_DIR = ROOT / "jobsDeepseekProTerminus2Controlled"
+CANDIDATE_RUNS_DIR = ROOT / "jobsDeepseekProTerminus2ControlledIter2"
 REFERENCE_ERROR_CSV = ROOT / "jobs" / "successful_run_errors.csv"
 ERROR_RATIOS_CSV_PATH = Path(
-    "/home/jiasheng/WannierisationBenchmarking/jobsGeminiReviewsDeepseek/"
+    "/home/jiasheng/WannierisationBenchmarking/jobsGeminiReviewsDeepseekIter3/"
     "ChemSimReruns/all_error_ratios_by_material.csv"
 )
 
 OUT_PNG = Path(
-    "/home/jiasheng/WannierisationBenchmarking/jobsGeminiReviewsDeepseek/"
+    "/home/jiasheng/WannierisationBenchmarking/jobsGeminiReviewsDeepseekIter3/"
     "ChemSimReruns/material_dependency_graph.png"
 )
 OUT_SVG = Path(
-    "/home/jiasheng/WannierisationBenchmarking/jobsGeminiReviewsDeepseek/"
+    "/home/jiasheng/WannierisationBenchmarking/jobsGeminiReviewsDeepseekIter3/"
     "ChemSimReruns/material_dependency_graph.svg"
 )
 LOWER_OUT_PNG = Path(
-    "/home/jiasheng/WannierisationBenchmarking/jobsGeminiReviewsDeepseek/"
+    "/home/jiasheng/WannierisationBenchmarking/jobsGeminiReviewsDeepseekIter3/"
     "ChemSimReruns/material_dependency_graph_lower_error_ratio.png"
 )
 
@@ -532,15 +532,10 @@ blue_white_red = mpl.colors.LinearSegmentedColormap.from_list(
     ["#08306B", "#9ECAE1", "#FFFFFF", "#FCAE91", "#99000D"],
 )
 
-try:
-    pos0 = nx.nx_agraph.graphviz_layout(G, prog="sfdp")
-except Exception:
-    try:
-        pos0 = nx.nx_pydot.graphviz_layout(G, prog="sfdp")
-    except Exception:
-        pos0 = nx.spring_layout(G, seed=7, k=3.5, iterations=2000)
-
-pos = {n: np.asarray(xy, dtype=float).copy() for n, xy in pos0.items()}
+# Layout each weakly connected group independently.  This makes graph distance
+# meaningful inside a group (direct neighbors stay close), while a later packing
+# step separates disconnected groups from one another.
+pos0 = {}
 
 
 def _layout_span(pos: dict) -> float:
@@ -824,14 +819,112 @@ def _normalize_layout(pos: dict, target_span: float = 1000.0):
         pos[n] = xy
 
 
-# Build the layout.
+def _layout_one_component(nodes: set[str], seed: int) -> dict[str, np.ndarray]:
+    """Lay out one connected material group so graph distance drives geometry."""
+    H = G.subgraph(nodes).to_undirected()
+    if H.number_of_nodes() == 1:
+        only = next(iter(H.nodes))
+        return {only: np.zeros(2, dtype=float)}
+
+    # Kamada-Kawai uses shortest-path distances, so adjacent materials are close
+    # and nodes several hops apart naturally sit farther away.
+    try:
+        local = nx.kamada_kawai_layout(H, weight=None, scale=1.0)
+    except Exception:
+        local = nx.spring_layout(
+            H,
+            seed=seed,
+            k=1.35 / np.sqrt(max(H.number_of_nodes(), 2)),
+            iterations=1500,
+            weight=None,
+            scale=1.0,
+        )
+
+    local = {n: np.asarray(xy, dtype=float).copy() for n, xy in local.items()}
+
+    # Give larger groups more canvas, then resolve labels/node disks locally.
+    local_span = 115.0 + 52.0 * np.sqrt(H.number_of_nodes())
+    _normalize_layout(local, target_span=local_span)
+    _hard_resolve_node_collisions(local, min_gap_frac=0.020, iterations=2200)
+    _straight_edge_clearance_pass(local, iterations=700, clearance_gap_frac=0.010)
+    _hard_resolve_node_collisions(local, min_gap_frac=0.022, iterations=2600)
+    return local
+
+
+def _pack_component_layouts(
+    component_layouts: list[dict[str, np.ndarray]],
+    padding: float = 95.0,
+) -> dict[str, np.ndarray]:
+    """Shelf-pack component bounding boxes without changing local geometry."""
+    boxes = []
+    for local in component_layouts:
+        coords = np.asarray(list(local.values()), dtype=float)
+        lo = coords.min(axis=0)
+        hi = coords.max(axis=0)
+        width, height = (hi - lo) + 2.0 * padding
+        boxes.append((local, lo, float(width), float(height)))
+
+    # Largest groups first gives a compact, stable packing.
+    boxes.sort(key=lambda item: item[2] * item[3], reverse=True)
+    total_area = sum(width * height for _, _, width, height in boxes)
+    row_limit = max(np.sqrt(total_area) * 1.35, max((b[2] for b in boxes), default=1.0))
+
+    packed = {}
+    x_cursor = 0.0
+    y_cursor = 0.0
+    row_height = 0.0
+    for local, lo, width, height in boxes:
+        if x_cursor > 0.0 and x_cursor + width > row_limit:
+            x_cursor = 0.0
+            y_cursor += row_height
+            row_height = 0.0
+
+        shift = np.array([x_cursor + padding, y_cursor + padding]) - lo
+        for node, xy in local.items():
+            packed[node] = np.asarray(xy, dtype=float) + shift
+
+        x_cursor += width
+        row_height = max(row_height, height)
+
+    return packed
+
+
+# Build the layout component-by-component, then separate the groups.
+components = [
+    set(nodes)
+    for nodes in nx.connected_components(G.to_undirected())
+]
+components.sort(key=lambda nodes: (-len(nodes), sorted(nodes)[0]))
+component_layouts = [
+    _layout_one_component(nodes, seed=7 + i)
+    for i, nodes in enumerate(components)
+]
+pos = _pack_component_layouts(component_layouts, padding=125.0)
+
+# Normalize once, then perform a GLOBAL hard-disk pass.  Local component
+# collision removal is not enough because fixed-size matplotlib markers can
+# still overlap after all components are packed into one finite figure.
 _normalize_layout(pos, target_span=1000.0)
-_spread_targets(pos, min_dist_frac=0.20, iterations=1200)
-_initial_radial_candidate_layout(pos, pos0, base_radius_frac=0.120, ring_gap_frac=0.078, max_per_ring=7)
-_hard_resolve_node_collisions(pos, min_gap_frac=0.021, iterations=3500)
-_straight_edge_clearance_pass(pos, iterations=1200, clearance_gap_frac=0.016)
-_hard_resolve_node_collisions(pos, min_gap_frac=0.024, iterations=4000)
-_normalize_layout(pos, target_span=1000.0)
+_hard_resolve_node_collisions(
+    pos,
+    min_gap_frac=0.018,
+    iterations=7000,
+    damping=0.82,
+)
+_straight_edge_clearance_pass(
+    pos,
+    iterations=1200,
+    clearance_gap_frac=0.010,
+)
+_hard_resolve_node_collisions(
+    pos,
+    min_gap_frac=0.020,
+    iterations=8000,
+    damping=0.80,
+)
+
+# Do NOT normalize again here: doing so would shrink the newly created
+# clearances while marker sizes remain fixed in points on the final figure.
 pos = {n: tuple(xy) for n, xy in pos.items()}
 
 
@@ -862,7 +955,7 @@ def draw_graph(
             return CANDIDATE_MISSING_RING_COLOR
         return CANDIDATE_PURPLE(candidate_ratio_norm(r))
 
-    fig, ax = plt.subplots(figsize=(22, 16))
+    fig, ax = plt.subplots(figsize=(26, 19))
 
     ax.set_title(
         "Material similarity dependency graph\n"
