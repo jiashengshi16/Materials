@@ -24,6 +24,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 HARBOR_DATASET_ROOT = ROOT / "harbor_datasets" / "wannier_200"
 CANDIDATE_RUN_ERROR_TABLE = ROOT / "include_only_candidates.csv"
+RUN_QUALITY_ERROR_TABLE = ROOT / "successful_run_errors.csv"
 
 # Hardcoded experiment controls.
 # Choose either "chemically similar" or "list".
@@ -48,7 +49,7 @@ MATERIAL_SELECTION_MODE = "chemically similar"
 MODEL = "gemini-3.5-flash"
 GEMINI_BIN = "gemini"
 MAX_CONCURRENT_GEMINI = 12
-OUTPUT_ROOT = ROOT / "jobsGeminiReviewsDeepseekIter2" / "gemini_self_debug_reviews"
+OUTPUT_ROOT = ROOT / "jobsGeminiReviewsDeepseekIter3" / "gemini_self_debug_reviews"
 RUN_ROOTS = [
     ROOT / "jobsDeepseekProTerminus2ControlledIter2",
 ]
@@ -1224,6 +1225,88 @@ def manifest_summary(manifest: dict[str, Any]) -> dict[str, Any]:
     return {key: manifest.get(key) for key in keys if key in manifest}
 
 
+def run_quality_metrics(case: TrialCase) -> dict[str, Any]:
+    """Load this run's RMSE and the same-material reference RMSE from the CSV."""
+    result: dict[str, Any] = {
+        "status": "unavailable",
+        "source_csv": display_path(RUN_QUALITY_ERROR_TABLE),
+        "candidate_error_eV": None,
+        "reference_error_eV": None,
+        "candidate_to_reference_error_ratio": None,
+        "matched_run_id": None,
+    }
+
+    if not RUN_QUALITY_ERROR_TABLE.is_file():
+        result["reason"] = "run-quality CSV not found"
+        return result
+
+    required_columns = {
+        "material",
+        "run_id",
+        "gemini_error_eV",
+        "reference_error_eV",
+    }
+    case_suffix = f"/{case.job_dir.name}/{case.trial_dir.name}"
+    material_rows: list[dict[str, str]] = []
+    matching_rows: list[dict[str, str]] = []
+
+    with RUN_QUALITY_ERROR_TABLE.open(newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None or not required_columns.issubset(reader.fieldnames):
+            result["reason"] = (
+                "run-quality CSV must contain material, run_id, gemini_error_eV, "
+                "and reference_error_eV columns"
+            )
+            return result
+
+        for row in reader:
+            if (row.get("material") or "").strip() != case.material:
+                continue
+            material_rows.append(row)
+            run_id = (row.get("run_id") or "").strip().replace("\\", "/")
+            if run_id.endswith(case_suffix):
+                matching_rows.append(row)
+
+    reference_values: set[float] = set()
+    for row in material_rows:
+        try:
+            reference_values.add(float((row.get("reference_error_eV") or "").strip()))
+        except ValueError:
+            continue
+
+    if len(reference_values) == 1:
+        result["reference_error_eV"] = reference_values.pop()
+    elif len(reference_values) > 1:
+        result["reason"] = "multiple reference_error_eV values found for material"
+        return result
+
+    if not matching_rows:
+        result["reason"] = "no CSV row matched this case's job/trial path"
+        return result
+
+    matched = matching_rows[0]
+    try:
+        candidate_error = float((matched.get("gemini_error_eV") or "").strip())
+    except ValueError:
+        result["reason"] = "matched row has invalid gemini_error_eV"
+        return result
+
+    reference_error = result["reference_error_eV"]
+    if not isinstance(reference_error, float) or reference_error <= 0.0:
+        result["reason"] = "reference_error_eV is missing or not positive"
+        return result
+
+    result.update(
+        {
+            "status": "available",
+            "candidate_error_eV": candidate_error,
+            "candidate_to_reference_error_ratio": candidate_error / reference_error,
+            "matched_run_id": (matched.get("run_id") or "").strip(),
+        }
+    )
+    return result
+
+
 def prompt_text(case: TrialCase) -> str:
     material = case.material
     num_wann = case.job_metadata.get("num_wann_from_folder")
@@ -1267,7 +1350,9 @@ Follow this evidence-reading order. The order is part of the forensic method:
 first reconstruct what the old model knew and chose, then inspect objective
 recipe diagnostics, and only then inspect later outcomes. Do not use Stage 3
 outcomes to retroactively claim that the old model knew something it could not
-have known at decision time.
+have known at decision time. After completing all three stages, integrate evidence across
+stages while preserving the distinction between what was knowable at decision
+time, direct numerical diagnostics, and later outcomes.
 
 ## STAGE 1 — Reconstruct the old decision and contract
 
@@ -1337,6 +1422,7 @@ Only after Stages 1 and 2, read ALL OF THESE if present:
 - `case_files/artifacts/attempt_1/run_manifest.json`
 - `case_files/case_metadata.json`
 - `case_files/verifier/diagnostics.json`
+- `case_files/run_quality_metrics.json`
 - `case_files/workflow_contract/artifacts/app/workflow/locked_runner.log`
 - `case_files/workflow_contract/artifacts/app/workflow/locked_runner_state.json`
 - `case_files/workflow_contract/config.json`
@@ -1352,12 +1438,33 @@ Compare these later observations against the Stage 1 decision chain and the
 Stage 2 objective diagnostics. Separate symptoms from causes and explicitly
 distinguish old-model responsibility from locked-runner behavior.
 
-The per-run verifier diagnostics are allowed only as scalar final outcome
-metrics for this specific run. They do not provide the hidden reference recipe
-or the Gemini/reference RMSE ratio. Do not use the verifier diagnostics to
-infer hidden reference settings, reference-only methods, or a Gemini/reference
-RMSE ratio. The diagnosis must obey `case_files/original_task_instructions.md`
-when judging what the old model could know or control.
+The per-run verifier diagnostics and `case_files/run_quality_metrics.json` are
+allowed only as scalar final outcome metrics for this specific run. The latter
+contains the candidate RMSE, the same-material `reference_error_eV`, and their
+ratio; it does not reveal the hidden reference recipe or reference-only methods.
+Do not use either file to infer hidden reference settings. The diagnosis must
+obey `case_files/original_task_instructions.md` when judging what the old model
+could know or control.
+
+Interpret the two error measures differently and use both:
+
+- The raw candidate RMSE in eV is the absolute interpolation error for this run.
+- The error ratio is `candidate RMSE / reference_error_eV` for another system on
+  the same material. A ratio below 1 means the candidate beat that reference, a
+  ratio near 1 means comparable performance, and a ratio above 1 means worse
+  relative performance.
+- Raw RMSE alone can mis-rank run quality across materials: a numerically small
+  RMSE can still be poor relative to an easy same-material reference, while a
+  larger RMSE can still be comparatively strong for a difficult material.
+- Use the ratio to improve comparison of candidate-run quality, but never rank a
+  candidate's importance or relevance to a new target material from the ratio
+  alone. Also consider chemical similarity, transferability of the diagnosed
+  decisions, evidence quality, and what controls were available to the old run.
+
+A recorded `TimeoutError` is not by itself evidence that the candidate run was
+unsuccessful. If the workflow ultimately completed successfully and produced a
+low error ratio, the run may still be judged good and successful. Distinguish a
+transient timeout from an incomplete run, missing outputs, or failed scoring.
 
 Do not handwave from aggregate statistics. The core diagnosis must come from
 this material's `.win`, `.wout`, deterministic `.amn_summary.json`, `.eig`,
@@ -1390,10 +1497,14 @@ them from grep, rg, nl, or similar inspection. Cover at least:
 6. localization quality from WF spreads and spread components;
 7. whether the old run accepted a result it should have rejected, while
    explicitly separating old-model responsibility from locked-runner behavior;
+8. raw RMSE versus same-material reference error ratio, including whether either
+   metric changes the run-quality interpretation;
+9. whether any `TimeoutError` was transient or represented an actual incomplete
+   run, using final completion and error-ratio evidence.
 
 If the run shows evidence of avoidable issues, also cover:
 
-8. the most likely specific failure chain.
+10. the most likely specific failure chain.
 
 Do NOT produce next-run recommendations, future playbooks, anti-loop rules, or
 operational retry plans in this review.
@@ -1496,6 +1607,9 @@ The JSON report must have this shape:
   "job_folder": "{case.job_dir.name}",
   "trial_folder": "{case.trial_dir.name}",
   "num_wann_from_job_folder": {json.dumps(num_wann)},
+  "candidate_error_eV": "number | null",
+  "reference_error_eV": "number | null",
+  "candidate_to_reference_error_ratio": "number | null",
   "verdict": "good | mixed | bad | uncertain",
   "projection_verdict": "good | not_used | bad | uncertain",
   "decision_reviews": [
@@ -1613,6 +1727,12 @@ def build_case(case: TrialCase) -> Path:
     task_text, task_source = original_task_instructions(case)
     write_text(case_files / "original_task_instructions.md", task_text)
 
+    quality_metrics = run_quality_metrics(case)
+    write_text(
+        case_files / "run_quality_metrics.json",
+        json.dumps(quality_metrics, indent=2, sort_keys=True) + "\n",
+    )
+
     metadata = {
         "material": material,
         "case_id": case.case_id,
@@ -1625,6 +1745,7 @@ def build_case(case: TrialCase) -> Path:
         "job_metadata": case.job_metadata,
         "manifest_summary": manifest_summary(case.manifest),
         "original_task_instructions_source": task_source,
+        "run_quality_metrics": quality_metrics,
         "win_copied": win_copied,
         "wout_copied": wout_copied,
         "run_manifest_copied": manifest_copied,
