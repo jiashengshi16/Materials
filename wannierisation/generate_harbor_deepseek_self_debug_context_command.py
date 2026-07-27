@@ -76,8 +76,8 @@ LOCKED_COMMAND_WRAPPER_APP_PATH = "/app/locked_command_wrapper.sh"
 LOCKED_BIN_APP_DIR = "/app/locked_bin"
 LOCKED_RUNNER_VERIFIER_HOOK_MARKER = "# Harbor deterministic locked runner pre-verifier hook"
 
-DEFAULT_RECIPE_AGENT_TIMEOUT_SEC = 2700
-DEFAULT_SUCCESS_WAVE_TIMEOUT_SEC = 8100
+DEFAULT_RECIPE_AGENT_TIMEOUT_SEC = 5400
+DEFAULT_SUCCESS_WAVE_TIMEOUT_SEC = 8200
 LOCKED_FINAL_TIMEOUT_CLEANUP_BUFFER_SEC = 300
 POST_PRUNE_COMMANDS = [
     ["docker", "tag", "wannier-qe-local:latest", "wannier-qe-gemini-base:0.46.0"],
@@ -668,6 +668,28 @@ def normalize_recipe(material: str, request: dict[str, Any], expected: dict[str,
 def write_locked_recipe(recipe: dict[str, Any]) -> None:
     LOCKED_RECIPE_PATH.write_text(json.dumps(recipe, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
+def normalized_runner_wannier90_controls(
+    recipe: dict[str, Any],
+) -> dict[str, Any]:
+    controls = recipe.get("runner_wannier90_controls")
+    if not isinstance(controls, dict):
+        return {}
+
+    normalized: dict[str, Any] = {}
+
+    if "kmesh_tol" in controls:
+        try:
+            normalized["kmesh_tol"] = float(controls["kmesh_tol"])
+        except (TypeError, ValueError):
+            pass
+
+    if controls.get("devel_flag") == "kmesh_degen":
+        normalized["devel_flag"] = "kmesh_degen"
+
+    if isinstance(controls.get("kmesh_strategy"), str):
+        normalized["kmesh_strategy"] = controls["kmesh_strategy"]
+
+    return normalized
 
 def write_win(path: Path, recipe: dict[str, Any], nscf: dict[str, Any]) -> None:
     windows = recipe["windows"]
@@ -687,6 +709,13 @@ def write_win(path: Path, recipe: dict[str, Any], nscf: dict[str, Any]) -> None:
         f"dis_froz_max = {windows['dis_froz_max']:.8f}",
         "begin projections",
     ]
+    controls = normalized_runner_wannier90_controls(recipe)
+
+    if "kmesh_tol" in controls:
+        lines.insert(-1, f"kmesh_tol = {controls['kmesh_tol']:.8g}")
+
+    if controls.get("devel_flag") == "kmesh_degen":
+        lines.insert(-1, "devel_flag = kmesh_degen")
     lines.extend(f"  {projection}" for projection in recipe["projections"])
     lines.extend(["end projections", "begin unit_cell_cart", "Ang"])
     lines.extend(f"  {row[0]: .12f} {row[1]: .12f} {row[2]: .12f}" for row in nscf["cell"])
@@ -806,7 +835,139 @@ def run_wannier_final(seed: str, run_dir: Path, timeout_sec: int = 7200) -> int:
                 raise TimeoutError(f"wannier90.x {seed} exceeded locked wall timeout")
             time.sleep(30)
 
+def kmesh_bvector_degeneracy_text(text: str) -> bool:
+    lower = text.lower()
+    return any(
+        marker in lower
+        for marker in [
+            "kmesh_get_bvector",
+            "not enough bvectors found",
+            "kmesh_get: something wrong",
+            "too many nearest neighbours",
+            "kmesh has found >12 nearest neighbours",
+            "accidentally degenerate shells",
+        ]
+    )
 
+
+def clean_wannier_pp_outputs(run_dir: Path, seed: str) -> None:
+    for suffix in [".nnkp", ".wout", ".bvec", ".chk"]:
+        path = run_dir / f"{seed}{suffix}"
+        if path.exists():
+            path.unlink()
+
+
+def recipe_with_runner_controls(
+    recipe: dict[str, Any],
+    *,
+    kmesh_strategy: str,
+    kmesh_tol: float | None = None,
+    devel_flag: str | None = None,
+) -> dict[str, Any]:
+    updated = json.loads(json.dumps(recipe))
+
+    controls: dict[str, Any] = {
+        "kmesh_strategy": kmesh_strategy,
+    }
+
+    if kmesh_tol is not None:
+        controls["kmesh_tol"] = kmesh_tol
+
+    if devel_flag is not None:
+        controls["devel_flag"] = devel_flag
+
+    updated["runner_wannier90_controls"] = controls
+    return updated
+
+
+def run_pp_with_kmesh_repair(
+    seed: str,
+    run_dir: Path,
+    recipe: dict[str, Any],
+    nscf: dict[str, Any],
+) -> tuple[int, dict[str, Any], list[str]]:
+    attempts = [
+        (
+            "none",
+            recipe,
+        ),
+        (
+            "kmesh_tol_1e-4",
+            recipe_with_runner_controls(
+                recipe,
+                kmesh_strategy="kmesh_tol_1e-4",
+                kmesh_tol=1.0e-4,
+            ),
+        ),
+        (
+            "kmesh_tol_1e-4+kmesh_degen",
+            recipe_with_runner_controls(
+                recipe,
+                kmesh_strategy="kmesh_tol_1e-4+kmesh_degen",
+                kmesh_tol=1.0e-4,
+                devel_flag="kmesh_degen",
+            ),
+        ),
+    ]
+
+    notes: list[str] = []
+
+    for index, (strategy, attempt_recipe) in enumerate(attempts):
+        clean_wannier_pp_outputs(run_dir, seed)
+
+        write_win(
+            run_dir / f"{seed}.win",
+            attempt_recipe,
+            nscf,
+        )
+
+        result = run_command(
+            ["wannier90.x", "-pp", seed],
+            run_dir,
+            f"{seed}.pp.log",
+            600,
+        )
+
+        nnkp_path = run_dir / f"{seed}.nnkp"
+
+        if result.returncode == 0 and nnkp_path.is_file():
+            if strategy != "none":
+                notes.append(
+                    "compiler-owned Wannier90 k-mesh repair applied: "
+                    f"{strategy}"
+                )
+
+            return 0, attempt_recipe, notes
+
+        combined = result.stdout + "\n" + result.stderr + "\n"
+
+        wout_path = run_dir / f"{seed}.wout"
+        if wout_path.is_file():
+            combined += wout_path.read_text(
+                encoding="utf-8",
+                errors="replace",
+            )
+
+        if index == 0 and kmesh_bvector_degeneracy_text(combined):
+            notes.append(
+                "normal wannier90.x -pp hit "
+                "kmesh_bvector_degeneracy; retrying with "
+                "kmesh_tol = 1e-4"
+            )
+            continue
+
+        if index == 1 and kmesh_bvector_degeneracy_text(combined):
+            notes.append(
+                "kmesh_tol = 1e-4 did not resolve "
+                "kmesh_bvector_degeneracy; retrying with "
+                "devel_flag = kmesh_degen"
+            )
+            continue
+
+        return 1, attempt_recipe, notes
+
+    return 1, attempts[-1][1], notes
+    
 def collect_artifacts(seed: str, run_dir: Path, recipe: dict[str, Any], status: str, notes: list[str]) -> None:
     attempt_dir = ARTIFACTS_DIR / "attempt_1"
     attempt_dir.mkdir(parents=True, exist_ok=True)
@@ -844,6 +1005,7 @@ def collect_artifacts(seed: str, run_dir: Path, recipe: dict[str, Any], status: 
             "num_bands": recipe["num_bands"],
             "num_wann": recipe["num_wann"],
             **recipe["windows"],
+            **({"runner_wannier90_controls": normalized_runner_wannier90_controls(recipe)} if normalized_runner_wannier90_controls(recipe) else {}),
         },
         "files": files,
         "dft_reference": {
@@ -879,6 +1041,7 @@ def collect_artifacts(seed: str, run_dir: Path, recipe: dict[str, Any], status: 
         f"- Status: {manifest['status']}\n"
         f"- Projections: {json.dumps(recipe['projections'])}\n"
         f"- Windows: {json.dumps(recipe['windows'], sort_keys=True)}\n"
+        f"- Runner Wannier90 controls: {json.dumps(normalized_runner_wannier90_controls(recipe), sort_keys=True)}\n"
         f"- Notes: {'; '.join(notes) if notes else 'none'}\n",
         encoding="utf-8",
     )
@@ -895,6 +1058,7 @@ def write_decisions(recipe: dict[str, Any], notes: list[str]) -> None:
         f"- Target DFT bands: 1-{recipe['target_dft_band_end']}\n"
         f"- Projections: {json.dumps(recipe['projections'])}\n"
         f"- Energy windows: {json.dumps(recipe['windows'], sort_keys=True)}\n"
+        f"- Runner Wannier90 controls: {json.dumps(normalized_runner_wannier90_controls(recipe), sort_keys=True)}\n"
         f"- Runner notes: {'; '.join(notes) if notes else 'none'}\n\n"
         "## Agent Rationale\n\n"
         f"{rationale_text if rationale_text else '- none supplied'}\n",
@@ -958,7 +1122,6 @@ def main() -> int:
         install_qe_save(run_dir)
         copy_pseudos(run_dir)
         seed = recipe["seedname"]
-        write_win(run_dir / f"{seed}.win", recipe, nscf)
         write_pw2wan(run_dir / f"{seed}.pw2wan", seed)
 
         run_script = WORKFLOW_DIR / "run.sh"
@@ -971,9 +1134,23 @@ def main() -> int:
         )
         run_script.chmod(0o755)
 
-        result = run_command(["wannier90.x", "-pp", seed], run_dir, f"{seed}.pp.log", 600)
-        if result.returncode != 0:
-            notes.append("wannier90.x -pp failed for the proposed projection recipe")
+        pp_status, recipe, repair_notes = run_pp_with_kmesh_repair(
+            seed,
+            run_dir,
+            recipe,
+            nscf,
+        )
+
+        notes.extend(repair_notes)
+
+        # Save the actually selected recipe, including any compiler-owned
+        # k-mesh repair controls.
+        write_locked_recipe(recipe)
+
+        if pp_status != 0:
+            notes.append(
+                "wannier90.x -pp failed for the proposed projection recipe"
+            )
             write_decisions(recipe, notes)
             collect_artifacts(seed, run_dir, recipe, "failed", notes)
             write_runner_state("failed", message="wannier90 -pp failed")
@@ -1172,16 +1349,15 @@ def upstream_pp_diagnostics(
 
     primary_cause = "wannier90.x -pp did not generate the .nnkp file"
     hints: list[str] = []
-    if "kmesh_get_bvector" in lower or "not enough bvectors found" in lower:
-        primary_cause = "Wannier90 k-mesh b-vector search failed"
+    if kmesh_bvector_degeneracy_text(combined):
+        primary_cause = "kmesh_bvector_degeneracy"
         hints.extend([
             "This is a Wannier90 preprocessing failure in automatic b-vector selection, "
             "usually caused by degenerate neighbour shells for the cell/k-point grid.",
             "This is not a projection syntax/count issue; changing projections alone is "
             "unlikely to fix it.",
-            "If the workflow allows raw Wannier90 controls, try kmesh_tol or "
-            "devel_flag = kmesh_degen. Otherwise the material/k-grid likely cannot be "
-            "made to pass with the locked recipe schema.",
+            "The compiler owns this repair: retry with kmesh_tol = 1e-4 first, then "
+            "devel_flag = kmesh_degen if the degeneracy persists.",
         ])
     elif "too few projection functions" in lower:
         primary_cause = "too few projection functions defined"
@@ -1214,7 +1390,7 @@ def upstream_pp_diagnostics(
 
 
 def missing_nnkp_message(seed: str, diagnostics: dict[str, Any]) -> str:
-    if diagnostics["primary_cause"] == "Wannier90 k-mesh b-vector search failed":
+    if diagnostics["primary_cause"] == "kmesh_bvector_degeneracy":
         return (
             f"wannier90.x -pp did not generate {seed}.nnkp. "
             f"Primary cause: {diagnostics['primary_cause']}. "
@@ -1363,6 +1539,118 @@ def fail(stage: str, message: str, **extra: Any) -> int:
     return 1
 
 
+def kmesh_bvector_degeneracy_text(text: str) -> bool:
+    lower = text.lower()
+    return any(
+        marker in lower
+        for marker in [
+            "kmesh_get_bvector",
+            "not enough bvectors found",
+            "kmesh_get: something wrong",
+            "too many nearest neighbours",
+            "kmesh has found >12 nearest neighbours",
+            "accidentally degenerate shells",
+        ]
+    )
+
+
+def clean_wannier_pp_outputs(compile_dir: Path, seed: str) -> None:
+    for suffix in [".nnkp", ".wout", ".bvec", ".chk"]:
+        path = compile_dir / f"{seed}{suffix}"
+        if path.exists():
+            path.unlink()
+
+
+def recipe_with_runner_controls(
+    recipe: dict[str, Any],
+    *,
+    kmesh_strategy: str,
+    kmesh_tol: float | None = None,
+    devel_flag: str | None = None,
+) -> dict[str, Any]:
+    updated = json.loads(json.dumps(recipe))
+    controls: dict[str, Any] = {"kmesh_strategy": kmesh_strategy}
+    if kmesh_tol is not None:
+        controls["kmesh_tol"] = kmesh_tol
+    if devel_flag is not None:
+        controls["devel_flag"] = devel_flag
+    updated["runner_wannier90_controls"] = controls
+    return updated
+
+
+def compile_pp_with_kmesh_repair(
+    runner: Any,
+    compile_dir: Path,
+    seed: str,
+    recipe: dict[str, Any],
+    nscf: dict[str, Any],
+) -> tuple[bool, dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+    attempts = [
+        ("none", recipe),
+        (
+            "kmesh_tol_1e-4",
+            recipe_with_runner_controls(
+                recipe,
+                kmesh_strategy="kmesh_tol_1e-4",
+                kmesh_tol=1.0e-4,
+            ),
+        ),
+        (
+            "kmesh_tol_1e-4+kmesh_degen",
+            recipe_with_runner_controls(
+                recipe,
+                kmesh_strategy="kmesh_tol_1e-4+kmesh_degen",
+                kmesh_tol=1.0e-4,
+                devel_flag="kmesh_degen",
+            ),
+        ),
+    ]
+    attempt_reports: list[dict[str, Any]] = []
+    last_diagnostics: dict[str, Any] = {}
+
+    for index, (strategy, attempt_recipe) in enumerate(attempts):
+        clean_wannier_pp_outputs(compile_dir, seed)
+        runner.write_win(
+            compile_dir / f"{seed}.win",
+            attempt_recipe,
+            nscf,
+        )
+        pp = runner.run_command(
+            ["wannier90.x", "-pp", seed],
+            compile_dir,
+            f"{seed}.compile.pp.log",
+            600,
+        )
+        diagnostics = upstream_pp_diagnostics(
+            compile_dir,
+            seed,
+            attempt_recipe,
+            nscf,
+        )
+        nnkp_exists = (compile_dir / f"{seed}.nnkp").is_file()
+        attempt_reports.append({
+            "strategy": strategy,
+            "returncode": pp.returncode,
+            "nnkp_exists": nnkp_exists,
+            "primary_cause": diagnostics["primary_cause"],
+            "runner_wannier90_controls": attempt_recipe.get(
+                "runner_wannier90_controls",
+                {},
+            ),
+        })
+
+        if pp.returncode == 0 and nnkp_exists:
+            return True, attempt_recipe, attempt_reports, diagnostics
+
+        last_diagnostics = diagnostics
+        if diagnostics["primary_cause"] != "kmesh_bvector_degeneracy":
+            return False, attempt_recipe, attempt_reports, diagnostics
+        if index == len(attempts) - 1:
+            return False, attempt_recipe, attempt_reports, diagnostics
+
+    return False, attempts[-1][1], attempt_reports, last_diagnostics
+
+
 def main() -> int:
     WORKFLOW_DIR.mkdir(parents=True, exist_ok=True)
     runner = load_runner()
@@ -1380,28 +1668,21 @@ def main() -> int:
         runner.install_qe_save(compile_dir)
         runner.copy_pseudos(compile_dir)
         seed = recipe["seedname"]
-        runner.write_win(compile_dir / f"{seed}.win", recipe, nscf)
         runner.write_pw2wan(compile_dir / f"{seed}.pw2wan", seed)
 
-        pp = runner.run_command(
-            ["wannier90.x", "-pp", seed],
+        pp_ok, recipe, pp_attempts, diagnostics = compile_pp_with_kmesh_repair(
+            runner,
             compile_dir,
-            f"{seed}.compile.pp.log",
-            600,
+            seed,
+            recipe,
+            nscf,
         )
-        if pp.returncode != 0:
-            diagnostics = upstream_pp_diagnostics(compile_dir, seed, recipe, nscf)
+        if not pp_ok:
             return fail(
                 "wannier90_pp",
                 missing_nnkp_message(seed, diagnostics),
                 upstream_diagnostics=diagnostics,
-            )
-        if not (compile_dir / f"{seed}.nnkp").is_file():
-            diagnostics = upstream_pp_diagnostics(compile_dir, seed, recipe, nscf)
-            return fail(
-                "wannier90_pp",
-                missing_nnkp_message(seed, diagnostics),
-                upstream_diagnostics=diagnostics,
+                kmesh_repair_attempts=pp_attempts,
             )
 
         pw2 = runner.run_command(
@@ -1443,6 +1724,8 @@ def main() -> int:
             "num_wann": recipe["num_wann"],
             "num_bands": recipe["num_bands"],
             "windows": recipe["windows"],
+            "runner_wannier90_controls": recipe.get("runner_wannier90_controls", {}),
+            "kmesh_repair_attempts": pp_attempts,
             "window_diagnostics": windows,
             "recipe_path": "workflow/recipe_request.json",
             "report_path": "workflow/compile_recipe_report.json",
