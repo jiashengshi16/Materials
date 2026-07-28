@@ -45,16 +45,19 @@ from compare_wannier_choices import (
     parse_win,
 )
 
-JOBS_ROOT = ROOT / "jobsDeepseekProTerminus2Controlled"
+JOBS_ROOT = ROOT / "jobsDeepseekProTerminus2ControlledIter2"
 #RERUNS_ROOT = ROOT / "reruns"
-REVIEWS_ROOT = ROOT / "jobsGeminiReviewsDeepseek/ChemSimReruns"
+REVIEWS_ROOT = ROOT / "jobsGeminiReviewsDeepseekIter3/ChemSimReruns"
 REFERENCE_ERROR_CSV = ROOT / "jobs" / "successful_run_errors.csv"
+CANDIDATE_CSV = ROOT / "include_only_candidates.csv"
+CANDIDATE_CSV_FALLBACK = ROOT / "include_only_candidates.csv"
 DATASET_ROOT = ROOT / "harbor_datasets" / "wannier_200"
 OUTPUT_CSV = REVIEWS_ROOT / "projection_mode_comparison.csv"
 OUTPUT_JSON = REVIEWS_ROOT / "projection_mode_comparison_summary.json"
 OUTPUT_ERROR_CSV = REVIEWS_ROOT / "projection_error_ratio_comparison.csv"
 OUTPUT_ERROR_JSON = REVIEWS_ROOT / "projection_error_ratio_comparison.json"
 OUTPUT_ALL_RATIOS_CSV = REVIEWS_ROOT / "all_error_ratios_by_material.csv"
+OUTPUT_NON_TARGET_RATIOS_CSV = REVIEWS_ROOT / "non_target_error_ratios.csv"
 OUTPUT_HEATMAP = REVIEWS_ROOT / "projection_mode_delta_heatmap"
 OUTPUT_AVERAGE_HEATMAP = REVIEWS_ROOT / "projection_mode_pairwise_average_delta_heatmap"
 PROJECTION_SIMILARITY_CMAP = LinearSegmentedColormap.from_list(
@@ -86,6 +89,8 @@ def material_from_job_folder(path: Path) -> str:
         material = data.get("material")
         if isinstance(material, str) and material:
             return material
+    if path.name.startswith("num_wann_ordered__"):
+        return path.name.rsplit("__", 1)[-1]
     if path.parent != REVIEWS_ROOT and not path.parent.name.startswith("num_wann_ordered__"):
         return path.parent.name
     return path.name.rsplit("__", 1)[-1]
@@ -264,6 +269,28 @@ def job_folder_from_run_id(run_id: object) -> Path | None:
     return candidate if candidate.is_dir() else None
 
 
+def load_reference_errors_by_key() -> dict[tuple[str, int], float]:
+    reference_df = pd.read_csv(REFERENCE_ERROR_CSV)
+    reference_df["num_wann"] = pd.to_numeric(
+        reference_df["num_wann"], errors="coerce"
+    )
+    reference_df["reference_error_eV"] = pd.to_numeric(
+        reference_df["reference_error_eV"], errors="coerce"
+    )
+    reference_df = reference_df.dropna(
+        subset=[
+            "material",
+            "num_wann",
+            "reference_error_eV",
+        ]
+    )
+    return {
+        (str(row["material"]), int(row["num_wann"])): float(row["reference_error_eV"])
+        for _, row in reference_df.iterrows()
+        if float(row["reference_error_eV"]) > 0
+    }
+
+
 def write_all_error_ratios_csv(new_by_material: dict[str, list[Path]]) -> tuple[int, dict[tuple[str, int], dict[str, float | None]]]:
     original_df = pd.DataFrame(load_original_rows())
     original_df["num_wann"] = pd.to_numeric(original_df["num_wann"], errors="coerce")
@@ -345,6 +372,183 @@ def write_all_error_ratios_csv(new_by_material: dict[str, list[Path]]) -> tuple[
         writer.writerows(rows)
 
     return len(rows), average_by_key
+
+
+
+def _walk_json_for_numeric_key(value: object, keys: set[str]) -> float | None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key in keys:
+                numeric = finite(child)
+                if numeric is not None:
+                    return numeric
+        for child in value.values():
+            found = _walk_json_for_numeric_key(child, keys)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = _walk_json_for_numeric_key(child, keys)
+            if found is not None:
+                return found
+    return None
+
+
+def _walk_json_for_strings(value: object, keys: set[str]) -> set[str]:
+    found: set[str] = set()
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key in keys and isinstance(child, str) and child.strip():
+                found.add(child.strip())
+            found.update(_walk_json_for_strings(child, keys))
+    elif isinstance(value, list):
+        for child in value:
+            found.update(_walk_json_for_strings(child, keys))
+    return found
+
+
+def target_materials_from_job_folders(jobs_by_material: dict[str, list[Path]]) -> set[str]:
+    """Discover target material names from metadata inside JOBS_ROOT only."""
+    target_keys = {
+        "target_material",
+        "target",
+        "target_name",
+        "source_material",
+    }
+    targets: set[str] = set()
+    for folders in jobs_by_material.values():
+        for folder in folders:
+            metadata_candidates = [
+                folder / "case_files" / "case_metadata.json",
+                folder / "case_metadata.json",
+            ]
+            for metadata_path in metadata_candidates:
+                if not metadata_path.is_file():
+                    continue
+                try:
+                    data = json.loads(metadata_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                targets.update(_walk_json_for_strings(data, target_keys))
+    return targets
+
+
+def folder_error_ratio(job_folder: Path) -> tuple[float | None, float | None, float | None]:
+    """Return (rmse_eV, reference_error_eV, error_ratio) using only files in job_folder."""
+    metrics = load_result_metrics(job_folder)
+    rmse = finite(metrics.get("rmse_eV"))
+
+    direct_ratio_keys = {
+        "error_ratio",
+        "rmse_error_ratio",
+        "interpolation_error_ratio",
+        "gemini_to_reference_ratio",
+    }
+    reference_keys = {
+        "reference_error_eV",
+        "reference_rmse_eV",
+        "reference_rmse",
+        "baseline_error_eV",
+        "baseline_rmse_eV",
+    }
+
+    direct_ratio = _walk_json_for_numeric_key(metrics, direct_ratio_keys)
+    reference_rmse = _walk_json_for_numeric_key(metrics, reference_keys)
+
+    # If the first metrics block does not carry the denominator/ratio, inspect JSON
+    # files inside this job folder. This deliberately does not read any CSV files.
+    if direct_ratio is None or reference_rmse is None:
+        for json_path in sorted(job_folder.rglob("*.json")):
+            try:
+                data = json.loads(json_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if direct_ratio is None:
+                direct_ratio = _walk_json_for_numeric_key(data, direct_ratio_keys)
+            if reference_rmse is None:
+                reference_rmse = _walk_json_for_numeric_key(data, reference_keys)
+            if direct_ratio is not None and reference_rmse is not None:
+                break
+
+    if direct_ratio is not None and math.isfinite(direct_ratio):
+        return rmse, reference_rmse, float(direct_ratio)
+    if rmse is not None and reference_rmse is not None and reference_rmse > 0:
+        return rmse, reference_rmse, rmse / reference_rmse
+    return rmse, reference_rmse, None
+
+
+def write_non_target_error_ratios_csv(
+    jobs_by_material: dict[str, list[Path]],
+) -> int:
+    """
+    Write error ratios for all non-target materials found under JOBS_ROOT.
+
+    Target discovery uses only files inside jobsDeepseekProTerminus2ControlledIter2.
+    Reference denominators fall back to the shared successful-run error table,
+    matching the rest of this comparison script.
+    """
+    target_materials = target_materials_from_job_folders(jobs_by_material)
+    non_target_materials = set(jobs_by_material) - target_materials
+    reference_by_key = load_reference_errors_by_key()
+
+    rows: list[dict[str, object]] = []
+    max_runs = 0
+
+    for material in sorted(non_target_materials):
+        folders_by_num_wann: dict[int, list[Path]] = defaultdict(list)
+        for folder in jobs_by_material.get(material, []):
+            num_wann = num_wann_from_job_folder(folder)
+            if num_wann is not None:
+                folders_by_num_wann[num_wann].append(folder)
+
+        for num_wann, folders in sorted(folders_by_num_wann.items()):
+            run_values: list[tuple[str, float | None, float | None, float]] = []
+            for folder in sorted(folders):
+                rmse, reference_rmse, ratio = folder_error_ratio(folder)
+                if ratio is None and rmse is not None:
+                    reference_rmse = reference_by_key.get((material, num_wann))
+                    if reference_rmse is not None:
+                        ratio = rmse / reference_rmse
+                if ratio is not None and math.isfinite(ratio):
+                    run_values.append((folder.name, rmse, reference_rmse, float(ratio)))
+
+            if not run_values:
+                continue
+
+            run_values.sort(key=lambda item: (item[3], item[0]))
+            max_runs = max(max_runs, len(run_values))
+
+            row: dict[str, object] = {
+                "material": material,
+                "num_wann": num_wann,
+                "avg_error_ratio": float(np.mean([item[3] for item in run_values])),
+            }
+            for index, (folder_name, rmse, reference_rmse, ratio) in enumerate(run_values, start=1):
+                row[f"run_{index}_folder"] = folder_name
+                row[f"run_{index}_rmse_eV"] = rmse
+                row[f"run_{index}_reference_error_eV"] = reference_rmse
+                row[f"run_{index}_error_ratio"] = ratio
+            rows.append(row)
+
+    fieldnames = ["material", "num_wann"]
+    for index in range(1, max_runs + 1):
+        fieldnames.extend(
+            [
+                f"run_{index}_folder",
+                f"run_{index}_rmse_eV",
+                f"run_{index}_reference_error_eV",
+                f"run_{index}_error_ratio",
+            ]
+        )
+    fieldnames.append("avg_error_ratio")
+
+    OUTPUT_NON_TARGET_RATIOS_CSV.parent.mkdir(parents=True, exist_ok=True)
+    with OUTPUT_NON_TARGET_RATIOS_CSV.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    return len(rows)
 
 
 def finite(value: object) -> float | None:
@@ -819,6 +1023,8 @@ def main() -> None:
         )
     new_by_material = job_folders_by_material(REVIEWS_ROOT)
     all_ratio_row_count, average_error_ratios_by_key = write_all_error_ratios_csv(new_by_material)
+    jobs_by_material = job_folders_by_material(JOBS_ROOT)
+    non_target_ratio_row_count = write_non_target_error_ratios_csv(jobs_by_material)
 
     rows: list[dict[str, object]] = []
     average_rows: list[dict[str, object]] = []
@@ -963,6 +1169,8 @@ def main() -> None:
                     "skipped_materials": skipped,
                     "all_error_ratios_csv": str(OUTPUT_ALL_RATIOS_CSV.relative_to(ROOT)),
                     "all_error_ratios_rows": all_ratio_row_count,
+                    "non_target_error_ratios_csv": str(OUTPUT_NON_TARGET_RATIOS_CSV.relative_to(ROOT)),
+                    "non_target_error_ratios_rows": non_target_ratio_row_count,
                 },
                 indent=2,
             )
@@ -972,6 +1180,7 @@ def main() -> None:
         print("Compared materials: 0")
         print(f"Skipped materials: {len(skipped)}")
         print(f"Wrote {OUTPUT_ALL_RATIOS_CSV.relative_to(ROOT)}")
+        print(f"Wrote {OUTPUT_NON_TARGET_RATIOS_CSV.relative_to(ROOT)}")
         return
 
     OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
@@ -1028,6 +1237,7 @@ def main() -> None:
             "error_ratio_csv": str(OUTPUT_ERROR_CSV.relative_to(ROOT)),
             "error_ratio_json": str(OUTPUT_ERROR_JSON.relative_to(ROOT)),
             "all_error_ratios_csv": str(OUTPUT_ALL_RATIOS_CSV.relative_to(ROOT)),
+            "non_target_error_ratios_csv": str(OUTPUT_NON_TARGET_RATIOS_CSV.relative_to(ROOT)),
             "heatmap_png": str(OUTPUT_HEATMAP.with_suffix(".png").relative_to(ROOT)),
             "heatmap_pdf": str(OUTPUT_HEATMAP.with_suffix(".pdf").relative_to(ROOT)),
             "average_heatmap_png": str(OUTPUT_AVERAGE_HEATMAP.with_suffix(".png").relative_to(ROOT)),
@@ -1054,6 +1264,7 @@ def main() -> None:
         "compared_materials": len(rows),
         "pairwise_average_materials": len(average_rows),
         "all_error_ratios_rows": all_ratio_row_count,
+        "non_target_error_ratios_rows": non_target_ratio_row_count,
         "skipped_materials": skipped,
     }
     OUTPUT_JSON.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
@@ -1064,6 +1275,7 @@ def main() -> None:
     print(f"Wrote {OUTPUT_ERROR_CSV.relative_to(ROOT)}")
     print(f"Wrote {OUTPUT_ERROR_JSON.relative_to(ROOT)}")
     print(f"Wrote {OUTPUT_ALL_RATIOS_CSV.relative_to(ROOT)}")
+    print(f"Wrote {OUTPUT_NON_TARGET_RATIOS_CSV.relative_to(ROOT)}")
     print(f"Wrote {OUTPUT_JSON.relative_to(ROOT)}")
     print(f"Wrote {OUTPUT_HEATMAP.with_suffix('.png').relative_to(ROOT)}")
     print(f"Wrote {OUTPUT_HEATMAP.with_suffix('.pdf').relative_to(ROOT)}")
